@@ -579,14 +579,7 @@ class SqliteSubmissionHistoryRepository(SubmissionHistoryRepository):
     def query(self, filters: SubmissionHistoryFilters) -> SubmissionHistoryPage:
         """Return paginated successful application history."""
 
-        statement = self._filtered_submissions(filters).options(
-            selectinload(ApplicationSubmissionModel.job_posting),
-            selectinload(ApplicationSubmissionModel.profile_snapshot),
-            selectinload(ApplicationSubmissionModel.answers),
-            selectinload(ApplicationSubmissionModel.recruiter_interactions),
-            selectinload(ApplicationSubmissionModel.execution_events),
-            selectinload(ApplicationSubmissionModel.artifact_snapshots),
-        )
+        statement = self._with_history_loads(self._filtered_submissions(filters))
         statement = statement.order_by(
             ApplicationSubmissionModel.submitted_at.desc(),
             ApplicationSubmissionModel.id,
@@ -606,6 +599,35 @@ class SqliteSubmissionHistoryRepository(SubmissionHistoryRepository):
             offset=filters.offset,
         )
 
+    def get(self, submission_id: UUID) -> SubmissionHistoryEntry | None:
+        """Return one successful submission with all audit relationships loaded."""
+
+        statement = self._with_history_loads(
+            select(ApplicationSubmissionModel).where(
+                ApplicationSubmissionModel.id == submission_id,
+                ApplicationSubmissionModel.status == SubmissionStatus.SUBMITTED.value,
+            ),
+        )
+        with self._session_provider() as session:
+            model = session.scalar(statement)
+
+        if model is None:
+            return None
+        return self._build_history_entry(model)
+
+    def _with_history_loads(
+        self,
+        statement: Select[tuple[ApplicationSubmissionModel]],
+    ) -> Select[tuple[ApplicationSubmissionModel]]:
+        return statement.options(
+            selectinload(ApplicationSubmissionModel.job_posting),
+            selectinload(ApplicationSubmissionModel.profile_snapshot),
+            selectinload(ApplicationSubmissionModel.answers),
+            selectinload(ApplicationSubmissionModel.recruiter_interactions),
+            selectinload(ApplicationSubmissionModel.execution_events),
+            selectinload(ApplicationSubmissionModel.artifact_snapshots),
+        )
+
     def _filtered_submissions(
         self,
         filters: SubmissionHistoryFilters,
@@ -616,7 +638,9 @@ class SqliteSubmissionHistoryRepository(SubmissionHistoryRepository):
         )
 
         if filters.company_name:
-            statement = statement.where(JobPostingModel.company_name == filters.company_name)
+            statement = statement.where(
+                JobPostingModel.company_name.ilike(f"%{filters.company_name}%"),
+            )
         if filters.title:
             statement = statement.where(JobPostingModel.title.ilike(f"%{filters.title}%"))
         if filters.external_job_id:

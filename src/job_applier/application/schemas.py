@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -181,6 +182,123 @@ class ArtifactSnapshotRead(ReadSchema):
     path: str
     sha256: str
     created_at: datetime
+
+
+class ProfileSnapshotDetailRead(ProfileSnapshotRead):
+    data: dict[str, Any]
+
+    @classmethod
+    def from_snapshot(cls, snapshot: Any) -> ProfileSnapshotDetailRead:
+        """Return the profile snapshot plus parsed JSON payload."""
+
+        return cls.model_validate(
+            {
+                **ProfileSnapshotRead.model_validate(snapshot).model_dump(mode="json"),
+                "data": json.loads(snapshot.data_json),
+            },
+        )
+
+
+class ExecutionEventDetailRead(ExecutionEventRead):
+    payload: dict[str, Any]
+
+    @classmethod
+    def from_event(cls, event: Any) -> ExecutionEventDetailRead:
+        """Return the execution event plus parsed JSON payload."""
+
+        return cls.model_validate(
+            {
+                **ExecutionEventRead.model_validate(event).model_dump(mode="json"),
+                "payload": json.loads(event.payload_json),
+            },
+        )
+
+
+class ApplicationHistoryListItemRead(BaseModel):
+    id: UUID
+    submitted_at: datetime
+    company_name: str
+    job_title: str
+    job_url: str
+    location: str | None = None
+    external_job_id: str | None = None
+    cv_version: str | None = None
+    execution_origin: ExecutionOrigin
+    notes: str | None = None
+
+    @classmethod
+    def from_entry(cls, entry: Any) -> ApplicationHistoryListItemRead:
+        """Build the compact list item shown by the history screen."""
+
+        return cls(
+            id=entry.submission.id,
+            submitted_at=entry.submission.submitted_at,
+            company_name=entry.job_posting.company_name,
+            job_title=entry.job_posting.title,
+            job_url=entry.job_posting.url,
+            location=entry.job_posting.location,
+            external_job_id=entry.job_posting.external_job_id,
+            cv_version=entry.submission.cv_version,
+            execution_origin=entry.submission.execution_origin,
+            notes=entry.submission.notes,
+        )
+
+
+class ApplicationHistoryDetailRead(BaseModel):
+    submission: ApplicationSubmissionRead
+    job_posting: JobPostingRead
+    answers: tuple[ApplicationAnswerRead, ...]
+    profile_snapshot: ProfileSnapshotDetailRead | None = None
+    recruiter_interactions: tuple[RecruiterInteractionRead, ...]
+    execution_events: tuple[ExecutionEventDetailRead, ...]
+    artifacts: tuple[ArtifactSnapshotRead, ...]
+
+    @classmethod
+    def from_entry(cls, entry: Any) -> ApplicationHistoryDetailRead:
+        """Build the full audit response for one successful application."""
+
+        return cls(
+            submission=ApplicationSubmissionRead.model_validate(entry.submission),
+            job_posting=JobPostingRead.model_validate(entry.job_posting),
+            answers=tuple(ApplicationAnswerRead.model_validate(answer) for answer in entry.answers),
+            profile_snapshot=(
+                ProfileSnapshotDetailRead.from_snapshot(entry.profile_snapshot)
+                if entry.profile_snapshot
+                else None
+            ),
+            recruiter_interactions=tuple(
+                RecruiterInteractionRead.model_validate(item)
+                for item in entry.recruiter_interactions
+            ),
+            execution_events=tuple(
+                ExecutionEventDetailRead.from_event(item) for item in entry.execution_events
+            ),
+            artifacts=tuple(
+                ArtifactSnapshotRead.model_validate(artifact) for artifact in entry.artifacts
+            ),
+        )
+
+
+class ApplicationHistoryPageRead(BaseModel):
+    items: tuple[ApplicationHistoryListItemRead, ...]
+    total: int
+    limit: int
+    offset: int
+
+    @classmethod
+    def from_page(cls, page: Any) -> ApplicationHistoryPageRead:
+        """Build the paginated API response for the history list."""
+
+        return cls(
+            items=tuple(ApplicationHistoryListItemRead.from_entry(item) for item in page.items),
+            total=page.total,
+            limit=page.limit,
+            offset=page.offset,
+        )
+
+
+class ApplicationHistoryDetailEnvelope(BaseModel):
+    application: ApplicationHistoryDetailRead
 
 
 class UserProfileConfigSchema(BaseModel):

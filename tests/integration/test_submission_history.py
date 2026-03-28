@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from job_applier.application.history import SubmissionHistoryFilters
+from job_applier.domain import ApplicationSubmission, ExecutionOrigin, SubmissionStatus
 from job_applier.infrastructure.sqlite import create_session_factory
 from job_applier.infrastructure.sqlite.repositories import (
     SqliteAnswerRepository,
@@ -73,6 +74,31 @@ def test_submission_history_queries_filter_and_paginate(tmp_path: Path) -> None:
             ),
         )
 
+    ignored_posting = posting_repo.save(
+        build_posting(
+            company_name="Ignored",
+            title="Pending Submission",
+            external_job_id="job-999",
+            captured_at=utc_dt(28, 13),
+        ),
+    )
+    ignored_snapshot = snapshot_repo.save(build_snapshot(created_at=utc_dt(28, 13)))
+    pending_seed = build_submission(
+        job_posting_id=ignored_posting.id,
+        profile_snapshot_id=ignored_snapshot.id,
+        submitted_at=utc_dt(28, 14),
+        note_suffix=" pending",
+    )
+    submission_repo.save(
+        ApplicationSubmission(
+            id=pending_seed.id,
+            job_posting_id=ignored_posting.id,
+            status=SubmissionStatus.PENDING,
+            started_at=pending_seed.started_at,
+            execution_origin=ExecutionOrigin.SCHEDULED,
+        ),
+    )
+
     by_company = history_repo.query(SubmissionHistoryFilters(company_name="Acme"))
     assert by_company.total == 2
     assert [item.job_posting.company_name for item in by_company.items] == ["Acme", "Acme"]
@@ -88,6 +114,11 @@ def test_submission_history_queries_filter_and_paginate(tmp_path: Path) -> None:
     assert len(by_job.items[0].artifacts) == 1
     assert len(by_job.items[0].execution_events) == 1
     assert by_job.items[0].profile_snapshot is not None
+
+    detail = history_repo.get(by_job.items[0].submission.id)
+    assert detail is not None
+    assert detail.job_posting.external_job_id == "job-003"
+    assert detail.answers[0].normalized_key == "work_authorization"
 
     by_date = history_repo.query(
         SubmissionHistoryFilters(

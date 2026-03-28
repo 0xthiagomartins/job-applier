@@ -21,6 +21,7 @@ from job_applier.infrastructure.sqlite import (
     SqliteArtifactSnapshotRepository,
     SqliteJobPostingRepository,
     SqliteProfileSnapshotRepository,
+    SqliteSubmissionHistoryRepository,
     SqliteSubmissionRepository,
     create_session_factory,
 )
@@ -88,6 +89,13 @@ def get_artifact_repository() -> SqliteArtifactSnapshotRepository:
     """Return the SQLite-backed artifact repository."""
 
     return SqliteArtifactSnapshotRepository(get_database_session_factory())
+
+
+@lru_cache(maxsize=1)
+def get_submission_history_repository() -> SqliteSubmissionHistoryRepository:
+    """Return the SQLite-backed history read model."""
+
+    return SqliteSubmissionHistoryRepository(get_database_session_factory())
 
 
 @lru_cache(maxsize=1)

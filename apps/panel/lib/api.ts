@@ -1,4 +1,9 @@
-import { ExecutionSummary, PanelState } from "@/lib/types";
+import {
+  ApplicationHistoryDetail,
+  ApplicationHistoryPage,
+  ExecutionSummary,
+  PanelState,
+} from "@/lib/types";
 
 export function apiUrl(path: string): string {
   return path;
@@ -73,4 +78,45 @@ export async function runAgentNow(): Promise<ExecutionSummary> {
   });
   const payload = await parseResponse<{ execution: ExecutionSummary }>(response);
   return payload.execution;
+}
+
+export async function fetchApplications(params: {
+  company?: string;
+  title?: string;
+  submitted_from?: string;
+  submitted_to?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<ApplicationHistoryPage> {
+  const searchParams = new URLSearchParams();
+
+  if (params.company) {
+    searchParams.set("company", params.company);
+  }
+  if (params.title) {
+    searchParams.set("title", params.title);
+  }
+  if (params.submitted_from) {
+    searchParams.set("submitted_from", params.submitted_from);
+  }
+  if (params.submitted_to) {
+    searchParams.set("submitted_to", params.submitted_to);
+  }
+  searchParams.set("limit", String(params.limit ?? 10));
+  searchParams.set("offset", String(params.offset ?? 0));
+
+  const response = await fetch(apiUrl(`/api/applications?${searchParams.toString()}`), {
+    cache: "no-store",
+  });
+  return parseResponse<ApplicationHistoryPage>(response);
+}
+
+export async function fetchApplicationDetail(
+  applicationId: string,
+): Promise<ApplicationHistoryDetail> {
+  const response = await fetch(apiUrl(`/api/applications/${applicationId}`), {
+    cache: "no-store",
+  });
+  const payload = await parseResponse<{ application: ApplicationHistoryDetail }>(response);
+  return payload.application;
 }

@@ -7,6 +7,7 @@ from typing import Protocol, TypeVar
 from uuid import UUID
 
 from job_applier.application.history import (
+    SubmissionHistoryEntry,
     SubmissionHistoryFilters,
     SubmissionHistoryPage,
 )
@@ -105,3 +106,6 @@ class SubmissionHistoryRepository(Protocol):
 
     def query(self, filters: SubmissionHistoryFilters) -> SubmissionHistoryPage:
         """Return successful submissions filtered by business criteria."""
+
+    def get(self, submission_id: UUID) -> SubmissionHistoryEntry | None:
+        """Return one successful submission with full related audit context."""

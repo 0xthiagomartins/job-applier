@@ -55,6 +55,113 @@ export type ExecutionSummary = {
   last_error: string | null;
 };
 
+export type ApplicationHistoryListItem = {
+  id: string;
+  submitted_at: string;
+  company_name: string;
+  job_title: string;
+  job_url: string;
+  location: string | null;
+  external_job_id: string | null;
+  cv_version: string | null;
+  execution_origin: string;
+  notes: string | null;
+};
+
+export type ApplicationAnswer = {
+  id: string;
+  submission_id: string;
+  step_index: number;
+  question_raw: string;
+  question_type: string;
+  normalized_key: string;
+  answer_raw: string;
+  answer_source: string;
+  ambiguity_flag: boolean;
+  fill_strategy: string;
+};
+
+export type ArtifactSnapshot = {
+  id: string;
+  submission_id: string;
+  artifact_type: string;
+  path: string;
+  sha256: string;
+  created_at: string;
+};
+
+export type ExecutionEvent = {
+  id: string;
+  execution_id: string;
+  submission_id: string | null;
+  event_type: string;
+  timestamp: string;
+  payload_json: string;
+  payload: Record<string, unknown>;
+};
+
+export type RecruiterInteraction = {
+  id: string;
+  submission_id: string;
+  recruiter_name: string;
+  recruiter_profile_url: string | null;
+  action: string;
+  message_sent: string | null;
+  status: string;
+  sent_at: string | null;
+};
+
+export type ProfileSnapshot = {
+  id: string;
+  created_at: string;
+  data_json: string;
+  data: Record<string, unknown>;
+};
+
+export type ApplicationHistoryDetail = {
+  submission: {
+    id: string;
+    job_posting_id: string;
+    status: string;
+    started_at: string;
+    submitted_at: string | null;
+    cv_version: string | null;
+    cover_letter_version: string | null;
+    profile_snapshot_id: string | null;
+    ruleset_version: string | null;
+    ai_model_used: string | null;
+    execution_origin: string;
+    notes: string | null;
+  };
+  job_posting: {
+    id: string;
+    platform: string;
+    external_job_id: string | null;
+    url: string;
+    title: string;
+    company_name: string;
+    location: string | null;
+    workplace_type: string | null;
+    seniority: string | null;
+    easy_apply: boolean;
+    description_raw: string;
+    description_hash: string;
+    captured_at: string;
+  };
+  answers: ApplicationAnswer[];
+  profile_snapshot: ProfileSnapshot | null;
+  recruiter_interactions: RecruiterInteraction[];
+  execution_events: ExecutionEvent[];
+  artifacts: ArtifactSnapshot[];
+};
+
+export type ApplicationHistoryPage = {
+  items: ApplicationHistoryListItem[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
 export type PanelState = {
   profile: ProfileSection;
   preferences: PreferencesSection;

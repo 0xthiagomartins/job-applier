@@ -1,1 +1,1 @@
-"""Test package markers for shared helpers."""
+"""Test package for Job Applier."""

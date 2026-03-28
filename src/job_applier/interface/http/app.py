@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from job_applier.interface.http.dependencies import get_agent_scheduler
 from job_applier.interface.http.routes.agent import api_router as agent_api_router
+from job_applier.interface.http.routes.applications import api_router as applications_api_router
 from job_applier.interface.http.routes.panel import api_router as panel_api_router
 from job_applier.settings import get_runtime_settings, initialize_runtime_environment
 
@@ -46,5 +47,6 @@ def create_app() -> FastAPI:
 
     app.include_router(panel_api_router)
     app.include_router(agent_api_router)
+    app.include_router(applications_api_router)
 
     return app

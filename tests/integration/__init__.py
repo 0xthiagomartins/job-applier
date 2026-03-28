@@ -1,1 +1,1 @@
-"""Integration tests package."""
+"""Integration test helpers and suites."""
