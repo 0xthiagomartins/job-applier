@@ -7,7 +7,8 @@ Job Applier is an open source system for assisted job application automation wit
 The current repository bootstrap already includes:
 
 - Python 3.14 project management with `uv`
-- FastAPI application skeleton with a health check endpoint
+- FastAPI backend API with panel configuration endpoints
+- Next.js + TypeScript panel scaffold with shadcn-style components
 - Ruff, mypy, pytest and pre-commit configuration
 - GitHub Actions CI for lint, type-check and tests
 
@@ -26,17 +27,32 @@ The current repository bootstrap already includes:
    uv run pre-commit install
    ```
 
-4. Start the bootstrap app locally:
+4. Start the backend API locally:
 
    ```bash
    uv run uvicorn job_applier.main:app --reload
    ```
 
-5. Check the health endpoint:
+5. Install frontend dependencies:
+
+   ```bash
+   cd frontend
+   npm install
+   ```
+
+6. Start the panel locally:
+
+   ```bash
+   npm run dev
+   ```
+
+7. Check the backend health endpoint:
 
    ```bash
    curl http://127.0.0.1:8000/health
    ```
+
+8. Open the panel at `http://127.0.0.1:3000`.
 
 ## Quality commands
 
@@ -57,6 +73,14 @@ Run tests:
 
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest
+```
+
+Frontend checks:
+
+```bash
+cd frontend
+npm run typecheck
+npm run build
 ```
 
 ## Contributing

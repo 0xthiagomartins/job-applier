@@ -1,0 +1,14 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-background font-sans text-foreground antialiased;
+  background-image:
+    radial-gradient(circle at top left, rgba(245, 193, 139, 0.55), transparent 28%),
+    linear-gradient(145deg, #fbf4ea 0%, #efe2d2 48%, #fcf4e7 100%);
+}
+
+* {
+  box-sizing: border-box;
+}

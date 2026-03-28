@@ -26,6 +26,12 @@ dist/
 build/
 *.egg-info/
 
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/tsconfig.tsbuildinfo
+
 # Playwright / test outputs
 playwright-report/
 test-results/
