@@ -77,7 +77,7 @@ def test_profile_roundtrip_supports_upload(
 def test_preferences_and_ai_roundtrip(
     panel_store_override: LocalPanelSettingsStore,
 ) -> None:
-    async def exercise() -> tuple[int, int, dict[str, Any]]:
+    async def exercise() -> tuple[int, int, int, dict[str, Any]]:
         async with AsyncClient(
             transport=ASGITransport(app=app),
             base_url="http://testserver",
@@ -100,17 +100,25 @@ def test_preferences_and_ai_roundtrip(
                 "/api/panel/ai",
                 data={"api_key": "sk-test-12345", "model": "o3-mini"},
             )
+            schedule_response = await client.put(
+                "/api/panel/schedule",
+                data={"frequency": "daily", "run_at": "23:00", "timezone": "America/Sao_Paulo"},
+            )
             state_response = await client.get("/api/panel/state")
             return (
                 preferences_response.status_code,
                 ai_response.status_code,
+                schedule_response.status_code,
                 cast(dict[str, Any], state_response.json()),
             )
 
-    preferences_status, ai_status, payload = asyncio.run(exercise())
+    preferences_status, ai_status, schedule_status, payload = asyncio.run(exercise())
 
     assert preferences_status == 200
     assert ai_status == 200
+    assert schedule_status == 200
     assert payload["preferences"]["auto_connect_with_recruiter"] is True
     assert payload["preferences"]["keywords"] == ["python", "automation"]
+    assert payload["schedule"]["run_at"] == "23:00"
+    assert payload["schedule"]["timezone"] == "America/Sao_Paulo"
     assert payload["ai"]["has_api_key"] is True

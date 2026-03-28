@@ -9,14 +9,16 @@ from fastapi.responses import JSONResponse
 from pydantic import AnyUrl, SecretStr
 
 from job_applier.application.panel import (
+    SCHEDULE_FREQUENCY_OPTIONS,
     AIFormInput,
     PreferencesFormInput,
     ProfileFormInput,
+    ScheduleFormInput,
     parse_csv_lines,
     parse_int_mapping_lines,
     parse_text_mapping_lines,
 )
-from job_applier.domain.enums import SeniorityLevel, WorkplaceType
+from job_applier.domain.enums import ScheduleFrequency, SeniorityLevel, WorkplaceType
 from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
 from job_applier.interface.http.dependencies import get_panel_settings_store
 
@@ -49,12 +51,14 @@ async def get_panel_state(
         content={
             "profile": document.profile.model_dump(mode="json"),
             "preferences": document.preferences.model_dump(mode="json"),
+            "schedule": document.schedule.model_dump(mode="json"),
             "ai": {
                 "model": document.ai.model,
                 "has_api_key": document.ai.api_key is not None,
                 "masked_api_key": document.ai.masked_key(),
             },
             "options": {
+                "schedule_frequencies": [option.value for option in SCHEDULE_FREQUENCY_OPTIONS],
                 "workplace_types": [option.value for option in WorkplaceType],
                 "seniority_levels": [option.value for option in SeniorityLevel],
             },
@@ -170,6 +174,39 @@ async def get_ai(
                 "has_api_key": document.ai.api_key is not None,
                 "masked_api_key": document.ai.masked_key(),
             },
+        },
+    )
+
+
+@api_router.get("/schedule")
+async def get_schedule(
+    store: Annotated[LocalPanelSettingsStore, Depends(get_panel_settings_store)],
+) -> JSONResponse:
+    """Return the persisted schedule section."""
+
+    document = store.load()
+    return JSONResponse(content={"schedule": document.schedule.model_dump(mode="json")})
+
+
+@api_router.put("/schedule")
+async def save_schedule(
+    store: Annotated[LocalPanelSettingsStore, Depends(get_panel_settings_store)],
+    frequency: Annotated[ScheduleFrequency, Form()] = ScheduleFrequency.DAILY,
+    run_at: Annotated[str, Form()] = "23:00",
+    timezone: Annotated[str, Form()] = "UTC",
+) -> JSONResponse:
+    """Persist scheduler configuration from the panel."""
+
+    schedule_input = ScheduleFormInput(
+        frequency=frequency,
+        run_at=run_at,
+        timezone=timezone,
+    )
+    document = store.save_schedule(schedule_input)
+    return JSONResponse(
+        content={
+            "message": "Schedule saved successfully.",
+            "schedule": document.schedule.model_dump(mode="json"),
         },
     )
 

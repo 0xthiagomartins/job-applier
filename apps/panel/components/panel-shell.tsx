@@ -8,6 +8,7 @@ const links = [
   { href: "/", label: "Overview" },
   { href: "/profile", label: "Profile" },
   { href: "/preferences", label: "Preferences" },
+  { href: "/schedule", label: "Schedule" },
   { href: "/ai", label: "AI Settings" },
 ];
 
@@ -34,8 +35,8 @@ export function PanelShell({
             Lightweight panel, backend-first workflow.
           </h1>
           <p className="mt-5 max-w-2xl text-base leading-7 text-muted-foreground md:text-lg">
-            Configure the profile, search filters, AI options and recruiter toggle from a simple
-            Next.js panel backed by the FastAPI API.
+            Configure the profile, search filters, schedule, AI options and recruiter toggle from
+            a simple Next.js panel backed by the FastAPI API.
           </p>
         </div>
         <StatusSummary />

@@ -10,6 +10,7 @@ from job_applier.domain.entities import (
     RecruiterInteraction,
 )
 from job_applier.domain.enums import (
+    AgentExecutionStatus,
     AnswerSource,
     ArtifactType,
     ExecutionEventType,
@@ -19,6 +20,7 @@ from job_applier.domain.enums import (
     QuestionType,
     RecruiterAction,
     RecruiterInteractionStatus,
+    ScheduleFrequency,
     SeniorityLevel,
     SubmissionStatus,
     WorkplaceType,
@@ -27,6 +29,7 @@ from job_applier.domain.versioning import Ruleset
 
 __all__ = [
     "AnswerSource",
+    "AgentExecutionStatus",
     "ApplicationAnswer",
     "ApplicationSubmission",
     "ArtifactSnapshot",
@@ -43,6 +46,7 @@ __all__ = [
     "RecruiterInteraction",
     "RecruiterInteractionStatus",
     "Ruleset",
+    "ScheduleFrequency",
     "SeniorityLevel",
     "SubmissionStatus",
     "WorkplaceType",

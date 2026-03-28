@@ -1,7 +1,9 @@
 """Application layer for Job Applier."""
 
+from job_applier.application.agent_execution import ExecutionRunSummary
 from job_applier.application.config import UserAgentSettings
 from job_applier.application.schemas import (
+    AgentExecutionSummaryRead,
     ApplicationAnswerCreate,
     ApplicationAnswerRead,
     ApplicationSubmissionCreate,
@@ -28,6 +30,7 @@ from job_applier.application.snapshotting import (
 __all__ = [
     "ApplicationAnswerCreate",
     "ApplicationAnswerRead",
+    "AgentExecutionSummaryRead",
     "ApplicationSubmissionCreate",
     "ApplicationSubmissionRead",
     "ArtifactSnapshotCreate",
@@ -44,6 +47,7 @@ __all__ = [
     "UserAgentConfigRead",
     "UserAgentConfigWrite",
     "UserAgentSettings",
+    "ExecutionRunSummary",
     "build_profile_snapshot",
     "create_successful_submission_record",
 ]

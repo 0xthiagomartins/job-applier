@@ -24,6 +24,10 @@ class SeniorityLevel(StrEnum):
     DIRECTOR = "director"
 
 
+class ScheduleFrequency(StrEnum):
+    DAILY = "daily"
+
+
 class SubmissionStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
@@ -76,6 +80,7 @@ class RecruiterInteractionStatus(StrEnum):
 
 class ExecutionEventType(StrEnum):
     EXECUTION_STARTED = "execution_started"
+    EXECUTION_COMPLETED = "execution_completed"
     STEP_REACHED = "step_reached"
     AUTOFILL_APPLIED = "autofill_applied"
     SUBMISSION_COMPLETED = "submission_completed"
@@ -92,3 +97,9 @@ class ArtifactType(StrEnum):
 class ExecutionOrigin(StrEnum):
     SCHEDULED = "scheduled"
     MANUAL = "manual"
+
+
+class AgentExecutionStatus(StrEnum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"

@@ -19,6 +19,7 @@ class RuntimeSettings(BaseSettings):
     backend_host: str = "0.0.0.0"
     backend_port: int = 8000
     panel_port: int = 3000
+    scheduler_poll_interval_seconds: int = 30
     playwright_headless: bool = False
     playwright_display: str | None = Field(default=None, alias="DISPLAY")
 

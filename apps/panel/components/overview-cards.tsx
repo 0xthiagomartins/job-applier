@@ -27,6 +27,11 @@ export function OverviewCards(): React.JSX.Element {
         value={state?.preferences.keywords.join(", ") || "No keywords yet"}
       />
       <OverviewCard
+        description={state?.schedule.timezone || "UTC"}
+        title="Schedule"
+        value={state?.schedule.run_at || "23:00"}
+      />
+      <OverviewCard
         description={state?.ai.masked_api_key || "No API key stored yet."}
         title="AI Setup"
         value={state?.ai.model || "o3-mini"}

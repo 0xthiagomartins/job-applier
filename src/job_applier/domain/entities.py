@@ -222,10 +222,11 @@ class RecruiterInteraction:
 class ExecutionEvent:
     """Represents an execution event emitted during automation."""
 
-    submission_id: UUID
+    execution_id: UUID
     event_type: ExecutionEventType
     payload_json: str
     id: UUID = field(default_factory=uuid4)
+    submission_id: UUID | None = None
     timestamp: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:

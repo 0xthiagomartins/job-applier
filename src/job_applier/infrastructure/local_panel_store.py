@@ -13,9 +13,11 @@ from job_applier.application.panel import (
     PanelSettingsDocument,
     PreferencesFormInput,
     ProfileFormInput,
+    ScheduleFormInput,
     StoredAISection,
     StoredPreferencesSection,
     StoredProfileSection,
+    StoredScheduleSection,
     ensure_runtime_dir,
 )
 
@@ -92,6 +94,18 @@ class LocalPanelSettingsStore:
         updated_document = document.model_copy(
             update={
                 "ai": StoredAISection(api_key=api_key, model=ai_input.model),
+            },
+        )
+        self._write(updated_document)
+        return updated_document
+
+    def save_schedule(self, schedule_input: ScheduleFormInput) -> PanelSettingsDocument:
+        """Persist the execution schedule used by the agent."""
+
+        document = self.load()
+        updated_document = document.model_copy(
+            update={
+                "schedule": StoredScheduleSection(**schedule_input.model_dump()),
             },
         )
         self._write(updated_document)

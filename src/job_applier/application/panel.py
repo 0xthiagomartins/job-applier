@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
     AnyUrl,
@@ -16,9 +17,10 @@ from pydantic import (
     field_validator,
 )
 
-from job_applier.domain.enums import SeniorityLevel, WorkplaceType
+from job_applier.domain.enums import ScheduleFrequency, SeniorityLevel, WorkplaceType
 
 MODEL_OPTIONS = ("o3-mini", "gpt-4.1-mini", "gpt-4o-mini")
+SCHEDULE_FREQUENCY_OPTIONS = (ScheduleFrequency.DAILY,)
 
 
 class PanelModel(BaseModel):
@@ -200,12 +202,59 @@ class AIFormInput(BaseModel):
         return SecretStr(secret)
 
 
+class StoredScheduleSection(PanelModel):
+    """Persisted schedule section."""
+
+    frequency: ScheduleFrequency = ScheduleFrequency.DAILY
+    run_at: str = "23:00"
+    timezone: str = "UTC"
+
+
+class ScheduleFormInput(BaseModel):
+    """Validated schedule payload coming from the panel."""
+
+    frequency: ScheduleFrequency = ScheduleFrequency.DAILY
+    run_at: str = "23:00"
+    timezone: str = "UTC"
+
+    @field_validator("run_at")
+    @classmethod
+    def validate_run_at(cls, value: str) -> str:
+        """Ensure the configured time uses `HH:MM` 24-hour format."""
+
+        try:
+            hour_text, minute_text = value.split(":", maxsplit=1)
+            hour = int(hour_text)
+            minute = int(minute_text)
+        except ValueError as exc:
+            msg = "Time must use HH:MM format"
+            raise ValueError(msg) from exc
+
+        if hour not in range(24) or minute not in range(60):
+            msg = "Time must be a valid 24-hour value"
+            raise ValueError(msg)
+        return f"{hour:02d}:{minute:02d}"
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        """Ensure the configured timezone exists."""
+
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            msg = "Timezone must be a valid IANA timezone"
+            raise ValueError(msg) from exc
+        return value
+
+
 class PanelSettingsDocument(PanelModel):
     """Full persisted panel document."""
 
     profile: StoredProfileSection = Field(default_factory=StoredProfileSection)
     preferences: StoredPreferencesSection = Field(default_factory=StoredPreferencesSection)
     ai: StoredAISection = Field(default_factory=StoredAISection)
+    schedule: StoredScheduleSection = Field(default_factory=StoredScheduleSection)
 
 
 class PanelOverview(BaseModel):
@@ -214,6 +263,7 @@ class PanelOverview(BaseModel):
     profile_ready: bool
     preferences_ready: bool
     ai_ready: bool
+    schedule_ready: bool
 
     @classmethod
     def from_document(cls, document: PanelSettingsDocument) -> PanelOverview:
@@ -223,6 +273,7 @@ class PanelOverview(BaseModel):
             profile_ready=bool(document.profile.name and document.profile.email),
             preferences_ready=bool(document.preferences.keywords and document.preferences.location),
             ai_ready=document.ai.api_key is not None,
+            schedule_ready=bool(document.schedule.run_at and document.schedule.timezone),
         )
 
 

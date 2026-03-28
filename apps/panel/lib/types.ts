@@ -28,17 +28,39 @@ export type PreferencesSection = {
   auto_connect_with_recruiter: boolean;
 };
 
+export type ScheduleSection = {
+  frequency: string;
+  run_at: string;
+  timezone: string;
+};
+
 export type AISection = {
   model: string;
   has_api_key: boolean;
   masked_api_key: string | null;
 };
 
+export type ExecutionSummary = {
+  execution_id: string;
+  origin: string;
+  status: string;
+  started_at: string;
+  finished_at: string | null;
+  snapshot_id: string | null;
+  jobs_seen: number;
+  jobs_selected: number;
+  successful_submissions: number;
+  error_count: number;
+  last_error: string | null;
+};
+
 export type PanelState = {
   profile: ProfileSection;
   preferences: PreferencesSection;
+  schedule: ScheduleSection;
   ai: AISection;
   options: {
+    schedule_frequencies: string[];
     workplace_types: string[];
     seniority_levels: string[];
   };

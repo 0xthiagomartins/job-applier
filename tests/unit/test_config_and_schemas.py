@@ -34,7 +34,8 @@ def test_settings_load_from_env_file_and_snapshot_excludes_api_key(tmp_path: Pat
                 'SEARCH__WORKPLACE_TYPES=["remote","hybrid"]',
                 'SEARCH__SENIORITY=["senior"]',
                 "SEARCH__EASY_APPLY_ONLY=true",
-                "AGENT__SCHEDULE__CRON=0 23 * * *",
+                "AGENT__SCHEDULE__FREQUENCY=daily",
+                "AGENT__SCHEDULE__RUN_AT=23:00",
                 "AGENT__SCHEDULE__TIMEZONE=America/Sao_Paulo",
                 "AI__API_KEY=sk-test",
                 "AI__MODEL=o3-mini",
@@ -50,6 +51,7 @@ def test_settings_load_from_env_file_and_snapshot_excludes_api_key(tmp_path: Pat
 
     assert settings.profile.email == "thiago@example.com"
     assert settings.agent.auto_connect_with_recruiter is False
+    assert settings.agent.schedule.run_at == "23:00"
     assert payload["ai"] == {"model": "o3-mini"}
     assert "api_key" not in payload["ai"]
 

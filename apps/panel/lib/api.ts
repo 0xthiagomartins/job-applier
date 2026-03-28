@@ -1,4 +1,4 @@
-import { PanelState } from "@/lib/types";
+import { ExecutionSummary, PanelState } from "@/lib/types";
 
 export function apiUrl(path: string): string {
   return path;
@@ -43,10 +43,34 @@ export async function savePreferences(formData: FormData): Promise<{ message: st
   return parseResponse<{ message: string }>(response);
 }
 
+export async function saveSchedule(formData: FormData): Promise<{ message: string }> {
+  const response = await fetch(apiUrl("/api/panel/schedule"), {
+    method: "PUT",
+    body: formData,
+  });
+  return parseResponse<{ message: string }>(response);
+}
+
 export async function saveAiSettings(formData: FormData): Promise<{ message: string }> {
   const response = await fetch(apiUrl("/api/panel/ai"), {
     method: "PUT",
     body: formData,
   });
   return parseResponse<{ message: string }>(response);
+}
+
+export async function fetchExecutions(limit = 5): Promise<ExecutionSummary[]> {
+  const response = await fetch(apiUrl(`/api/agent/executions?limit=${limit}`), {
+    cache: "no-store",
+  });
+  const payload = await parseResponse<{ executions: ExecutionSummary[] }>(response);
+  return payload.executions;
+}
+
+export async function runAgentNow(): Promise<ExecutionSummary> {
+  const response = await fetch(apiUrl("/api/agent/run"), {
+    method: "POST",
+  });
+  const payload = await parseResponse<{ execution: ExecutionSummary }>(response);
+  return payload.execution;
 }

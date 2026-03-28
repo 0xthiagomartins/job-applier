@@ -20,6 +20,7 @@ export function StatusSummary(): React.JSX.Element {
 
   const profileReady = Boolean(state?.profile.name && state.profile.email);
   const preferencesReady = Boolean(state?.preferences.location && state.preferences.keywords.length > 0);
+  const scheduleReady = Boolean(state?.schedule.run_at && state.schedule.timezone);
   const aiReady = Boolean(state?.ai.has_api_key);
 
   return (
@@ -35,6 +36,10 @@ export function StatusSummary(): React.JSX.Element {
         <div className="flex items-center justify-between rounded-2xl bg-white/65 px-4 py-3">
           <span>Preferences</span>
           {readinessBadge(preferencesReady)}
+        </div>
+        <div className="flex items-center justify-between rounded-2xl bg-white/65 px-4 py-3">
+          <span>Schedule</span>
+          {readinessBadge(scheduleReady)}
         </div>
         <div className="flex items-center justify-between rounded-2xl bg-white/65 px-4 py-3">
           <span>AI Setup</span>

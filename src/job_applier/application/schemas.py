@@ -9,6 +9,7 @@ from uuid import UUID
 from pydantic import AnyUrl, BaseModel, ConfigDict, EmailStr, Field, SecretStr
 
 from job_applier.domain.enums import (
+    AgentExecutionStatus,
     AnswerSource,
     ArtifactType,
     ExecutionEventType,
@@ -18,6 +19,7 @@ from job_applier.domain.enums import (
     QuestionType,
     RecruiterAction,
     RecruiterInteractionStatus,
+    ScheduleFrequency,
     SeniorityLevel,
     SubmissionStatus,
     WorkplaceType,
@@ -146,7 +148,8 @@ class RecruiterInteractionRead(ReadSchema):
 
 
 class ExecutionEventCreate(BaseModel):
-    submission_id: UUID
+    execution_id: UUID
+    submission_id: UUID | None = None
     event_type: ExecutionEventType
     payload_json: str
     timestamp: datetime | None = None
@@ -154,7 +157,8 @@ class ExecutionEventCreate(BaseModel):
 
 class ExecutionEventRead(ReadSchema):
     id: UUID
-    submission_id: UUID
+    execution_id: UUID
+    submission_id: UUID | None
     event_type: ExecutionEventType
     timestamp: datetime
     payload_json: str
@@ -205,7 +209,8 @@ class SearchConfigSchema(BaseModel):
 
 
 class ScheduleConfigSchema(BaseModel):
-    cron: str
+    frequency: ScheduleFrequency = ScheduleFrequency.DAILY
+    run_at: str = "23:00"
     timezone: str = "UTC"
 
 
@@ -251,3 +256,17 @@ class UserAgentConfigRead(BaseModel):
         """Build a read-safe config schema from a settings snapshot payload."""
 
         return cls.model_validate(payload)
+
+
+class AgentExecutionSummaryRead(BaseModel):
+    execution_id: UUID
+    origin: ExecutionOrigin
+    status: AgentExecutionStatus
+    started_at: datetime
+    finished_at: datetime | None = None
+    snapshot_id: UUID | None = None
+    jobs_seen: int = 0
+    jobs_selected: int = 0
+    successful_submissions: int = 0
+    error_count: int = 0
+    last_error: str | None = None

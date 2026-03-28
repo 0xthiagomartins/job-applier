@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from job_applier.interface.http.dependencies import get_agent_scheduler
+from job_applier.interface.http.routes.agent import api_router as agent_api_router
 from job_applier.interface.http.routes.panel import api_router as panel_api_router
 from job_applier.settings import get_runtime_settings, initialize_runtime_environment
 
@@ -15,7 +17,12 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     """Prepare the local runtime before serving requests."""
 
     initialize_runtime_environment(get_runtime_settings())
-    yield
+    scheduler = get_agent_scheduler()
+    await scheduler.start()
+    try:
+        yield
+    finally:
+        await scheduler.stop()
 
 
 def create_app() -> FastAPI:
@@ -38,5 +45,6 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(panel_api_router)
+    app.include_router(agent_api_router)
 
     return app
