@@ -8,9 +8,10 @@ The current repository bootstrap already includes:
 
 - Python 3.14 project management with `uv`
 - FastAPI backend API with panel configuration endpoints
-- Next.js + TypeScript panel scaffold with shadcn-style components
+- Next.js + TypeScript panel in `apps/panel` with shadcn-style components
 - Ruff, mypy, pytest and pre-commit configuration
 - GitHub Actions CI for lint, type-check and tests
+- single-container on-premise runtime path with local SQLite fallback
 
 ## Getting started
 
@@ -33,10 +34,10 @@ The current repository bootstrap already includes:
    uv run uvicorn job_applier.main:app --reload
    ```
 
-5. Install frontend dependencies:
+5. Install panel dependencies:
 
    ```bash
-   cd frontend
+   cd apps/panel
    npm install
    ```
 
@@ -78,10 +79,20 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest
 Frontend checks:
 
 ```bash
-cd frontend
+cd apps/panel
 npm run typecheck
 npm run build
 ```
+
+## On-premise container
+
+The repository already includes a single `Dockerfile` for the on-premise flow:
+
+- backend API and panel run inside the same container;
+- if `JOB_APPLIER_DATABASE_URL` is not provided, the app creates and uses a local SQLite file in `/data`;
+- for Linux hosts, Playwright can open a visible browser on the host display so the user can watch the automation and step in for captchas.
+
+Build and run details live in [docs/on-premise.md](docs/on-premise.md).
 
 ## Contributing
 

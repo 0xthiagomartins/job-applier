@@ -27,10 +27,10 @@ build/
 *.egg-info/
 
 # Frontend
-frontend/node_modules/
-frontend/.next/
-frontend/out/
-frontend/tsconfig.tsbuildinfo
+apps/panel/node_modules/
+apps/panel/.next/
+apps/panel/out/
+apps/panel/tsconfig.tsbuildinfo
 
 # Playwright / test outputs
 playwright-report/

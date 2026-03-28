@@ -1,10 +1,7 @@
 import { PanelState } from "@/lib/types";
 
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ?? "http://127.0.0.1:8000";
-
 export function apiUrl(path: string): string {
-  return `${API_BASE_URL}${path}`;
+  return path;
 }
 
 async function parseResponse<T>(response: Response): Promise<T> {

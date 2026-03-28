@@ -52,6 +52,32 @@ jobs:
       - name: Mypy
         run: uv run mypy src tests
 
+  panel:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: apps/panel/package-lock.json
+
+      - name: Install panel dependencies
+        working-directory: apps/panel
+        run: npm ci
+
+      - name: Typecheck panel
+        working-directory: apps/panel
+        run: npm run typecheck
+
+      - name: Build panel
+        working-directory: apps/panel
+        run: npm run build
+
   test:
     runs-on: ubuntu-latest
 
