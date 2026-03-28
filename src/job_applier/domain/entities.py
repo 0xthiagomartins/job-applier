@@ -63,6 +63,7 @@ class JobPosting:
     location: str | None = None
     workplace_type: WorkplaceType | None = None
     seniority: SeniorityLevel | None = None
+    easy_apply: bool = True
     description_hash: str = ""
     captured_at: datetime = field(default_factory=utc_now)
 

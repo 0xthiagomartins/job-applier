@@ -28,6 +28,7 @@ def test_job_posting_generates_description_hash_and_requires_utc() -> None:
 
     assert len(posting.description_hash) == 64
     assert posting.captured_at.tzinfo is not None
+    assert posting.easy_apply is True
 
     with pytest.raises(ValueError, match="captured_at must be timezone-aware"):
         JobPosting(

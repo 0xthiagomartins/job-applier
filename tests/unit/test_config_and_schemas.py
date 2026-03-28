@@ -72,3 +72,4 @@ def test_job_posting_schema_reads_from_domain_entity() -> None:
 
     assert schema.platform is Platform.LINKEDIN
     assert schema.company_name == "Acme"
+    assert schema.easy_apply is True

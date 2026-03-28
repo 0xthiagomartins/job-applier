@@ -31,6 +31,12 @@ class JobPostingModel(Base):
         Index("ix_job_postings_title", "title"),
         Index("ix_job_postings_external_job_id", "external_job_id"),
         Index("ix_job_postings_captured_at", "captured_at"),
+        Index(
+            "ux_job_postings_platform_external_job_id",
+            "platform",
+            "external_job_id",
+            unique=True,
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
@@ -42,6 +48,7 @@ class JobPostingModel(Base):
     location: Mapped[str | None] = mapped_column(String(255))
     workplace_type: Mapped[str | None] = mapped_column(String(32))
     seniority: Mapped[str | None] = mapped_column(String(32))
+    easy_apply: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     description_raw: Mapped[str] = mapped_column(Text, nullable=False)
     description_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

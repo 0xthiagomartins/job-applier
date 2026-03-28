@@ -42,6 +42,14 @@ class Repository(Protocol[EntityT]):
 class JobPostingRepository(Repository[JobPosting], Protocol):
     """Persistence contract for job postings."""
 
+    def find_by_external_job_id(
+        self,
+        *,
+        platform: str,
+        external_job_id: str,
+    ) -> JobPosting | None:
+        """Return one posting by platform and external identifier."""
+
 
 class SubmissionRepository(Repository[ApplicationSubmission], Protocol):
     """Persistence contract for submissions."""

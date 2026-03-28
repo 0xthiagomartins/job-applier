@@ -42,6 +42,7 @@ class JobPostingCreate(BaseModel):
     location: str | None = None
     workplace_type: WorkplaceType | None = None
     seniority: SeniorityLevel | None = None
+    easy_apply: bool = True
     description_hash: str | None = None
     captured_at: datetime | None = None
 
@@ -56,6 +57,7 @@ class JobPostingRead(ReadSchema):
     location: str | None
     workplace_type: WorkplaceType | None
     seniority: SeniorityLevel | None
+    easy_apply: bool
     description_raw: str
     description_hash: str
     captured_at: datetime

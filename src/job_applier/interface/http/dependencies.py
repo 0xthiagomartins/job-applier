@@ -9,6 +9,9 @@ from job_applier.infrastructure import (
     LocalExecutionStore,
     LocalPanelSettingsStore,
 )
+from job_applier.infrastructure.linkedin import LinkedInJobFetcher, PlaywrightLinkedInJobsClient
+from job_applier.infrastructure.sqlite import SqliteJobPostingRepository, create_session_factory
+from job_applier.infrastructure.sqlite.database import SessionFactory
 from job_applier.settings import get_runtime_settings
 
 
@@ -29,6 +32,39 @@ def get_execution_store() -> LocalExecutionStore:
 
 
 @lru_cache(maxsize=1)
+def get_database_session_factory() -> SessionFactory:
+    """Return the shared SQLAlchemy session factory."""
+
+    settings = get_runtime_settings()
+    return create_session_factory(settings.resolved_database_url)
+
+
+@lru_cache(maxsize=1)
+def get_job_posting_repository() -> SqliteJobPostingRepository:
+    """Return the SQLite-backed job posting repository."""
+
+    return SqliteJobPostingRepository(get_database_session_factory())
+
+
+@lru_cache(maxsize=1)
+def get_linkedin_jobs_client() -> PlaywrightLinkedInJobsClient:
+    """Return the Playwright LinkedIn search client."""
+
+    return PlaywrightLinkedInJobsClient(get_runtime_settings())
+
+
+@lru_cache(maxsize=1)
+def get_job_fetcher() -> LinkedInJobFetcher:
+    """Return the job fetcher used by orchestrated executions."""
+
+    return LinkedInJobFetcher(
+        client=get_linkedin_jobs_client(),
+        runtime_settings=get_runtime_settings(),
+        job_repository=get_job_posting_repository(),
+    )
+
+
+@lru_cache(maxsize=1)
 def get_successful_submission_store() -> InMemorySuccessfulSubmissionStore:
     """Return the in-memory successful submission store singleton."""
 
@@ -43,6 +79,7 @@ def get_agent_orchestrator() -> AgentExecutionOrchestrator:
         panel_store=get_panel_settings_store(),
         execution_store=get_execution_store(),
         successful_submission_store=get_successful_submission_store(),
+        job_fetcher=get_job_fetcher(),
     )
 
 

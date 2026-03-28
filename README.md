@@ -12,6 +12,7 @@ The current repository bootstrap already includes:
 - Ruff, mypy, pytest and pre-commit configuration
 - GitHub Actions CI for lint, type-check and tests
 - single-container on-premise runtime path with local SQLite fallback
+- automatic Alembic upgrade to the latest schema on startup
 
 ## Getting started
 
@@ -54,6 +55,25 @@ The current repository bootstrap already includes:
    ```
 
 8. Open the panel at `http://127.0.0.1:3000`.
+
+## LinkedIn search setup
+
+The LinkedIn Jobs search automation reads credentials from local runtime config, never from versioned code.
+
+Add these keys to your local `.env`:
+
+```bash
+JOB_APPLIER_LINKEDIN_EMAIL="you@example.com"
+JOB_APPLIER_LINKEDIN_PASSWORD="your-linkedin-password"
+JOB_APPLIER_PLAYWRIGHT_HEADLESS=false
+```
+
+Runtime behavior:
+
+- the first successful login saves a reusable session in `artifacts/runtime/linkedin/storage-state.json`;
+- later runs reuse that storage state automatically;
+- if LinkedIn expires the session, the app clears the saved state and logs in again;
+- in headful mode, the browser stays visible so the user can solve captcha or checkpoint screens.
 
 ## Quality commands
 

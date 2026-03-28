@@ -46,11 +46,16 @@ docker run --rm -it \
   -p 3000:3000 \
   -p 8000:8000 \
   -e DISPLAY=$DISPLAY \
+  -e JOB_APPLIER_LINKEDIN_EMAIL="you@example.com" \
+  -e JOB_APPLIER_LINKEDIN_PASSWORD="your-linkedin-password" \
+  -e JOB_APPLIER_PLAYWRIGHT_HEADLESS=false \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   -v job-applier-data:/data \
   --ipc=host \
   job-applier
 ```
+
+The container persists the reusable LinkedIn session at `/data/linkedin/storage-state.json`.
 
 ## External database
 

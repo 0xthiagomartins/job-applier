@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, TypeVar, cast
 from uuid import UUID
@@ -94,6 +95,7 @@ def _posting_to_model(entity: JobPosting) -> JobPostingModel:
         location=entity.location,
         workplace_type=entity.workplace_type.value if entity.workplace_type else None,
         seniority=entity.seniority.value if entity.seniority else None,
+        easy_apply=entity.easy_apply,
         description_raw=entity.description_raw,
         description_hash=entity.description_hash,
         captured_at=entity.captured_at,
@@ -111,6 +113,7 @@ def _posting_from_model(model: JobPostingModel) -> JobPosting:
         location=model.location,
         workplace_type=WorkplaceType(model.workplace_type) if model.workplace_type else None,
         seniority=SeniorityLevel(model.seniority) if model.seniority else None,
+        easy_apply=model.easy_apply,
         description_raw=model.description_raw,
         description_hash=model.description_hash,
         captured_at=_db_to_utc(model.captured_at),
@@ -345,6 +348,32 @@ class SqliteJobPostingRepository(
         statement: Select[tuple[JobPostingModel]],
     ) -> Select[tuple[JobPostingModel]]:
         return statement.order_by(JobPostingModel.captured_at.desc(), JobPostingModel.id)
+
+    def save(self, entity: JobPosting) -> JobPosting:
+        """Persist a new or updated posting while deduplicating on external id."""
+
+        if entity.external_job_id:
+            existing = self.find_by_external_job_id(
+                platform=entity.platform.value,
+                external_job_id=entity.external_job_id,
+            )
+            if existing is not None:
+                entity = replace(entity, id=existing.id)
+        return super().save(entity)
+
+    def find_by_external_job_id(
+        self,
+        *,
+        platform: str,
+        external_job_id: str,
+    ) -> JobPosting | None:
+        statement = self._base_query().where(
+            JobPostingModel.platform == platform,
+            JobPostingModel.external_job_id == external_job_id,
+        )
+        with self._session_provider() as session:
+            model = session.scalar(statement)
+            return None if model is None else self._from_model(model)
 
 
 class SqliteSubmissionRepository(
