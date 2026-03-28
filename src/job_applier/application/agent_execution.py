@@ -22,6 +22,7 @@ from job_applier.application.config import (
 )
 from job_applier.application.panel import PanelSettingsDocument
 from job_applier.application.snapshotting import (
+    SuccessfulSubmissionRecord,
     build_profile_snapshot,
     create_successful_submission_record,
 )
@@ -37,7 +38,6 @@ from job_applier.domain.enums import (
     ExecutionOrigin,
     SubmissionStatus,
 )
-from job_applier.infrastructure.in_memory.audit_store import InMemorySuccessfulSubmissionStore
 from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
 
 logger = logging.getLogger(__name__)
@@ -98,8 +98,23 @@ class JobSubmitter(Protocol):
         posting: JobPosting,
         *,
         origin: ExecutionOrigin,
-    ) -> ApplicationSubmission:
+    ) -> SubmissionAttempt:
         """Attempt to apply to the selected job posting."""
+
+
+class SuccessfulSubmissionStore(Protocol):
+    """Persistence contract used to look up successful submission audit bundles."""
+
+    def save(self, record: SuccessfulSubmissionRecord) -> None:
+        """Persist the audit bundle for a successful submission."""
+
+
+@dataclass(frozen=True, slots=True)
+class SubmissionAttempt:
+    """Structured result returned by a job submitter."""
+
+    submission: ApplicationSubmission
+    successful_record: SuccessfulSubmissionRecord | None = None
 
 
 class ExecutionStore(Protocol):
@@ -153,7 +168,7 @@ class NoOpJobSubmitter:
         posting: JobPosting,
         *,
         origin: ExecutionOrigin,
-    ) -> ApplicationSubmission:
+    ) -> SubmissionAttempt:
         logger.info(
             "job_submit_stage",
             extra={
@@ -162,11 +177,13 @@ class NoOpJobSubmitter:
                 "auto_connect_with_recruiter": settings.agent.auto_connect_with_recruiter,
             },
         )
-        return ApplicationSubmission(
-            job_posting_id=posting.id,
-            status=SubmissionStatus.SKIPPED,
-            execution_origin=origin,
-            notes="Application submitter is not configured yet.",
+        return SubmissionAttempt(
+            submission=ApplicationSubmission(
+                job_posting_id=posting.id,
+                status=SubmissionStatus.SKIPPED,
+                execution_origin=origin,
+                notes="Application submitter is not configured yet.",
+            ),
         )
 
 
@@ -212,6 +229,8 @@ def build_user_agent_settings(document: PanelSettingsDocument) -> UserAgentSetti
                 salary_expectation=document.profile.salary_expectation,
                 availability=document.profile.availability,
                 default_responses=document.profile.default_responses,
+                cv_path=document.profile.cv_path,
+                cv_filename=document.profile.cv_filename,
                 positive_filters=document.preferences.positive_keywords,
                 blacklist=document.preferences.negative_keywords,
             ),
@@ -255,7 +274,7 @@ class AgentExecutionOrchestrator:
         *,
         panel_store: LocalPanelSettingsStore,
         execution_store: ExecutionStore,
-        successful_submission_store: InMemorySuccessfulSubmissionStore,
+        successful_submission_store: SuccessfulSubmissionStore,
         job_fetcher: JobFetcher | None = None,
         job_scorer: JobScorer | None = None,
         job_submitter: JobSubmitter | None = None,
@@ -380,7 +399,7 @@ class AgentExecutionOrchestrator:
             jobs_selected += 1
 
             try:
-                submission = await self._job_submitter.submit(settings, posting, origin=origin)
+                attempt = await self._job_submitter.submit(settings, posting, origin=origin)
             except Exception as exc:  # noqa: BLE001
                 latest_error = str(exc)
                 error_count += 1
@@ -398,6 +417,7 @@ class AgentExecutionOrchestrator:
                     extra={"execution_id": str(execution_id), "job_posting_id": str(posting.id)},
                 )
                 continue
+            submission = attempt.submission
 
             if submission.status is SubmissionStatus.SKIPPED:
                 self._emit_event(
@@ -427,7 +447,10 @@ class AgentExecutionOrchestrator:
                 )
                 continue
 
-            record = create_successful_submission_record(submission, settings=settings)
+            record = attempt.successful_record or create_successful_submission_record(
+                submission,
+                settings=settings,
+            )
             self._successful_submission_store.save(record)
             successful_submissions += 1
             self._emit_event(

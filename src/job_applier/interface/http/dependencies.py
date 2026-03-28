@@ -11,10 +11,19 @@ from job_applier.infrastructure import (
     LocalPanelSettingsStore,
 )
 from job_applier.infrastructure.linkedin import (
+    LinkedInEasyApplySubmitter,
     LinkedInJobFetcher,
+    PlaywrightLinkedInEasyApplyExecutor,
     PlaywrightLinkedInJobsClient,
 )
-from job_applier.infrastructure.sqlite import SqliteJobPostingRepository, create_session_factory
+from job_applier.infrastructure.sqlite import (
+    SqliteAnswerRepository,
+    SqliteArtifactSnapshotRepository,
+    SqliteJobPostingRepository,
+    SqliteProfileSnapshotRepository,
+    SqliteSubmissionRepository,
+    create_session_factory,
+)
 from job_applier.infrastructure.sqlite.database import SessionFactory
 from job_applier.settings import get_runtime_settings
 
@@ -51,10 +60,45 @@ def get_job_posting_repository() -> SqliteJobPostingRepository:
 
 
 @lru_cache(maxsize=1)
+def get_submission_repository() -> SqliteSubmissionRepository:
+    """Return the SQLite-backed submission repository."""
+
+    return SqliteSubmissionRepository(get_database_session_factory())
+
+
+@lru_cache(maxsize=1)
+def get_answer_repository() -> SqliteAnswerRepository:
+    """Return the SQLite-backed answer repository."""
+
+    return SqliteAnswerRepository(get_database_session_factory())
+
+
+@lru_cache(maxsize=1)
+def get_profile_snapshot_repository() -> SqliteProfileSnapshotRepository:
+    """Return the SQLite-backed profile snapshot repository."""
+
+    return SqliteProfileSnapshotRepository(get_database_session_factory())
+
+
+@lru_cache(maxsize=1)
+def get_artifact_repository() -> SqliteArtifactSnapshotRepository:
+    """Return the SQLite-backed artifact repository."""
+
+    return SqliteArtifactSnapshotRepository(get_database_session_factory())
+
+
+@lru_cache(maxsize=1)
 def get_linkedin_jobs_client() -> PlaywrightLinkedInJobsClient:
     """Return the Playwright LinkedIn search client."""
 
     return PlaywrightLinkedInJobsClient(get_runtime_settings())
+
+
+@lru_cache(maxsize=1)
+def get_linkedin_easy_apply_executor() -> PlaywrightLinkedInEasyApplyExecutor:
+    """Return the Playwright Easy Apply executor."""
+
+    return PlaywrightLinkedInEasyApplyExecutor(get_runtime_settings())
 
 
 @lru_cache(maxsize=1)
@@ -76,6 +120,19 @@ def get_job_scorer() -> RuleBasedJobScorer:
 
 
 @lru_cache(maxsize=1)
+def get_job_submitter() -> LinkedInEasyApplySubmitter:
+    """Return the LinkedIn Easy Apply submitter used by executions."""
+
+    return LinkedInEasyApplySubmitter(
+        executor=get_linkedin_easy_apply_executor(),
+        submission_repository=get_submission_repository(),
+        answer_repository=get_answer_repository(),
+        profile_snapshot_repository=get_profile_snapshot_repository(),
+        artifact_repository=get_artifact_repository(),
+    )
+
+
+@lru_cache(maxsize=1)
 def get_successful_submission_store() -> InMemorySuccessfulSubmissionStore:
     """Return the in-memory successful submission store singleton."""
 
@@ -92,6 +149,7 @@ def get_agent_orchestrator() -> AgentExecutionOrchestrator:
         successful_submission_store=get_successful_submission_store(),
         job_fetcher=get_job_fetcher(),
         job_scorer=get_job_scorer(),
+        job_submitter=get_job_submitter(),
     )
 
 

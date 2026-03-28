@@ -10,6 +10,7 @@ from job_applier.application.agent_execution import (
     JobScorer,
     JobSubmitter,
     ScoredJobPosting,
+    SubmissionAttempt,
 )
 from job_applier.application.agent_scheduler import AgentScheduler
 from job_applier.application.panel import (
@@ -73,7 +74,12 @@ def test_orchestrator_records_events_and_continues_after_submit_error(tmp_path: 
             if self.calls == 2:
                 msg = "submit failure on second posting"
                 raise RuntimeError(msg)
-            return ApplicationSubmission(job_posting_id=posting.id, execution_origin=origin)
+            return SubmissionAttempt(
+                submission=ApplicationSubmission(
+                    job_posting_id=posting.id,
+                    execution_origin=origin,
+                ),
+            )
 
     orchestrator = AgentExecutionOrchestrator(
         panel_store=panel_store,

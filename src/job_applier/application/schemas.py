@@ -197,6 +197,8 @@ class UserProfileConfigSchema(BaseModel):
     salary_expectation: int | None = None
     availability: str
     default_responses: dict[str, str] = Field(default_factory=dict)
+    cv_path: str | None = None
+    cv_filename: str | None = None
     positive_filters: tuple[str, ...] = ()
     blacklist: tuple[str, ...] = ()
 

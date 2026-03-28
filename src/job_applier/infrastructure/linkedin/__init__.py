@@ -5,6 +5,19 @@ from job_applier.infrastructure.linkedin.auth import (
     LinkedInCredentials,
     LinkedInSessionManager,
 )
+from job_applier.infrastructure.linkedin.easy_apply import (
+    EasyApplyExecutionResult,
+    EasyApplyField,
+    EasyApplyStep,
+    LinkedInAnswerResolver,
+    LinkedInEasyApplyError,
+    LinkedInEasyApplySubmitter,
+    PlaywrightLinkedInEasyApplyExecutor,
+    ResolvedFieldValue,
+    classify_question,
+    normalize_key,
+    normalize_text,
+)
 from job_applier.infrastructure.linkedin.search import (
     LINKEDIN_JOBS_URL,
     LinkedInCollectedJob,
@@ -20,18 +33,29 @@ from job_applier.infrastructure.linkedin.search import (
 )
 
 __all__ = [
+    "EasyApplyExecutionResult",
+    "EasyApplyField",
+    "EasyApplyStep",
     "LINKEDIN_JOBS_URL",
     "LinkedInAuthError",
+    "LinkedInAnswerResolver",
     "LinkedInCollectedJob",
     "LinkedInCredentials",
+    "LinkedInEasyApplyError",
+    "LinkedInEasyApplySubmitter",
     "LinkedInJobFetcher",
     "LinkedInJobParser",
     "LinkedInSearchCriteria",
     "LinkedInSearchError",
     "LinkedInSessionManager",
+    "PlaywrightLinkedInEasyApplyExecutor",
     "PlaywrightLinkedInJobsClient",
+    "ResolvedFieldValue",
     "build_paginated_search_url",
     "build_search_criteria",
+    "classify_question",
     "infer_seniority",
     "infer_workplace_type",
+    "normalize_key",
+    "normalize_text",
 ]
