@@ -188,7 +188,7 @@ class UserProfileConfigSchema(BaseModel):
     email: EmailStr
     phone: str
     city: str
-    linkedin_url: AnyUrl
+    linkedin_url: AnyUrl | None = None
     github_url: AnyUrl | None = None
     portfolio_url: AnyUrl | None = None
     years_experience_by_stack: dict[str, int] = Field(default_factory=dict)
@@ -226,7 +226,7 @@ class AgentConfigSchema(BaseModel):
 
 class AIConfigWriteSchema(BaseModel):
     model: str
-    api_key: SecretStr
+    api_key: SecretStr | None = None
 
 
 class AIConfigReadSchema(BaseModel):

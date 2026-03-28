@@ -122,7 +122,6 @@ export function ProfileForm(): React.JSX.Element {
         </Field>
         <Field label="LinkedIn URL">
           <Input
-            required
             type="url"
             value={form.linkedin_url}
             onChange={(event) => updateField("linkedin_url", event.target.value)}

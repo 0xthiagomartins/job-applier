@@ -8,7 +8,7 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from pydantic import Field, SecretStr
+from pydantic import AnyUrl, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,6 +31,19 @@ class RuntimeSettings(BaseSettings):
     linkedin_max_search_pages: int = 2
     linkedin_default_timeout_ms: int = 15_000
     linkedin_login_timeout_seconds: int = 120
+    openai_api_key: SecretStr | None = None
+    bootstrap_panel_on_empty_state: bool = True
+    bootstrap_profile_name: str | None = None
+    bootstrap_profile_email: str | None = None
+    bootstrap_profile_phone: str | None = None
+    bootstrap_profile_city: str = "Sao Paulo"
+    bootstrap_profile_linkedin_url: AnyUrl | None = None
+    bootstrap_profile_github_url: AnyUrl | None = None
+    bootstrap_profile_portfolio_url: AnyUrl | None = None
+    bootstrap_profile_cv_path: Path | None = None
+    bootstrap_profile_availability: str = "Immediate"
+    bootstrap_profile_work_authorized: bool = True
+    bootstrap_profile_needs_sponsorship: bool = False
 
     model_config = SettingsConfigDict(
         env_file=".env",

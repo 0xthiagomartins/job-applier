@@ -33,7 +33,10 @@ def get_panel_settings_store() -> LocalPanelSettingsStore:
     """Return the panel settings store singleton."""
 
     settings = get_runtime_settings()
-    return LocalPanelSettingsStore(root_dir=settings.resolved_panel_storage_dir)
+    return LocalPanelSettingsStore(
+        root_dir=settings.resolved_panel_storage_dir,
+        runtime_settings=settings,
+    )
 
 
 @lru_cache(maxsize=1)

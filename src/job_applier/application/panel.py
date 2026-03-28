@@ -115,7 +115,7 @@ class ProfileFormInput(BaseModel):
     email: EmailStr
     phone: str = Field(min_length=1)
     city: str = Field(min_length=1)
-    linkedin_url: AnyUrl
+    linkedin_url: AnyUrl | None = None
     github_url: AnyUrl | None = None
     portfolio_url: AnyUrl | None = None
     years_experience_by_stack: dict[str, int] = Field(default_factory=dict)

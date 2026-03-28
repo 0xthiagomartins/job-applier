@@ -74,6 +74,7 @@ Runtime behavior:
 - later runs reuse that storage state automatically;
 - if LinkedIn expires the session, the app clears the saved state and logs in again;
 - in headful mode, the browser stays visible so the user can solve captcha or checkpoint screens.
+- when the panel state is still empty, the app bootstraps a local profile automatically from `.env` and tries to import a CV from `~/Documents`.
 
 ## Quality commands
 

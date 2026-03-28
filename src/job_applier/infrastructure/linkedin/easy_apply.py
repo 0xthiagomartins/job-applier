@@ -321,7 +321,7 @@ class LinkedInAnswerResolver:
             case QuestionType.CITY:
                 return profile.city
             case QuestionType.LINKEDIN_URL:
-                return str(profile.linkedin_url)
+                return str(profile.linkedin_url) if profile.linkedin_url else None
             case QuestionType.GITHUB_URL:
                 return str(profile.github_url) if profile.github_url else None
             case QuestionType.PORTFOLIO_URL:

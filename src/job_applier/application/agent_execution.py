@@ -192,10 +192,7 @@ def build_user_agent_settings(document: PanelSettingsDocument) -> UserAgentSetti
 
     missing_fields = [
         field_name
-        for field_name, field_value in (
-            ("profile.email", document.profile.email),
-            ("profile.linkedin_url", document.profile.linkedin_url),
-        )
+        for field_name, field_value in (("profile.email", document.profile.email),)
         if field_value is None
     ]
     if missing_fields:
@@ -203,14 +200,8 @@ def build_user_agent_settings(document: PanelSettingsDocument) -> UserAgentSetti
         msg = f"Missing required panel fields: {joined}."
         raise PanelSettingsConfigurationError(msg)
 
-    if document.ai.api_key is None:
-        msg = "AI API key is required before the agent can run."
-        raise PanelSettingsConfigurationError(msg)
-
     email = document.profile.email
-    linkedin_url = document.profile.linkedin_url
     assert email is not None
-    assert linkedin_url is not None
 
     try:
         return UserAgentSettings(
@@ -220,7 +211,7 @@ def build_user_agent_settings(document: PanelSettingsDocument) -> UserAgentSetti
                 email=email,
                 phone=document.profile.phone,
                 city=document.profile.city,
-                linkedin_url=linkedin_url,
+                linkedin_url=document.profile.linkedin_url,
                 github_url=document.profile.github_url,
                 portfolio_url=document.profile.portfolio_url,
                 years_experience_by_stack=document.profile.years_experience_by_stack,

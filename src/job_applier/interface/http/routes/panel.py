@@ -73,7 +73,7 @@ async def save_profile(
     email: Annotated[str, Form()],
     phone: Annotated[str, Form()],
     city: Annotated[str, Form()],
-    linkedin_url: Annotated[AnyUrl, Form()],
+    linkedin_url: Annotated[AnyUrl | None, Form()] = None,
     github_url: Annotated[AnyUrl | None, Form()] = None,
     portfolio_url: Annotated[AnyUrl | None, Form()] = None,
     years_experience_by_stack: Annotated[str, Form()] = "",
