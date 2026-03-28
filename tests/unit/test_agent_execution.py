@@ -42,7 +42,7 @@ def test_orchestrator_records_events_and_continues_after_submit_error(tmp_path: 
     submission_store = InMemorySuccessfulSubmissionStore()
 
     class FakeFetcher(JobFetcher):
-        async def fetch(self, settings):  # type: ignore[no-untyped-def]
+        async def fetch(self, settings):
             return [
                 JobPosting(
                     platform=Platform.LINKEDIN,
@@ -61,14 +61,14 @@ def test_orchestrator_records_events_and_continues_after_submit_error(tmp_path: 
             ]
 
     class FakeScorer(JobScorer):
-        async def score(self, settings, posting):  # type: ignore[no-untyped-def]
+        async def score(self, settings, posting):
             return ScoredJobPosting(posting=posting, selected=True, score=0.9)
 
     class FakeSubmitter(JobSubmitter):
         def __init__(self) -> None:
             self.calls = 0
 
-        async def submit(self, settings, posting, *, origin):  # type: ignore[no-untyped-def]
+        async def submit(self, settings, posting, *, origin):
             self.calls += 1
             if self.calls == 2:
                 msg = "submit failure on second posting"
