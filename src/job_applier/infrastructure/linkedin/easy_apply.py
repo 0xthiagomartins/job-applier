@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Literal, Protocol
 from uuid import UUID, uuid4
 
 from playwright.async_api import BrowserContext, Locator, Page, async_playwright
@@ -33,10 +33,8 @@ from job_applier.domain.entities import (
     utc_now,
 )
 from job_applier.domain.enums import (
-    AnswerSource,
     ArtifactType,
     ExecutionOrigin,
-    FillStrategy,
     QuestionType,
     SubmissionStatus,
 )
@@ -45,11 +43,18 @@ from job_applier.infrastructure.linkedin.auth import (
     LinkedInCredentials,
     LinkedInSessionManager,
 )
+from job_applier.infrastructure.linkedin.question_resolution import (
+    EasyApplyField,
+    LinkedInAnswerResolver,
+    LinkedInQuestionExtractor,
+    ResolvedFieldValue,
+    normalize_text,
+    pick_option,
+)
 from job_applier.settings import RuntimeSettings
 
 logger = logging.getLogger(__name__)
 
-ControlKind = Literal["text", "textarea", "select", "radio", "checkbox", "file"]
 ActionKind = Literal["next", "review", "submit"]
 
 SUCCESS_PATTERNS = (
@@ -65,39 +70,12 @@ class LinkedInEasyApplyError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class EasyApplyField:
-    """One normalized control discovered in the current Easy Apply step."""
-
-    question_raw: str
-    normalized_key: str
-    question_type: QuestionType
-    control_kind: ControlKind
-    dom_id: str | None = None
-    name: str | None = None
-    input_type: str | None = None
-    required: bool = False
-    prefilled: bool = False
-    current_value: str = ""
-    options: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
 class EasyApplyStep:
     """Current Easy Apply step metadata and discovered controls."""
 
     step_index: int
     total_steps: int
     fields: tuple[EasyApplyField, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class ResolvedFieldValue:
-    """Value selected for one field plus the audit metadata."""
-
-    value: str
-    answer_source: AnswerSource
-    fill_strategy: FillStrategy
-    ambiguity_flag: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,271 +114,6 @@ class EasyApplyExecutor(Protocol):
         """Run the Easy Apply flow for one posting."""
 
 
-def normalize_text(value: str) -> str:
-    """Collapse repeated whitespace and lowercase for comparisons."""
-
-    return re.sub(r"\s+", " ", value).strip().lower()
-
-
-def normalize_key(value: str) -> str:
-    """Convert free-form labels into stable snake_case keys."""
-
-    normalized = normalize_text(value)
-    slug = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
-    return slug or "unknown"
-
-
-def classify_question(
-    question_raw: str,
-    *,
-    control_kind: ControlKind,
-    input_type: str | None,
-    options: tuple[str, ...],
-) -> tuple[QuestionType, str]:
-    """Infer the question type and normalized key from the raw label."""
-
-    normalized = normalize_text(question_raw)
-
-    if control_kind == "file" and any(term in normalized for term in ("resume", "cv")):
-        return QuestionType.RESUME_UPLOAD, "resume_upload"
-    if "cover letter" in normalized:
-        return QuestionType.COVER_LETTER, "cover_letter"
-    if input_type == "email" or "email" in normalized or "e-mail" in normalized:
-        return QuestionType.EMAIL, "email"
-    if input_type == "tel" or "phone" in normalized or "mobile" in normalized:
-        return QuestionType.PHONE, "phone"
-    if "linkedin" in normalized:
-        return QuestionType.LINKEDIN_URL, "linkedin_url"
-    if "github" in normalized:
-        return QuestionType.GITHUB_URL, "github_url"
-    if any(term in normalized for term in ("portfolio", "personal site", "website", "site")):
-        return QuestionType.PORTFOLIO_URL, "portfolio_url"
-    if any(
-        term in normalized
-        for term in (
-            "authorized to work",
-            "work authorization",
-            "legally authorized",
-            "eligible to work",
-        )
-    ):
-        return QuestionType.WORK_AUTHORIZATION, "work_authorization"
-    if any(term in normalized for term in ("sponsorship", "visa", "require sponsor")):
-        return QuestionType.VISA_SPONSORSHIP, "visa_sponsorship"
-    if any(term in normalized for term in ("salary", "compensation", "pay expectation")):
-        return QuestionType.SALARY_EXPECTATION, "salary_expectation"
-    if any(
-        term in normalized
-        for term in ("start date", "availability", "notice period", "when can you start")
-    ):
-        return QuestionType.START_DATE, "start_date"
-    if "city" in normalized or ("location" in normalized and control_kind in {"text", "textarea"}):
-        return QuestionType.CITY, "city"
-    if "experience" in normalized and "year" in normalized:
-        return QuestionType.YEARS_EXPERIENCE, normalize_key(question_raw)
-    yes_no_options = {normalize_text(option) for option in options if option.strip()}
-    if yes_no_options and yes_no_options.issubset({"yes", "no"}):
-        return QuestionType.YES_NO_GENERIC, normalize_key(question_raw)
-    if control_kind == "textarea":
-        return QuestionType.FREE_TEXT_GENERIC, normalize_key(question_raw)
-    return QuestionType.UNKNOWN, normalize_key(question_raw)
-
-
-def _build_field(payload: dict[str, object]) -> EasyApplyField:
-    question_raw = str(
-        payload.get("question_raw")
-        or payload.get("name")
-        or payload.get("dom_id")
-        or payload.get("input_type")
-        or "unknown question"
-    )
-    control_kind = str(payload.get("control_kind") or "text")
-    control = (
-        control_kind
-        if control_kind
-        in {
-            "text",
-            "textarea",
-            "select",
-            "radio",
-            "checkbox",
-            "file",
-        }
-        else "text"
-    )
-    typed_control = cast(ControlKind, control)
-    raw_options = payload.get("options", ())
-    option_items = raw_options if isinstance(raw_options, (list, tuple)) else ()
-    options = tuple(item.strip() for item in option_items if isinstance(item, str) and item.strip())
-    input_type = str(payload.get("input_type")) if payload.get("input_type") else None
-    question_type, normalized_key = classify_question(
-        question_raw,
-        control_kind=typed_control,
-        input_type=input_type,
-        options=options,
-    )
-    return EasyApplyField(
-        question_raw=question_raw,
-        normalized_key=normalized_key,
-        question_type=question_type,
-        control_kind=typed_control,
-        dom_id=str(payload.get("dom_id")) if payload.get("dom_id") else None,
-        name=str(payload.get("name")) if payload.get("name") else None,
-        input_type=input_type,
-        required=bool(payload.get("required")),
-        prefilled=bool(payload.get("prefilled")),
-        current_value=str(payload.get("current_value") or ""),
-        options=options,
-    )
-
-
-class LinkedInAnswerResolver:
-    """Resolve known Easy Apply fields against the user profile and defaults."""
-
-    def resolve(
-        self,
-        field: EasyApplyField,
-        settings: UserAgentSettings,
-    ) -> ResolvedFieldValue | None:
-        """Return the selected value for a field, preserving prefilled controls."""
-
-        if field.prefilled and field.current_value.strip():
-            return None
-
-        default_value = self._lookup_default_response(field.normalized_key, settings)
-        if default_value is not None:
-            return ResolvedFieldValue(
-                value=default_value,
-                answer_source=AnswerSource.DEFAULT_RESPONSE,
-                fill_strategy=FillStrategy.DETERMINISTIC,
-            )
-
-        direct_value = self._resolve_direct_value(field, settings)
-        if direct_value is not None:
-            return ResolvedFieldValue(
-                value=direct_value,
-                answer_source=AnswerSource.PROFILE_SNAPSHOT,
-                fill_strategy=FillStrategy.DETERMINISTIC,
-            )
-
-        if not settings.ruleset.allow_best_effort_autofill:
-            return None
-
-        best_effort = self._resolve_best_effort(field, settings)
-        if best_effort is None:
-            return None
-        return ResolvedFieldValue(
-            value=best_effort,
-            answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
-            fill_strategy=FillStrategy.BEST_EFFORT,
-            ambiguity_flag=True,
-        )
-
-    def _lookup_default_response(
-        self,
-        normalized_key: str,
-        settings: UserAgentSettings,
-    ) -> str | None:
-        for key, value in settings.profile.default_responses.items():
-            if normalize_key(key) == normalized_key and value.strip():
-                return value.strip()
-        return None
-
-    def _resolve_direct_value(
-        self,
-        field: EasyApplyField,
-        settings: UserAgentSettings,
-    ) -> str | None:
-        profile = settings.profile
-
-        match field.question_type:
-            case QuestionType.EMAIL:
-                return str(profile.email)
-            case QuestionType.PHONE:
-                return profile.phone
-            case QuestionType.CITY:
-                return profile.city
-            case QuestionType.LINKEDIN_URL:
-                return str(profile.linkedin_url) if profile.linkedin_url else None
-            case QuestionType.GITHUB_URL:
-                return str(profile.github_url) if profile.github_url else None
-            case QuestionType.PORTFOLIO_URL:
-                return str(profile.portfolio_url) if profile.portfolio_url else None
-            case QuestionType.WORK_AUTHORIZATION:
-                return "Yes" if profile.work_authorized else "No"
-            case QuestionType.VISA_SPONSORSHIP:
-                return "Yes" if profile.needs_sponsorship else "No"
-            case QuestionType.SALARY_EXPECTATION:
-                if profile.salary_expectation is None:
-                    return None
-                return str(profile.salary_expectation)
-            case QuestionType.START_DATE:
-                return profile.availability
-            case QuestionType.RESUME_UPLOAD:
-                return profile.cv_path
-            case QuestionType.COVER_LETTER:
-                return self._lookup_default_response("cover_letter", settings)
-            case QuestionType.YEARS_EXPERIENCE:
-                return self._resolve_years_experience(field, settings)
-            case _:
-                return None
-
-    def _resolve_years_experience(
-        self,
-        field: EasyApplyField,
-        settings: UserAgentSettings,
-    ) -> str | None:
-        normalized_question = normalize_text(f"{field.question_raw} {field.normalized_key}")
-        for stack_name, years in settings.profile.years_experience_by_stack.items():
-            if normalize_key(stack_name) in normalized_question:
-                return str(years)
-
-        years_values = tuple(settings.profile.years_experience_by_stack.values())
-        if years_values:
-            return str(max(years_values))
-        return None
-
-    def _resolve_best_effort(
-        self,
-        field: EasyApplyField,
-        settings: UserAgentSettings,
-    ) -> str | None:
-        profile = settings.profile
-        normalized_question = normalize_text(field.question_raw)
-
-        if field.question_type is QuestionType.RESUME_UPLOAD:
-            return profile.cv_path
-
-        if field.options:
-            preferred = "No" if "follow" in normalized_question else None
-            return _pick_option(field.options, preferred=preferred)
-
-        if field.control_kind == "checkbox":
-            return "No" if "follow" in normalized_question else "Yes"
-        if field.control_kind == "file":
-            return profile.cv_path
-        if field.control_kind == "textarea":
-            return self._first_default_response(settings) or "Open to discuss."
-        if field.input_type == "email":
-            return str(profile.email)
-        if field.input_type == "tel":
-            return profile.phone
-        if field.input_type == "url":
-            return str(profile.linkedin_url)
-        if field.input_type == "number":
-            if profile.salary_expectation is not None:
-                return str(profile.salary_expectation)
-            years_values = tuple(profile.years_experience_by_stack.values())
-            return str(max(years_values)) if years_values else "0"
-        return self._first_default_response(settings) or profile.availability or profile.city
-
-    def _first_default_response(self, settings: UserAgentSettings) -> str | None:
-        for value in settings.profile.default_responses.values():
-            if value.strip():
-                return value.strip()
-        return None
-
-
 class PlaywrightLinkedInEasyApplyExecutor:
     """Use Playwright to run the LinkedIn Easy Apply modal end to end."""
 
@@ -412,6 +125,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
     ) -> None:
         self._runtime_settings = runtime_settings
         self._answer_resolver = answer_resolver or LinkedInAnswerResolver()
+        self._question_extractor = LinkedInQuestionExtractor()
         self._session_manager: LinkedInSessionManager | None = None
 
     async def execute(
@@ -520,6 +234,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     page,
                     step,
                     settings,
+                    posting=posting,
                     submission_id=submission_id,
                     uploaded_cv_paths=uploaded_cv_paths,
                 )
@@ -594,6 +309,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         step: EasyApplyStep,
         settings: UserAgentSettings,
         *,
+        posting: JobPosting,
         submission_id: UUID,
         uploaded_cv_paths: set[str],
     ) -> tuple[list[ApplicationAnswer], list[ArtifactSnapshot]]:
@@ -602,7 +318,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         artifacts: list[ArtifactSnapshot] = []
 
         for field in step.fields:
-            resolution = self._answer_resolver.resolve(field, settings)
+            resolution = await self._answer_resolver.resolve(field, settings, posting=posting)
             if resolution is None:
                 continue
 
@@ -665,7 +381,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 locator = await self._find_control_locator(root, field)
                 if locator is None:
                     return None
-                option = _pick_option(field.options, preferred=resolution.value)
+                option = pick_option(field.options, preferred=resolution.value)
                 if option is None:
                     return None
                 await locator.select_option(label=option)
@@ -681,7 +397,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 await locator.uncheck()
                 return "No"
             case "radio":
-                option = _pick_option(field.options, preferred=resolution.value)
+                option = pick_option(field.options, preferred=resolution.value)
                 if option is None:
                     return None
                 if await self._check_radio_option(root, field, option):
@@ -924,7 +640,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
         else:
             total = max(step_index + 1, 1)
         raw_fields = payload.get("fields", [])
-        fields = tuple(_build_field(item) for item in raw_fields if isinstance(item, dict))
+        fields = tuple(
+            self._question_extractor.build_field(item)
+            for item in raw_fields
+            if isinstance(item, dict)
+        )
         return EasyApplyStep(step_index=step_index, total_steps=total, fields=fields)
 
     async def _find_primary_action(self, page: Page) -> tuple[ActionKind, Locator] | None:
@@ -1161,30 +881,6 @@ class LinkedInEasyApplySubmitter(JobSubmitter):
 def _attribute_selector(attribute: str, value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'[{attribute}="{escaped}"]'
-
-
-def _pick_option(options: tuple[str, ...], *, preferred: str | None = None) -> str | None:
-    if not options:
-        return None
-
-    if preferred is not None:
-        normalized_preferred = normalize_text(preferred)
-        for option in options:
-            normalized_option = normalize_text(option)
-            if normalized_option == normalized_preferred:
-                return option
-        for option in options:
-            normalized_option = normalize_text(option)
-            if (
-                normalized_preferred in normalized_option
-                or normalized_option in normalized_preferred
-            ):
-                return option
-
-    for option in options:
-        if normalize_text(option) not in {"", "select an option", "choose an option"}:
-            return option
-    return options[0]
 
 
 def _join_errors(errors: tuple[str, ...]) -> str:

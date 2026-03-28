@@ -50,8 +50,8 @@ def test_submitted_submission_requires_snapshot_and_ruleset() -> None:
         )
 
 
-def test_best_effort_answers_must_be_marked_as_ambiguous() -> None:
-    with pytest.raises(ValueError, match="best-effort answers must be marked as ambiguous"):
+def test_non_deterministic_answers_must_be_marked_as_ambiguous() -> None:
+    with pytest.raises(ValueError, match="non-deterministic answers must be marked as ambiguous"):
         ApplicationAnswer(
             submission_id=uuid4(),
             step_index=1,
@@ -77,3 +77,18 @@ def test_best_effort_answers_must_be_marked_as_ambiguous() -> None:
 
     assert answer.ambiguity_flag is True
     assert json.loads(json.dumps({"answer": answer.answer_raw})) == {"answer": "Yes"}
+
+    ai_answer = ApplicationAnswer(
+        submission_id=uuid4(),
+        step_index=2,
+        question_raw="Why do you want this role?",
+        question_type=QuestionType.FREE_TEXT_GENERIC,
+        normalized_key="why_do_you_want_this_role",
+        answer_raw="I have strong experience with backend automation.",
+        answer_source=AnswerSource.AI,
+        fill_strategy=FillStrategy.AUTOFILL_AI,
+        ambiguity_flag=True,
+    )
+
+    assert ai_answer.answer_source is AnswerSource.AI
+    assert ai_answer.fill_strategy is FillStrategy.AUTOFILL_AI

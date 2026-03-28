@@ -174,8 +174,11 @@ class ApplicationAnswer:
             ensure_non_empty(self.normalized_key, "normalized_key"),
         )
         object.__setattr__(self, "answer_raw", ensure_non_empty(self.answer_raw, "answer_raw"))
-        if self.fill_strategy is FillStrategy.BEST_EFFORT and not self.ambiguity_flag:
-            msg = "best-effort answers must be marked as ambiguous"
+        if (
+            self.fill_strategy in {FillStrategy.BEST_EFFORT, FillStrategy.AUTOFILL_AI}
+            and not self.ambiguity_flag
+        ):
+            msg = "non-deterministic answers must be marked as ambiguous"
             raise ValueError(msg)
 
 

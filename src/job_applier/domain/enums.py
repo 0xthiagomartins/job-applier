@@ -60,11 +60,13 @@ class AnswerSource(StrEnum):
     PROFILE_SNAPSHOT = "profile_snapshot"
     DEFAULT_RESPONSE = "default_response"
     BEST_EFFORT_AUTOFILL = "best_effort_autofill"
+    AI = "ai"
 
 
 class FillStrategy(StrEnum):
     DETERMINISTIC = "deterministic"
     BEST_EFFORT = "best_effort"
+    AUTOFILL_AI = "autofill_ai"
 
 
 class RecruiterAction(StrEnum):
