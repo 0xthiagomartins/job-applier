@@ -1,2 +1,35 @@
 /context
 .codex
+.vscode
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+
+# Environment files
+.env
+.env.*
+
+# SQLite
+*.db
+*.sqlite
+*.sqlite3
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+
+# Playwright / test outputs
+playwright-report/
+test-results/
+
+# Local artifacts
+artifacts/*
+!artifacts/.gitkeep
