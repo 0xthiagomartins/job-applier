@@ -12,6 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Thiago Martins" }]
 dependencies = [
   "alembic>=1.16.0,<2.0.0",
+  "email-validator>=2.2.0,<3.0.0",
   "fastapi>=0.115.0,<1.0.0",
   "playwright>=1.52.0,<2.0.0",
   "pydantic-settings>=2.10.0,<3.0.0",
@@ -60,4 +61,3 @@ mypy_path = ["src"]
 [[tool.mypy.overrides]]
 module = ["tests.*"]
 disallow_untyped_defs = false
-
