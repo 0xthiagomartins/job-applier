@@ -23,6 +23,7 @@ export type PreferencesSection = {
   workplace_types: string[];
   seniority: string[];
   easy_apply_only: boolean;
+  minimum_score_threshold: number;
   positive_keywords: string[];
   negative_keywords: string[];
   auto_connect_with_recruiter: boolean;

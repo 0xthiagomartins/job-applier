@@ -135,6 +135,7 @@ class StoredPreferencesSection(PanelModel):
     workplace_types: tuple[WorkplaceType, ...] = ()
     seniority: tuple[SeniorityLevel, ...] = ()
     easy_apply_only: bool = True
+    minimum_score_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     positive_keywords: tuple[str, ...] = ()
     negative_keywords: tuple[str, ...] = ()
     auto_connect_with_recruiter: bool = False
@@ -149,6 +150,7 @@ class PreferencesFormInput(BaseModel):
     workplace_types: tuple[WorkplaceType, ...] = ()
     seniority: tuple[SeniorityLevel, ...] = ()
     easy_apply_only: bool = True
+    minimum_score_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     positive_keywords: tuple[str, ...] = ()
     negative_keywords: tuple[str, ...] = ()
     auto_connect_with_recruiter: bool = False

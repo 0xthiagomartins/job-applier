@@ -4,12 +4,16 @@ from functools import lru_cache
 
 from job_applier.application.agent_execution import AgentExecutionOrchestrator
 from job_applier.application.agent_scheduler import AgentScheduler
+from job_applier.application.job_scoring import RuleBasedJobScorer
 from job_applier.infrastructure import (
     InMemorySuccessfulSubmissionStore,
     LocalExecutionStore,
     LocalPanelSettingsStore,
 )
-from job_applier.infrastructure.linkedin import LinkedInJobFetcher, PlaywrightLinkedInJobsClient
+from job_applier.infrastructure.linkedin import (
+    LinkedInJobFetcher,
+    PlaywrightLinkedInJobsClient,
+)
 from job_applier.infrastructure.sqlite import SqliteJobPostingRepository, create_session_factory
 from job_applier.infrastructure.sqlite.database import SessionFactory
 from job_applier.settings import get_runtime_settings
@@ -65,6 +69,13 @@ def get_job_fetcher() -> LinkedInJobFetcher:
 
 
 @lru_cache(maxsize=1)
+def get_job_scorer() -> RuleBasedJobScorer:
+    """Return the deterministic job scorer used by executions."""
+
+    return RuleBasedJobScorer()
+
+
+@lru_cache(maxsize=1)
 def get_successful_submission_store() -> InMemorySuccessfulSubmissionStore:
     """Return the in-memory successful submission store singleton."""
 
@@ -80,6 +91,7 @@ def get_agent_orchestrator() -> AgentExecutionOrchestrator:
         execution_store=get_execution_store(),
         successful_submission_store=get_successful_submission_store(),
         job_fetcher=get_job_fetcher(),
+        job_scorer=get_job_scorer(),
     )
 
 

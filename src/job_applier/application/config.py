@@ -48,6 +48,7 @@ class SearchConfig(FrozenModel):
     workplace_types: tuple[WorkplaceType, ...] = ()
     seniority: tuple[SeniorityLevel, ...] = ()
     easy_apply_only: bool = True
+    minimum_score_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
 
 
 class ScheduleConfig(FrozenModel):

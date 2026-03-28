@@ -91,6 +91,7 @@ def test_preferences_and_ai_roundtrip(
                     "workplace_types": ["remote", "hybrid"],
                     "seniority": ["senior"],
                     "easy_apply_only": "true",
+                    "minimum_score_threshold": "0.7",
                     "positive_keywords": "fastapi, agentic",
                     "negative_keywords": "internship",
                     "auto_connect_with_recruiter": "true",
@@ -119,6 +120,7 @@ def test_preferences_and_ai_roundtrip(
     assert schedule_status == 200
     assert payload["preferences"]["auto_connect_with_recruiter"] is True
     assert payload["preferences"]["keywords"] == ["python", "automation"]
+    assert payload["preferences"]["minimum_score_threshold"] == 0.7
     assert payload["schedule"]["run_at"] == "23:00"
     assert payload["schedule"]["timezone"] == "America/Sao_Paulo"
     assert payload["ai"]["has_api_key"] is True

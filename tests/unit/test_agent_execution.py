@@ -178,6 +178,7 @@ def build_ready_panel_store(root_dir: Path) -> LocalPanelSettingsStore:
             workplace_types=(WorkplaceType.REMOTE,),
             seniority=(SeniorityLevel.SENIOR,),
             easy_apply_only=True,
+            minimum_score_threshold=0.55,
             positive_keywords=("fastapi",),
             negative_keywords=("internship",),
         ),

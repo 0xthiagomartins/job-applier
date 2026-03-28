@@ -69,6 +69,10 @@ export function PreferencesForm(): React.JSX.Element {
     if (state.preferences.easy_apply_only) {
       payload.append("easy_apply_only", "true");
     }
+    payload.append(
+      "minimum_score_threshold",
+      String(state.preferences.minimum_score_threshold),
+    );
     payload.append("positive_keywords", state.preferences.positive_keywords.join(", "));
     payload.append("negative_keywords", state.preferences.negative_keywords.join(", "));
     if (state.preferences.auto_connect_with_recruiter) {
@@ -119,6 +123,19 @@ export function PreferencesForm(): React.JSX.Element {
             type="number"
             value={state.preferences.posted_within_hours}
             onChange={(event) => updateField("posted_within_hours", Number(event.target.value))}
+          />
+        </Field>
+
+        <Field label="Minimum score threshold">
+          <Input
+            min={0}
+            max={1}
+            step={0.05}
+            type="number"
+            value={state.preferences.minimum_score_threshold}
+            onChange={(event) =>
+              updateField("minimum_score_threshold", Number(event.target.value))
+            }
           />
         </Field>
 

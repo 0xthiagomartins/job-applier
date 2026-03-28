@@ -222,6 +222,7 @@ def build_user_agent_settings(document: PanelSettingsDocument) -> UserAgentSetti
                 workplace_types=document.preferences.workplace_types,
                 seniority=document.preferences.seniority,
                 easy_apply_only=document.preferences.easy_apply_only,
+                minimum_score_threshold=document.preferences.minimum_score_threshold,
             ),
             agent=AgentConfig(
                 schedule=ScheduleConfig(
