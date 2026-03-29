@@ -59,16 +59,34 @@ export function ScheduleForm(): React.JSX.Element {
 
     startSaving(() => {
       void saveSchedule(payload)
-        .then((result) => setFeedback({ kind: "success", message: result.message }))
+        .then(async (result) => {
+          const refreshedState = await fetchPanelState();
+          setState(refreshedState);
+          setFeedback({ kind: "success", message: result.message });
+        })
         .catch((error: Error) => setFeedback({ kind: "error", message: error.message }));
     });
   }
 
   function handleRunNow(): void {
+    if (typeof window !== "undefined") {
+      const confirmed = window.confirm(
+        "Executar o agente agora? Isso vai disparar o fluxo completo de busca e aplicacao.",
+      );
+      if (!confirmed) {
+        return;
+      }
+    }
+
     startRunning(() => {
       void runAgentNow()
         .then((execution) => {
-          setExecutions((current) => [execution, ...current.filter((item) => item.execution_id !== execution.execution_id)].slice(0, 5));
+          setExecutions((current) =>
+            [execution, ...current.filter((item) => item.execution_id !== execution.execution_id)].slice(
+              0,
+              5,
+            ),
+          );
           setFeedback({ kind: "success", message: "Manual execution completed." });
         })
         .catch((error: Error) => setFeedback({ kind: "error", message: error.message }));
@@ -110,10 +128,21 @@ export function ScheduleForm(): React.JSX.Element {
           </Field>
 
           <Field label="Timezone">
-            <Input
+            <Select
               value={state.schedule.timezone}
-              onChange={(event) => updateField("timezone", event.target.value)}
-            />
+              onValueChange={(value) => updateField("timezone", value)}
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Select a timezone" />
+              </SelectTrigger>
+              <SelectContent>
+                {state.options.timezones.map((option) => (
+                  <SelectItem key={option} value={option}>
+                    {option}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </Field>
         </div>
 
@@ -129,6 +158,22 @@ export function ScheduleForm(): React.JSX.Element {
           </div>
         </div>
       </form>
+
+      <Card className="bg-white/70">
+        <CardHeader>
+          <CardTitle>Next scheduled run</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <p className="text-lg font-semibold text-foreground">
+            {state.computed.next_execution_at
+              ? new Date(state.computed.next_execution_at).toLocaleString()
+              : "Unavailable"}
+          </p>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Daily at {state.schedule.run_at} in {state.schedule.timezone}.
+          </p>
+        </CardContent>
+      </Card>
 
       <Card className="bg-white/70">
         <CardHeader>

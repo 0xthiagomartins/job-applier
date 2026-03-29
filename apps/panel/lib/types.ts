@@ -41,6 +41,10 @@ export type AISection = {
   masked_api_key: string | null;
 };
 
+export type ComputedPanelState = {
+  next_execution_at: string | null;
+};
+
 export type ExecutionSummary = {
   execution_id: string;
   origin: string;
@@ -166,9 +170,11 @@ export type PanelState = {
   profile: ProfileSection;
   preferences: PreferencesSection;
   schedule: ScheduleSection;
+  computed: ComputedPanelState;
   ai: AISection;
   options: {
     schedule_frequencies: string[];
+    timezones: string[];
     workplace_types: string[];
     seniority_levels: string[];
   };

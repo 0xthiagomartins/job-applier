@@ -123,4 +123,6 @@ def test_preferences_and_ai_roundtrip(
     assert payload["preferences"]["minimum_score_threshold"] == 0.7
     assert payload["schedule"]["run_at"] == "23:00"
     assert payload["schedule"]["timezone"] == "America/Sao_Paulo"
+    assert payload["computed"]["next_execution_at"].endswith("+00:00")
     assert payload["ai"]["has_api_key"] is True
+    assert "America/Sao_Paulo" in payload["options"]["timezones"]

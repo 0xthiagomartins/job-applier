@@ -1,14 +1,14 @@
+import { OperationalDashboard } from "@/components/operational-dashboard";
 import { PanelShell } from "@/components/panel-shell";
-import { OverviewCards } from "@/components/overview-cards";
 
 export default function HomePage(): React.JSX.Element {
   return (
     <PanelShell
       active="/"
-      description="The panel stays intentionally small. Use it to configure the candidate profile, search filters, AI setup and recruiter toggle without pulling UI concerns into the Python backend."
-      title="Overview"
+      description="Track the last execution, trigger manual runs and jump quickly into schedule, filters and history without leaving the panel."
+      title="Operations"
     >
-      <OverviewCards />
+      <OperationalDashboard />
     </PanelShell>
   );
 }

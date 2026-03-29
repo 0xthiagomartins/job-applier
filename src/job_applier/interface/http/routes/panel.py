@@ -10,10 +10,12 @@ from pydantic import AnyUrl, SecretStr
 
 from job_applier.application.panel import (
     SCHEDULE_FREQUENCY_OPTIONS,
+    TIMEZONE_OPTIONS,
     AIFormInput,
     PreferencesFormInput,
     ProfileFormInput,
     ScheduleFormInput,
+    calculate_next_execution_at,
     parse_csv_lines,
     parse_int_mapping_lines,
     parse_text_mapping_lines,
@@ -52,6 +54,9 @@ async def get_panel_state(
             "profile": document.profile.model_dump(mode="json"),
             "preferences": document.preferences.model_dump(mode="json"),
             "schedule": document.schedule.model_dump(mode="json"),
+            "computed": {
+                "next_execution_at": calculate_next_execution_at(document.schedule).isoformat(),
+            },
             "ai": {
                 "model": document.ai.model,
                 "has_api_key": document.ai.api_key is not None,
@@ -59,6 +64,7 @@ async def get_panel_state(
             },
             "options": {
                 "schedule_frequencies": [option.value for option in SCHEDULE_FREQUENCY_OPTIONS],
+                "timezones": list(TIMEZONE_OPTIONS),
                 "workplace_types": [option.value for option in WorkplaceType],
                 "seniority_levels": [option.value for option in SeniorityLevel],
             },
@@ -187,7 +193,14 @@ async def get_schedule(
     """Return the persisted schedule section."""
 
     document = store.load()
-    return JSONResponse(content={"schedule": document.schedule.model_dump(mode="json")})
+    return JSONResponse(
+        content={
+            "schedule": document.schedule.model_dump(mode="json"),
+            "computed": {
+                "next_execution_at": calculate_next_execution_at(document.schedule).isoformat(),
+            },
+        },
+    )
 
 
 @api_router.put("/schedule")
@@ -209,6 +222,9 @@ async def save_schedule(
         content={
             "message": "Schedule saved successfully.",
             "schedule": document.schedule.model_dump(mode="json"),
+            "computed": {
+                "next_execution_at": calculate_next_execution_at(document.schedule).isoformat(),
+            },
         },
     )
 

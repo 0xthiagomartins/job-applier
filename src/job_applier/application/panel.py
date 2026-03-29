@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -21,6 +22,14 @@ from job_applier.domain.enums import ScheduleFrequency, SeniorityLevel, Workplac
 
 MODEL_OPTIONS = ("o3-mini", "gpt-4.1-mini", "gpt-4o-mini")
 SCHEDULE_FREQUENCY_OPTIONS = (ScheduleFrequency.DAILY,)
+TIMEZONE_OPTIONS = (
+    "UTC",
+    "America/Sao_Paulo",
+    "America/New_York",
+    "America/Chicago",
+    "America/Los_Angeles",
+    "Europe/London",
+)
 
 
 class PanelModel(BaseModel):
@@ -284,3 +293,25 @@ def ensure_runtime_dir(path: Path) -> Path:
 
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def calculate_next_execution_at(
+    schedule: StoredScheduleSection,
+    *,
+    now_utc: datetime | None = None,
+) -> datetime:
+    """Return the next UTC timestamp for the configured daily schedule."""
+
+    current_utc = now_utc or datetime.now(UTC)
+    timezone = ZoneInfo(schedule.timezone)
+    current_local = current_utc.astimezone(timezone)
+    hour_text, minute_text = schedule.run_at.split(":", maxsplit=1)
+    next_local = current_local.replace(
+        hour=int(hour_text),
+        minute=int(minute_text),
+        second=0,
+        microsecond=0,
+    )
+    if next_local <= current_local:
+        next_local += timedelta(days=1)
+    return next_local.astimezone(UTC)

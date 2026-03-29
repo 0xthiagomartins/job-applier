@@ -1,7 +1,10 @@
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import SecretStr
 
+from job_applier.application.panel import StoredScheduleSection, calculate_next_execution_at
+from job_applier.domain import ScheduleFrequency
 from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
 from job_applier.settings import RuntimeSettings
 
@@ -106,3 +109,18 @@ def test_local_panel_store_backfills_existing_empty_state_with_bootstrap(tmp_pat
     assert document.ai.api_key is not None
     assert document.ai.api_key.get_secret_value() == "sk-test-12345"
     assert document.schedule.timezone == "America/Sao_Paulo"
+
+
+def test_calculate_next_execution_at_returns_next_daily_slot() -> None:
+    schedule = StoredScheduleSection(
+        frequency=ScheduleFrequency.DAILY,
+        run_at="23:00",
+        timezone="America/Sao_Paulo",
+    )
+
+    next_execution = calculate_next_execution_at(
+        schedule,
+        now_utc=datetime(2026, 3, 29, 23, 30, tzinfo=UTC),
+    )
+
+    assert next_execution == datetime(2026, 3, 30, 2, 0, tzinfo=UTC)
