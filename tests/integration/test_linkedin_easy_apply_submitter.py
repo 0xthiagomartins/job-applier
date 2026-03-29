@@ -21,6 +21,8 @@ from job_applier.domain import (
     ApplicationAnswer,
     ArtifactSnapshot,
     ArtifactType,
+    ExecutionEvent,
+    ExecutionEventType,
     ExecutionOrigin,
     FillStrategy,
     QuestionType,
@@ -37,6 +39,7 @@ from job_applier.infrastructure.linkedin.easy_apply import (
 from job_applier.infrastructure.sqlite import (
     SqliteAnswerRepository,
     SqliteArtifactSnapshotRepository,
+    SqliteExecutionEventRepository,
     SqliteJobPostingRepository,
     SqliteProfileSnapshotRepository,
     SqliteRecruiterInteractionRepository,
@@ -66,7 +69,9 @@ def test_easy_apply_submitter_persists_only_successful_submissions(tmp_path: Pat
     snapshot_repo = SqliteProfileSnapshotRepository(session_factory)
     recruiter_repo = SqliteRecruiterInteractionRepository(session_factory)
     artifact_repo = SqliteArtifactSnapshotRepository(session_factory)
+    event_repo = SqliteExecutionEventRepository(session_factory)
     history_repo = SqliteSubmissionHistoryRepository(session_factory)
+    execution_run_id = uuid4()
 
     posting = posting_repo.save(
         build_posting(
@@ -82,7 +87,9 @@ def test_easy_apply_submitter_persists_only_successful_submissions(tmp_path: Pat
         def __init__(self) -> None:
             self.calls = 0
 
-        async def execute(self, settings, posting, *, origin):
+        async def execute(self, settings, posting, *, execution_id, origin):
+            del settings, posting, origin
+            assert execution_id == execution_run_id
             self.calls += 1
             if self.calls == 1:
                 submission_id = uuid4()
@@ -119,6 +126,15 @@ def test_easy_apply_submitter_persists_only_successful_submissions(tmp_path: Pat
                             sent_at=submitted_at,
                         ),
                     ),
+                    execution_events=(
+                        ExecutionEvent(
+                            execution_id=execution_run_id,
+                            submission_id=submission_id,
+                            event_type=ExecutionEventType.SUBMIT_TRIGGERED,
+                            payload_json='{"stage":"submit"}',
+                            timestamp=submitted_at,
+                        ),
+                    ),
                     submitted_at=submitted_at,
                     cv_version="resume.pdf",
                 )
@@ -127,6 +143,14 @@ def test_easy_apply_submitter_persists_only_successful_submissions(tmp_path: Pat
                 started_at=datetime(2026, 3, 28, 23, 5, tzinfo=UTC),
                 status=SubmissionStatus.FAILED,
                 notes="validation error: missing answer",
+                execution_events=(
+                    ExecutionEvent(
+                        execution_id=execution_run_id,
+                        event_type=ExecutionEventType.EXCEPTION_CAPTURED,
+                        payload_json='{"stage":"submit","message":"validation error"}',
+                        timestamp=datetime(2026, 3, 28, 23, 5, tzinfo=UTC),
+                    ),
+                ),
             )
 
     submitter = LinkedInEasyApplySubmitter(
@@ -136,13 +160,24 @@ def test_easy_apply_submitter_persists_only_successful_submissions(tmp_path: Pat
         profile_snapshot_repository=snapshot_repo,
         recruiter_repository=recruiter_repo,
         artifact_repository=artifact_repo,
+        execution_event_repository=event_repo,
     )
 
     successful_attempt = asyncio.run(
-        submitter.submit(settings, posting, origin=ExecutionOrigin.MANUAL),
+        submitter.submit(
+            settings,
+            posting,
+            execution_id=execution_run_id,
+            origin=ExecutionOrigin.MANUAL,
+        ),
     )
     failed_attempt = asyncio.run(
-        submitter.submit(settings, posting, origin=ExecutionOrigin.MANUAL),
+        submitter.submit(
+            settings,
+            posting,
+            execution_id=execution_run_id,
+            origin=ExecutionOrigin.MANUAL,
+        ),
     )
 
     assert successful_attempt.submission.status is SubmissionStatus.SUBMITTED
@@ -158,6 +193,7 @@ def test_easy_apply_submitter_persists_only_successful_submissions(tmp_path: Pat
     answers = answer_repo.list_for_submission(successful_attempt.submission.id)
     artifacts = artifact_repo.list_for_submission(successful_attempt.submission.id)
     recruiter_interactions = recruiter_repo.list_for_submission(successful_attempt.submission.id)
+    events = event_repo.list_for_execution(execution_run_id)
     snapshots = snapshot_repo.list()
     history = history_repo.query(SubmissionHistoryFilters())
 
@@ -166,6 +202,9 @@ def test_easy_apply_submitter_persists_only_successful_submissions(tmp_path: Pat
     assert len(artifacts) == 1
     assert len(recruiter_interactions) == 1
     assert recruiter_interactions[0].status is RecruiterInteractionStatus.SENT
+    assert len(events) == 2
+    assert events[0].submission_id == successful_attempt.submission.id
+    assert events[1].submission_id is None
     assert len(snapshots) == 1
     assert history.total == 1
     assert history.items[0].submission.id == successful_attempt.submission.id

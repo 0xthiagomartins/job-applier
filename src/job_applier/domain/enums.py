@@ -84,9 +84,14 @@ class ExecutionEventType(StrEnum):
     EXECUTION_STARTED = "execution_started"
     EXECUTION_COMPLETED = "execution_completed"
     STEP_REACHED = "step_reached"
+    JOB_PROCESSED = "job_processed"
+    SUBMIT_TRIGGERED = "submit_triggered"
     AUTOFILL_APPLIED = "autofill_applied"
+    QUESTION_CLASSIFICATION_FAILED = "question_classification_failed"
+    RECRUITER_CONNECT_ATTEMPTED = "recruiter_connect_attempted"
     SUBMISSION_COMPLETED = "submission_completed"
     EXECUTION_FAILED = "execution_failed"
+    EXCEPTION_CAPTURED = "exception_captured"
 
 
 class ArtifactType(StrEnum):

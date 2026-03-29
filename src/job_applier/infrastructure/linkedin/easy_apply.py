@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
-from dataclasses import dataclass
+import traceback
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -18,6 +20,7 @@ from job_applier.application.config import UserAgentSettings
 from job_applier.application.repositories import (
     AnswerRepository,
     ArtifactSnapshotRepository,
+    ExecutionEventRepository,
     ProfileSnapshotRepository,
     RecruiterInteractionRepository,
     SubmissionRepository,
@@ -30,12 +33,14 @@ from job_applier.domain.entities import (
     ApplicationAnswer,
     ApplicationSubmission,
     ArtifactSnapshot,
+    ExecutionEvent,
     JobPosting,
     RecruiterInteraction,
     utc_now,
 )
 from job_applier.domain.enums import (
     ArtifactType,
+    ExecutionEventType,
     ExecutionOrigin,
     QuestionType,
     SubmissionStatus,
@@ -57,6 +62,7 @@ from job_applier.infrastructure.linkedin.recruiter_connect import (
     LinkedInRecruiterCandidateFinder,
     PlaywrightRecruiterConnector,
 )
+from job_applier.observability import bind_submission_context
 from job_applier.settings import RuntimeSettings
 
 logger = logging.getLogger(__name__)
@@ -93,6 +99,7 @@ class EasyApplyExecutionResult:
     status: SubmissionStatus
     notes: str | None = None
     answers: tuple[ApplicationAnswer, ...] = ()
+    execution_events: tuple[ExecutionEvent, ...] = ()
     artifacts: tuple[ArtifactSnapshot, ...] = ()
     recruiter_interactions: tuple[RecruiterInteraction, ...] = ()
     submitted_at: datetime | None = None
@@ -116,6 +123,7 @@ class EasyApplyExecutor(Protocol):
         settings: UserAgentSettings,
         posting: JobPosting,
         *,
+        execution_id: UUID,
         origin: ExecutionOrigin,
     ) -> EasyApplyExecutionResult:
         """Run the Easy Apply flow for one posting."""
@@ -129,12 +137,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
         runtime_settings: RuntimeSettings,
         *,
         answer_resolver: LinkedInAnswerResolver | None = None,
+        execution_event_repository: ExecutionEventRepository | None = None,
     ) -> None:
         self._runtime_settings = runtime_settings
         self._answer_resolver = answer_resolver or LinkedInAnswerResolver()
         self._question_extractor = LinkedInQuestionExtractor()
         self._recruiter_candidate_finder = LinkedInRecruiterCandidateFinder()
         self._recruiter_connector = PlaywrightRecruiterConnector(runtime_settings)
+        self._execution_event_repository = execution_event_repository
         self._session_manager: LinkedInSessionManager | None = None
 
     async def execute(
@@ -142,12 +152,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
         settings: UserAgentSettings,
         posting: JobPosting,
         *,
+        execution_id: UUID,
         origin: ExecutionOrigin,
     ) -> EasyApplyExecutionResult:
         submission_id = uuid4()
         started_at = utc_now()
         run_dir = self._build_run_dir(posting, submission_id)
         answers: list[ApplicationAnswer] = []
+        execution_events: list[ExecutionEvent] = []
         artifacts: list[ArtifactSnapshot] = []
         uploaded_cv_paths: set[str] = set()
 
@@ -157,18 +169,36 @@ class PlaywrightLinkedInEasyApplyExecutor:
             )
             try:
                 context = await self._get_session_manager().create_authenticated_context(browser)
+                trace_started = await self._start_trace(context)
                 try:
-                    return await self._execute_once(
+                    result = await self._execute_once(
                         context,
                         settings,
                         posting,
+                        execution_id=execution_id,
                         origin=origin,
                         submission_id=submission_id,
                         started_at=started_at,
                         run_dir=run_dir,
                         answers=answers,
+                        execution_events=execution_events,
                         artifacts=artifacts,
                         uploaded_cv_paths=uploaded_cv_paths,
+                    )
+                    trace_artifact = await self._stop_trace(
+                        context,
+                        trace_started=trace_started,
+                        run_dir=run_dir,
+                        submission_id=submission_id,
+                        preserve=result.status is SubmissionStatus.FAILED
+                        or self._runtime_settings.playwright_trace_enabled,
+                    )
+                    if trace_artifact is not None:
+                        artifacts.append(trace_artifact)
+                    return replace(
+                        result,
+                        execution_events=tuple(execution_events),
+                        artifacts=tuple(artifacts),
                     )
                 finally:
                     await context.close()
@@ -181,11 +211,13 @@ class PlaywrightLinkedInEasyApplyExecutor:
         settings: UserAgentSettings,
         posting: JobPosting,
         *,
+        execution_id: UUID,
         origin: ExecutionOrigin,
         submission_id: UUID,
         started_at: datetime,
         run_dir: Path,
         answers: list[ApplicationAnswer],
+        execution_events: list[ExecutionEvent],
         artifacts: list[ArtifactSnapshot],
         uploaded_cv_paths: set[str],
     ) -> EasyApplyExecutionResult:
@@ -194,162 +226,355 @@ class PlaywrightLinkedInEasyApplyExecutor:
         recruiter_interactions: list[RecruiterInteraction] = []
 
         try:
-            await page.goto(posting.url, wait_until="domcontentloaded")
-            await self._ensure_authenticated_page(page)
-            artifacts.append(
-                await self._capture_screenshot(
-                    page,
-                    run_dir / "job-opened.png",
-                    submission_id=submission_id,
-                ),
-            )
-            recruiter_candidate = await self._recruiter_candidate_finder.find(page, settings)
+            with bind_submission_context(submission_id):
+                await page.goto(posting.url, wait_until="domcontentloaded")
+                await self._ensure_authenticated_page(page)
+                artifacts.extend(
+                    await self._capture_debug_bundle(
+                        page,
+                        run_dir=run_dir,
+                        submission_id=submission_id,
+                        label="job_opened",
+                    ),
+                )
+                recruiter_candidate = await self._recruiter_candidate_finder.find(page, settings)
 
-            easy_apply_button = await self._find_easy_apply_button(page)
-            if easy_apply_button is None:
-                notes = "Easy Apply button not available for this posting."
-                logger.info(
-                    "linkedin_easy_apply_skipped",
-                    extra={"job_posting_id": str(posting.id), "origin": origin.value},
+                easy_apply_button = await self._find_easy_apply_button(page)
+                if easy_apply_button is None:
+                    notes = "Easy Apply button not available for this posting."
+                    logger.info(
+                        "linkedin_easy_apply_skipped",
+                        extra={"job_posting_id": str(posting.id), "origin": origin.value},
+                    )
+                    self._record_event(
+                        execution_events,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
+                        event_type=ExecutionEventType.JOB_PROCESSED,
+                        payload={
+                            "job_posting_id": str(posting.id),
+                            "origin": origin.value,
+                            "reason": "easy_apply_unavailable",
+                            "status": SubmissionStatus.SKIPPED.value,
+                        },
+                    )
+                    return EasyApplyExecutionResult(
+                        submission_id=submission_id,
+                        started_at=started_at,
+                        status=SubmissionStatus.SKIPPED,
+                        notes=notes,
+                    )
+
+                await easy_apply_button.click()
+                await self._wait_for_easy_apply_modal(page)
+
+                max_steps = 10
+                for fallback_step_index in range(max_steps):
+                    step = await self._extract_step(page, fallback_step_index=fallback_step_index)
+                    self._record_event(
+                        execution_events,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
+                        event_type=ExecutionEventType.STEP_REACHED,
+                        payload={
+                            "stage": "easy_apply_step",
+                            "job_posting_id": str(posting.id),
+                            "step_index": step.step_index,
+                            "total_steps": step.total_steps,
+                            "field_count": len(step.fields),
+                        },
+                    )
+                    logger.info(
+                        "linkedin_easy_apply_step",
+                        extra={
+                            "job_posting_id": str(posting.id),
+                            "step_index": step.step_index,
+                            "total_steps": step.total_steps,
+                            "field_count": len(step.fields),
+                        },
+                    )
+                    artifacts.extend(
+                        await self._capture_debug_bundle(
+                            page,
+                            run_dir=run_dir,
+                            submission_id=submission_id,
+                            label=f"step_{step.step_index + 1:02d}",
+                        ),
+                    )
+                    step_answers, step_artifacts = await self._fill_step_fields(
+                        page,
+                        step,
+                        settings,
+                        posting=posting,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
+                        execution_events=execution_events,
+                        uploaded_cv_paths=uploaded_cv_paths,
+                    )
+                    answers.extend(step_answers)
+                    artifacts.extend(step_artifacts)
+
+                    action = await self._find_primary_action(page)
+                    if action is None:
+                        errors = await self._collect_validation_errors(page)
+                        notes = _join_errors(errors) or "No LinkedIn step action was available."
+                        artifacts.extend(
+                            await self._capture_debug_bundle(
+                                page,
+                                run_dir=run_dir,
+                                submission_id=submission_id,
+                                label="failure_missing_action",
+                            ),
+                        )
+                        self._record_event(
+                            execution_events,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            event_type=ExecutionEventType.JOB_PROCESSED,
+                            payload={
+                                "job_posting_id": str(posting.id),
+                                "reason": "missing_primary_action",
+                                "status": SubmissionStatus.FAILED.value,
+                            },
+                        )
+                        return EasyApplyExecutionResult(
+                            submission_id=submission_id,
+                            started_at=started_at,
+                            status=SubmissionStatus.FAILED,
+                            notes=notes,
+                        )
+
+                    action_kind, action_locator = action
+                    if action_kind == "submit":
+                        await self._prepare_submit_step(page)
+                        self._record_event(
+                            execution_events,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            event_type=ExecutionEventType.SUBMIT_TRIGGERED,
+                            payload={
+                                "job_posting_id": str(posting.id),
+                                "step_index": step.step_index,
+                            },
+                        )
+                        await action_locator.click()
+                        success, outcome_notes = await self._await_submission_outcome(page)
+                        artifacts.extend(
+                            await self._capture_debug_bundle(
+                                page,
+                                run_dir=run_dir,
+                                submission_id=submission_id,
+                                label="post_submit",
+                            ),
+                        )
+                        if success:
+                            if recruiter_candidate is not None:
+                                self._record_event(
+                                    execution_events,
+                                    execution_id=execution_id,
+                                    submission_id=submission_id,
+                                    event_type=ExecutionEventType.RECRUITER_CONNECT_ATTEMPTED,
+                                    payload={
+                                        "job_posting_id": str(posting.id),
+                                        "recruiter_name": recruiter_candidate.name,
+                                        "recruiter_profile_url": recruiter_candidate.profile_url,
+                                    },
+                                )
+                                try:
+                                    recruiter_attempt = await self._recruiter_connector.connect(
+                                        context,
+                                        recruiter=recruiter_candidate,
+                                        settings=settings,
+                                        posting=posting,
+                                        submission_id=submission_id,
+                                        screenshot_path=self._artifact_path(
+                                            run_dir,
+                                            submission_id=submission_id,
+                                            label="recruiter_connect",
+                                            extension="png",
+                                        ),
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    self._record_exception_event(
+                                        execution_events,
+                                        execution_id=execution_id,
+                                        submission_id=submission_id,
+                                        stage="recruiter_connect",
+                                        error=exc,
+                                    )
+                                    logger.exception(
+                                        "linkedin_recruiter_connect_error",
+                                        extra={
+                                            "job_posting_id": str(posting.id),
+                                            "submission_id": str(submission_id),
+                                        },
+                                    )
+                                else:
+                                    recruiter_interactions.append(recruiter_attempt.interaction)
+                                    if recruiter_attempt.screenshot_path is not None:
+                                        artifacts.append(
+                                            _build_file_artifact(
+                                                submission_id=submission_id,
+                                                path=recruiter_attempt.screenshot_path,
+                                                artifact_type=ArtifactType.SCREENSHOT,
+                                            ),
+                                        )
+                                    self._record_event(
+                                        execution_events,
+                                        execution_id=execution_id,
+                                        submission_id=submission_id,
+                                        event_type=ExecutionEventType.RECRUITER_CONNECT_ATTEMPTED,
+                                        payload={
+                                            "job_posting_id": str(posting.id),
+                                            "recruiter_name": (
+                                                recruiter_attempt.interaction.recruiter_name
+                                            ),
+                                            "status": recruiter_attempt.interaction.status.value,
+                                        },
+                                    )
+                                    logger.info(
+                                        "linkedin_recruiter_connect_result",
+                                        extra={
+                                            "job_posting_id": str(posting.id),
+                                            "submission_id": str(submission_id),
+                                            "status": recruiter_attempt.interaction.status.value,
+                                            "recruiter_name": (
+                                                recruiter_attempt.interaction.recruiter_name
+                                            ),
+                                        },
+                                    )
+                            self._record_event(
+                                execution_events,
+                                execution_id=execution_id,
+                                submission_id=submission_id,
+                                event_type=ExecutionEventType.JOB_PROCESSED,
+                                payload={
+                                    "job_posting_id": str(posting.id),
+                                    "status": SubmissionStatus.SUBMITTED.value,
+                                },
+                            )
+                            return EasyApplyExecutionResult(
+                                submission_id=submission_id,
+                                started_at=started_at,
+                                status=SubmissionStatus.SUBMITTED,
+                                notes=outcome_notes
+                                or "LinkedIn Easy Apply submitted successfully.",
+                                answers=tuple(answers),
+                                recruiter_interactions=tuple(recruiter_interactions),
+                                submitted_at=utc_now(),
+                                cv_version=settings.profile.cv_filename,
+                            )
+                        self._record_event(
+                            execution_events,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            event_type=ExecutionEventType.JOB_PROCESSED,
+                            payload={
+                                "job_posting_id": str(posting.id),
+                                "reason": "submit_not_confirmed",
+                                "status": SubmissionStatus.FAILED.value,
+                            },
+                        )
+                        return EasyApplyExecutionResult(
+                            submission_id=submission_id,
+                            started_at=started_at,
+                            status=SubmissionStatus.FAILED,
+                            notes=outcome_notes or "LinkedIn did not confirm the application.",
+                        )
+
+                    await action_locator.click()
+                    await page.wait_for_timeout(700)
+
+                    errors = await self._collect_validation_errors(page)
+                    if errors:
+                        artifacts.extend(
+                            await self._capture_debug_bundle(
+                                page,
+                                run_dir=run_dir,
+                                submission_id=submission_id,
+                                label=f"failure_step_{step.step_index + 1:02d}",
+                            ),
+                        )
+                        self._record_event(
+                            execution_events,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            event_type=ExecutionEventType.JOB_PROCESSED,
+                            payload={
+                                "job_posting_id": str(posting.id),
+                                "reason": "validation_error",
+                                "status": SubmissionStatus.FAILED.value,
+                            },
+                        )
+                        return EasyApplyExecutionResult(
+                            submission_id=submission_id,
+                            started_at=started_at,
+                            status=SubmissionStatus.FAILED,
+                            notes=_join_errors(errors),
+                        )
+
+                artifacts.extend(
+                    await self._capture_debug_bundle(
+                        page,
+                        run_dir=run_dir,
+                        submission_id=submission_id,
+                        label="failure_max_steps",
+                    ),
+                )
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.JOB_PROCESSED,
+                    payload={
+                        "job_posting_id": str(posting.id),
+                        "reason": "max_steps_exceeded",
+                        "status": SubmissionStatus.FAILED.value,
+                    },
                 )
                 return EasyApplyExecutionResult(
                     submission_id=submission_id,
                     started_at=started_at,
-                    status=SubmissionStatus.SKIPPED,
-                    notes=notes,
+                    status=SubmissionStatus.FAILED,
+                    notes="LinkedIn Easy Apply exceeded the maximum number of steps.",
                 )
-
-            await easy_apply_button.click()
-            await self._wait_for_easy_apply_modal(page)
-
-            max_steps = 10
-            for fallback_step_index in range(max_steps):
-                step = await self._extract_step(page, fallback_step_index=fallback_step_index)
-                logger.info(
-                    "linkedin_easy_apply_step",
-                    extra={
-                        "job_posting_id": str(posting.id),
-                        "step_index": step.step_index,
-                        "total_steps": step.total_steps,
-                        "field_count": len(step.fields),
-                    },
-                )
-                artifacts.append(
-                    await self._capture_screenshot(
+        except Exception as exc:  # noqa: BLE001
+            self._record_exception_event(
+                execution_events,
+                execution_id=execution_id,
+                submission_id=submission_id,
+                stage="easy_apply_execute",
+                error=exc,
+            )
+            self._record_event(
+                execution_events,
+                execution_id=execution_id,
+                submission_id=submission_id,
+                event_type=ExecutionEventType.JOB_PROCESSED,
+                payload={
+                    "job_posting_id": str(posting.id),
+                    "reason": "unhandled_exception",
+                    "status": SubmissionStatus.FAILED.value,
+                },
+            )
+            if not page.is_closed():
+                artifacts.extend(
+                    await self._capture_debug_bundle(
                         page,
-                        run_dir / f"step-{step.step_index + 1}.png",
+                        run_dir=run_dir,
                         submission_id=submission_id,
+                        label="failure_exception",
                     ),
                 )
-                step_answers, step_artifacts = await self._fill_step_fields(
-                    page,
-                    step,
-                    settings,
-                    posting=posting,
-                    submission_id=submission_id,
-                    uploaded_cv_paths=uploaded_cv_paths,
-                )
-                answers.extend(step_answers)
-                artifacts.extend(step_artifacts)
-
-                action = await self._find_primary_action(page)
-                if action is None:
-                    errors = await self._collect_validation_errors(page)
-                    notes = _join_errors(errors) or "No LinkedIn step action was available."
-                    return EasyApplyExecutionResult(
-                        submission_id=submission_id,
-                        started_at=started_at,
-                        status=SubmissionStatus.FAILED,
-                        notes=notes,
-                    )
-
-                action_kind, action_locator = action
-                if action_kind == "submit":
-                    await self._prepare_submit_step(page)
-                    await action_locator.click()
-                    success, outcome_notes = await self._await_submission_outcome(page)
-                    artifacts.append(
-                        await self._capture_screenshot(
-                            page,
-                            run_dir / "post-submit.png",
-                            submission_id=submission_id,
-                        ),
-                    )
-                    if success:
-                        if recruiter_candidate is not None:
-                            try:
-                                recruiter_attempt = await self._recruiter_connector.connect(
-                                    context,
-                                    recruiter=recruiter_candidate,
-                                    settings=settings,
-                                    posting=posting,
-                                    submission_id=submission_id,
-                                    screenshot_path=run_dir / "recruiter-connect.png",
-                                )
-                            except Exception:  # noqa: BLE001
-                                logger.exception(
-                                    "linkedin_recruiter_connect_error",
-                                    extra={
-                                        "job_posting_id": str(posting.id),
-                                        "submission_id": str(submission_id),
-                                    },
-                                )
-                            else:
-                                recruiter_interactions.append(recruiter_attempt.interaction)
-                                if recruiter_attempt.screenshot_path is not None:
-                                    artifacts.append(
-                                        _build_file_artifact(
-                                            submission_id=submission_id,
-                                            path=recruiter_attempt.screenshot_path,
-                                            artifact_type=ArtifactType.SCREENSHOT,
-                                        ),
-                                    )
-                                logger.info(
-                                    "linkedin_recruiter_connect_result",
-                                    extra={
-                                        "job_posting_id": str(posting.id),
-                                        "submission_id": str(submission_id),
-                                        "status": recruiter_attempt.interaction.status.value,
-                                        "recruiter_name": (
-                                            recruiter_attempt.interaction.recruiter_name
-                                        ),
-                                    },
-                                )
-                        return EasyApplyExecutionResult(
-                            submission_id=submission_id,
-                            started_at=started_at,
-                            status=SubmissionStatus.SUBMITTED,
-                            notes=outcome_notes or "LinkedIn Easy Apply submitted successfully.",
-                            answers=tuple(answers),
-                            artifacts=tuple(artifacts),
-                            recruiter_interactions=tuple(recruiter_interactions),
-                            submitted_at=utc_now(),
-                            cv_version=settings.profile.cv_filename,
-                        )
-                    return EasyApplyExecutionResult(
-                        submission_id=submission_id,
-                        started_at=started_at,
-                        status=SubmissionStatus.FAILED,
-                        notes=outcome_notes or "LinkedIn did not confirm the application.",
-                    )
-
-                await action_locator.click()
-                await page.wait_for_timeout(700)
-
-                errors = await self._collect_validation_errors(page)
-                if errors:
-                    return EasyApplyExecutionResult(
-                        submission_id=submission_id,
-                        started_at=started_at,
-                        status=SubmissionStatus.FAILED,
-                        notes=_join_errors(errors),
-                    )
-
+            logger.exception(
+                "linkedin_easy_apply_unhandled_error",
+                extra={"job_posting_id": str(posting.id), "submission_id": str(submission_id)},
+            )
             return EasyApplyExecutionResult(
                 submission_id=submission_id,
                 started_at=started_at,
                 status=SubmissionStatus.FAILED,
-                notes="LinkedIn Easy Apply exceeded the maximum number of steps.",
+                notes=str(exc),
             )
         finally:
             await page.close()
@@ -361,7 +586,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
         settings: UserAgentSettings,
         *,
         posting: JobPosting,
+        execution_id: UUID,
         submission_id: UUID,
+        execution_events: list[ExecutionEvent],
         uploaded_cv_paths: set[str],
     ) -> tuple[list[ApplicationAnswer], list[ArtifactSnapshot]]:
         root = await self._easy_apply_root(page)
@@ -369,6 +596,20 @@ class PlaywrightLinkedInEasyApplyExecutor:
         artifacts: list[ArtifactSnapshot] = []
 
         for field in step.fields:
+            if field.question_type is QuestionType.UNKNOWN:
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.QUESTION_CLASSIFICATION_FAILED,
+                    payload={
+                        "step_index": step.step_index,
+                        "question_raw": field.question_raw,
+                        "normalized_key": field.normalized_key,
+                        "control_kind": field.control_kind,
+                        "classification_confidence": field.classification_confidence,
+                    },
+                )
             resolution = await self._answer_resolver.resolve(field, settings, posting=posting)
             if resolution is None:
                 continue
@@ -376,6 +617,23 @@ class PlaywrightLinkedInEasyApplyExecutor:
             applied_value = await self._apply_field_value(root, field, resolution, settings)
             if applied_value is None:
                 continue
+
+            if resolution.ambiguity_flag:
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.AUTOFILL_APPLIED,
+                    payload={
+                        "step_index": step.step_index,
+                        "normalized_key": field.normalized_key,
+                        "question_type": field.question_type.value,
+                        "answer_source": resolution.answer_source.value,
+                        "fill_strategy": resolution.fill_strategy.value,
+                        "confidence": resolution.confidence,
+                        "reasoning": resolution.reasoning,
+                    },
+                )
 
             logger.info(
                 "linkedin_easy_apply_field_filled",
@@ -824,6 +1082,84 @@ class PlaywrightLinkedInEasyApplyExecutor:
             )
         return self._session_manager
 
+    async def _start_trace(self, context: BrowserContext) -> bool:
+        try:
+            await context.tracing.start(screenshots=True, snapshots=True, sources=False)
+        except Exception:  # noqa: BLE001
+            logger.exception("linkedin_playwright_trace_start_failed")
+            return False
+        return True
+
+    async def _stop_trace(
+        self,
+        context: BrowserContext,
+        *,
+        trace_started: bool,
+        run_dir: Path,
+        submission_id: UUID,
+        preserve: bool,
+    ) -> ArtifactSnapshot | None:
+        if not trace_started:
+            return None
+
+        try:
+            if not preserve:
+                await context.tracing.stop()
+                return None
+
+            trace_path = self._artifact_path(
+                run_dir,
+                submission_id=submission_id,
+                label="playwright_trace",
+                extension="zip",
+            )
+            await context.tracing.stop(path=str(trace_path))
+        except Exception:  # noqa: BLE001
+            logger.exception("linkedin_playwright_trace_stop_failed")
+            return None
+
+        return _build_file_artifact(
+            submission_id=submission_id,
+            path=trace_path,
+            artifact_type=ArtifactType.PLAYWRIGHT_TRACE,
+        )
+
+    async def _capture_debug_bundle(
+        self,
+        page: Page,
+        *,
+        run_dir: Path,
+        submission_id: UUID,
+        label: str,
+    ) -> list[ArtifactSnapshot]:
+        capture_token = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        screenshot_path = self._artifact_path(
+            run_dir,
+            submission_id=submission_id,
+            label=label,
+            extension="png",
+            capture_token=capture_token,
+        )
+        html_path = self._artifact_path(
+            run_dir,
+            submission_id=submission_id,
+            label=label,
+            extension="html",
+            capture_token=capture_token,
+        )
+        return [
+            await self._capture_screenshot(
+                page,
+                screenshot_path,
+                submission_id=submission_id,
+            ),
+            await self._capture_html_dump(
+                page,
+                html_path,
+                submission_id=submission_id,
+            ),
+        ]
+
     async def _capture_screenshot(
         self,
         page: Page,
@@ -840,6 +1176,36 @@ class PlaywrightLinkedInEasyApplyExecutor:
             sha256=_sha256_file(path),
         )
 
+    async def _capture_html_dump(
+        self,
+        page: Page,
+        path: Path,
+        *,
+        submission_id: UUID,
+    ) -> ArtifactSnapshot:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        html_content = await page.content()
+        path.write_text(html_content, encoding="utf-8")
+        return ArtifactSnapshot(
+            submission_id=submission_id,
+            artifact_type=ArtifactType.HTML_DUMP,
+            path=str(path),
+            sha256=_sha256_file(path),
+        )
+
+    def _artifact_path(
+        self,
+        run_dir: Path,
+        *,
+        submission_id: UUID,
+        label: str,
+        extension: str,
+        capture_token: str | None = None,
+    ) -> Path:
+        token = capture_token or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        slug = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+        return run_dir / f"{submission_id.hex}_{slug}_{token}.{extension}"
+
     def _build_run_dir(self, posting: JobPosting, submission_id: UUID) -> Path:
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         external_job_id = posting.external_job_id or posting.id.hex
@@ -850,6 +1216,48 @@ class PlaywrightLinkedInEasyApplyExecutor:
         )
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
+
+    def _record_event(
+        self,
+        execution_events: list[ExecutionEvent],
+        *,
+        execution_id: UUID,
+        event_type: ExecutionEventType,
+        payload: dict[str, object],
+        submission_id: UUID | None = None,
+    ) -> None:
+        execution_events.append(
+            ExecutionEvent(
+                execution_id=execution_id,
+                submission_id=submission_id,
+                event_type=event_type,
+                payload_json=json.dumps(payload, sort_keys=True),
+            ),
+        )
+
+    def _record_exception_event(
+        self,
+        execution_events: list[ExecutionEvent],
+        *,
+        execution_id: UUID,
+        stage: str,
+        error: Exception,
+        submission_id: UUID | None = None,
+    ) -> None:
+        self._record_event(
+            execution_events,
+            execution_id=execution_id,
+            submission_id=submission_id,
+            event_type=ExecutionEventType.EXCEPTION_CAPTURED,
+            payload={
+                "stage": stage,
+                "error_type": error.__class__.__name__,
+                "message": str(error),
+                "stack_trace": "".join(
+                    traceback.format_exception(type(error), error, error.__traceback__),
+                ),
+            },
+        )
 
 
 class LinkedInEasyApplySubmitter(JobSubmitter):
@@ -864,6 +1272,7 @@ class LinkedInEasyApplySubmitter(JobSubmitter):
         profile_snapshot_repository: ProfileSnapshotRepository,
         recruiter_repository: RecruiterInteractionRepository,
         artifact_repository: ArtifactSnapshotRepository,
+        execution_event_repository: ExecutionEventRepository,
     ) -> None:
         self._executor = executor
         self._submission_repository = submission_repository
@@ -871,22 +1280,32 @@ class LinkedInEasyApplySubmitter(JobSubmitter):
         self._profile_snapshot_repository = profile_snapshot_repository
         self._recruiter_repository = recruiter_repository
         self._artifact_repository = artifact_repository
+        self._execution_event_repository = execution_event_repository
 
     async def submit(
         self,
         settings: UserAgentSettings,
         posting: JobPosting,
         *,
+        execution_id: UUID,
         origin: ExecutionOrigin,
     ) -> SubmissionAttempt:
-        result = await self._executor.execute(settings, posting, origin=origin)
+        result = await self._executor.execute(
+            settings,
+            posting,
+            execution_id=execution_id,
+            origin=origin,
+        )
 
         if result.status is SubmissionStatus.SUBMITTED:
             record = self._persist_successful_submission(result, posting, settings, origin)
+            self._persist_execution_events(result.execution_events, keep_submission_link=True)
             return SubmissionAttempt(
                 submission=record.submission,
                 successful_record=record,
             )
+
+        self._persist_execution_events(result.execution_events, keep_submission_link=False)
 
         submission = ApplicationSubmission(
             id=result.submission_id,
@@ -931,6 +1350,18 @@ class LinkedInEasyApplySubmitter(JobSubmitter):
         for artifact in result.artifacts:
             self._artifact_repository.save(artifact)
         return record
+
+    def _persist_execution_events(
+        self,
+        execution_events: tuple[ExecutionEvent, ...],
+        *,
+        keep_submission_link: bool,
+    ) -> None:
+        for event in execution_events:
+            persisted_event = event
+            if not keep_submission_link and event.submission_id is not None:
+                persisted_event = replace(event, submission_id=None)
+            self._execution_event_repository.save(persisted_event)
 
 
 def _attribute_selector(attribute: str, value: str) -> str:

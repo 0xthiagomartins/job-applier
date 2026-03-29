@@ -9,6 +9,7 @@ from job_applier.infrastructure import (
     InMemorySuccessfulSubmissionStore,
     LocalExecutionStore,
     LocalPanelSettingsStore,
+    MirroredExecutionStore,
 )
 from job_applier.infrastructure.linkedin import (
     LinkedInEasyApplySubmitter,
@@ -19,6 +20,7 @@ from job_applier.infrastructure.linkedin import (
 from job_applier.infrastructure.sqlite import (
     SqliteAnswerRepository,
     SqliteArtifactSnapshotRepository,
+    SqliteExecutionEventRepository,
     SqliteJobPostingRepository,
     SqliteProfileSnapshotRepository,
     SqliteRecruiterInteractionRepository,
@@ -46,7 +48,10 @@ def get_execution_store() -> LocalExecutionStore:
     """Return the local execution store singleton."""
 
     settings = get_runtime_settings()
-    return LocalExecutionStore(root_dir=settings.data_dir / "executions")
+    return MirroredExecutionStore(
+        event_repository=get_execution_event_repository(),
+        root_dir=settings.data_dir / "executions",
+    )
 
 
 @lru_cache(maxsize=1)
@@ -100,6 +105,13 @@ def get_artifact_repository() -> SqliteArtifactSnapshotRepository:
 
 
 @lru_cache(maxsize=1)
+def get_execution_event_repository() -> SqliteExecutionEventRepository:
+    """Return the SQLite-backed execution event repository."""
+
+    return SqliteExecutionEventRepository(get_database_session_factory())
+
+
+@lru_cache(maxsize=1)
 def get_submission_history_repository() -> SqliteSubmissionHistoryRepository:
     """Return the SQLite-backed history read model."""
 
@@ -117,7 +129,10 @@ def get_linkedin_jobs_client() -> PlaywrightLinkedInJobsClient:
 def get_linkedin_easy_apply_executor() -> PlaywrightLinkedInEasyApplyExecutor:
     """Return the Playwright Easy Apply executor."""
 
-    return PlaywrightLinkedInEasyApplyExecutor(get_runtime_settings())
+    return PlaywrightLinkedInEasyApplyExecutor(
+        get_runtime_settings(),
+        execution_event_repository=get_execution_event_repository(),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -149,6 +164,7 @@ def get_job_submitter() -> LinkedInEasyApplySubmitter:
         profile_snapshot_repository=get_profile_snapshot_repository(),
         recruiter_repository=get_recruiter_repository(),
         artifact_repository=get_artifact_repository(),
+        execution_event_repository=get_execution_event_repository(),
     )
 
 

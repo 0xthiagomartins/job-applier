@@ -8,10 +8,18 @@ if TYPE_CHECKING:
     from job_applier.infrastructure.in_memory.audit_store import (
         InMemorySuccessfulSubmissionStore,
     )
-    from job_applier.infrastructure.local_execution_store import LocalExecutionStore
+    from job_applier.infrastructure.local_execution_store import (
+        LocalExecutionStore,
+        MirroredExecutionStore,
+    )
     from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
 
-__all__ = ["InMemorySuccessfulSubmissionStore", "LocalExecutionStore", "LocalPanelSettingsStore"]
+__all__ = [
+    "InMemorySuccessfulSubmissionStore",
+    "LocalExecutionStore",
+    "LocalPanelSettingsStore",
+    "MirroredExecutionStore",
+]
 
 
 def __getattr__(name: str) -> Any:
@@ -27,6 +35,10 @@ def __getattr__(name: str) -> Any:
         from job_applier.infrastructure.local_execution_store import LocalExecutionStore
 
         return LocalExecutionStore
+    if name == "MirroredExecutionStore":
+        from job_applier.infrastructure.local_execution_store import MirroredExecutionStore
+
+        return MirroredExecutionStore
     if name == "LocalPanelSettingsStore":
         from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
 

@@ -10,6 +10,7 @@ from job_applier.interface.http.dependencies import get_agent_scheduler
 from job_applier.interface.http.routes.agent import api_router as agent_api_router
 from job_applier.interface.http.routes.applications import api_router as applications_api_router
 from job_applier.interface.http.routes.panel import api_router as panel_api_router
+from job_applier.observability import configure_logging
 from job_applier.settings import get_runtime_settings, initialize_runtime_environment
 
 
@@ -28,6 +29,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     """Create the FastAPI app used by the project."""
+
+    configure_logging(get_runtime_settings())
 
     app = FastAPI(title="Job Applier", version="0.1.0", lifespan=lifespan)
     app.add_middleware(

@@ -23,6 +23,7 @@ class RuntimeSettings(BaseSettings):
     panel_port: int = 3000
     scheduler_poll_interval_seconds: int = 30
     playwright_headless: bool = False
+    playwright_trace_enabled: bool = True
     playwright_display: str | None = Field(default=None, alias="DISPLAY")
     linkedin_email: str | None = None
     linkedin_password: SecretStr | None = None
@@ -44,6 +45,9 @@ class RuntimeSettings(BaseSettings):
     bootstrap_profile_availability: str = "Immediate"
     bootstrap_profile_work_authorized: bool = True
     bootstrap_profile_needs_sponsorship: bool = False
+    log_level: str = "INFO"
+    log_json: bool = True
+    log_file_path: Path | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",

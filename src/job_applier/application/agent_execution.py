@@ -39,6 +39,7 @@ from job_applier.domain.enums import (
     SubmissionStatus,
 )
 from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
+from job_applier.observability import bind_execution_context
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,7 @@ class JobSubmitter(Protocol):
         settings: UserAgentSettings,
         posting: JobPosting,
         *,
+        execution_id: UUID,
         origin: ExecutionOrigin,
     ) -> SubmissionAttempt:
         """Attempt to apply to the selected job posting."""
@@ -167,8 +169,10 @@ class NoOpJobSubmitter:
         settings: UserAgentSettings,
         posting: JobPosting,
         *,
+        execution_id: UUID,
         origin: ExecutionOrigin,
     ) -> SubmissionAttempt:
+        del execution_id
         logger.info(
             "job_submit_stage",
             extra={
@@ -283,6 +287,20 @@ class AgentExecutionOrchestrator:
         execution_id = uuid4()
         started_at = datetime.now().astimezone()
 
+        with bind_execution_context(execution_id):
+            return await self._run_execution_bound(
+                execution_id=execution_id, started_at=started_at, origin=origin
+            )
+
+    async def _run_execution_bound(
+        self,
+        *,
+        execution_id: UUID,
+        started_at: datetime,
+        origin: ExecutionOrigin,
+    ) -> ExecutionRunSummary:
+        """Run one agent execution with a bound structured logging context."""
+
         try:
             settings = build_user_agent_settings(self._panel_store.load())
         except PanelSettingsConfigurationError as exc:
@@ -390,7 +408,12 @@ class AgentExecutionOrchestrator:
             jobs_selected += 1
 
             try:
-                attempt = await self._job_submitter.submit(settings, posting, origin=origin)
+                attempt = await self._job_submitter.submit(
+                    settings,
+                    posting,
+                    execution_id=execution_id,
+                    origin=origin,
+                )
             except Exception as exc:  # noqa: BLE001
                 latest_error = str(exc)
                 error_count += 1
@@ -414,11 +437,20 @@ class AgentExecutionOrchestrator:
                 self._emit_event(
                     execution_id=execution_id,
                     event_type=ExecutionEventType.STEP_REACHED,
-                    submission_id=submission.id,
                     payload={
                         "stage": "submit_skipped",
                         "job_posting_id": str(posting.id),
+                        "submission_id": str(submission.id),
                         "notes": submission.notes,
+                    },
+                )
+                self._emit_event(
+                    execution_id=execution_id,
+                    event_type=ExecutionEventType.JOB_PROCESSED,
+                    payload={
+                        "job_posting_id": str(posting.id),
+                        "status": submission.status.value,
+                        "submission_id": str(submission.id),
                     },
                 )
                 continue
@@ -429,11 +461,20 @@ class AgentExecutionOrchestrator:
                 self._emit_event(
                     execution_id=execution_id,
                     event_type=ExecutionEventType.EXECUTION_FAILED,
-                    submission_id=submission.id,
                     payload={
                         "stage": "submit_job",
                         "job_posting_id": str(posting.id),
+                        "submission_id": str(submission.id),
                         "message": latest_error,
+                    },
+                )
+                self._emit_event(
+                    execution_id=execution_id,
+                    event_type=ExecutionEventType.JOB_PROCESSED,
+                    payload={
+                        "job_posting_id": str(posting.id),
+                        "status": submission.status.value,
+                        "submission_id": str(submission.id),
                     },
                 )
                 continue
@@ -450,6 +491,17 @@ class AgentExecutionOrchestrator:
                 event_type=ExecutionEventType.SUBMISSION_COMPLETED,
                 payload={
                     "job_posting_id": str(posting.id),
+                    "company_name": posting.company_name,
+                    "title": posting.title,
+                },
+            )
+            self._emit_event(
+                execution_id=execution_id,
+                submission_id=record.submission.id,
+                event_type=ExecutionEventType.JOB_PROCESSED,
+                payload={
+                    "job_posting_id": str(posting.id),
+                    "status": record.submission.status.value,
                     "company_name": posting.company_name,
                     "title": posting.title,
                 },

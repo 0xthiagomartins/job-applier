@@ -69,7 +69,8 @@ def test_orchestrator_records_events_and_continues_after_submit_error(tmp_path: 
         def __init__(self) -> None:
             self.calls = 0
 
-        async def submit(self, settings, posting, *, origin):
+        async def submit(self, settings, posting, *, execution_id, origin):
+            del execution_id
             self.calls += 1
             if self.calls == 2:
                 msg = "submit failure on second posting"
@@ -103,6 +104,7 @@ def test_orchestrator_records_events_and_continues_after_submit_error(tmp_path: 
         ExecutionEventType.EXECUTION_STARTED.value,
         ExecutionEventType.STEP_REACHED.value,
         ExecutionEventType.SUBMISSION_COMPLETED.value,
+        ExecutionEventType.JOB_PROCESSED.value,
         ExecutionEventType.EXECUTION_FAILED.value,
         ExecutionEventType.EXECUTION_COMPLETED.value,
     ]

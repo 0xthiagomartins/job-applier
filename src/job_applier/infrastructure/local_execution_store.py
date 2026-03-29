@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from job_applier.application.agent_execution import ExecutionRunSummary
 from job_applier.application.panel import ensure_runtime_dir
+from job_applier.application.repositories import ExecutionEventRepository
 from job_applier.domain.entities import ExecutionEvent
 
 
@@ -116,3 +117,22 @@ class LocalExecutionStore:
         temp_path = self._state_path.with_suffix(".tmp")
         temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         temp_path.replace(self._state_path)
+
+
+class MirroredExecutionStore(LocalExecutionStore):
+    """Mirror execution events to SQLite while preserving the local debug file."""
+
+    def __init__(
+        self,
+        *,
+        event_repository: ExecutionEventRepository,
+        root_dir: Path | None = None,
+    ) -> None:
+        super().__init__(root_dir=root_dir)
+        self._event_repository = event_repository
+
+    def append_event(self, event: ExecutionEvent) -> None:
+        """Persist the event locally and in the relational event store."""
+
+        super().append_event(event)
+        self._event_repository.save(event)
