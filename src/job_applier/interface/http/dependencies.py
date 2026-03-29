@@ -21,6 +21,7 @@ from job_applier.infrastructure.sqlite import (
     SqliteArtifactSnapshotRepository,
     SqliteJobPostingRepository,
     SqliteProfileSnapshotRepository,
+    SqliteRecruiterInteractionRepository,
     SqliteSubmissionHistoryRepository,
     SqliteSubmissionRepository,
     create_session_factory,
@@ -85,6 +86,13 @@ def get_profile_snapshot_repository() -> SqliteProfileSnapshotRepository:
 
 
 @lru_cache(maxsize=1)
+def get_recruiter_repository() -> SqliteRecruiterInteractionRepository:
+    """Return the SQLite-backed recruiter interaction repository."""
+
+    return SqliteRecruiterInteractionRepository(get_database_session_factory())
+
+
+@lru_cache(maxsize=1)
 def get_artifact_repository() -> SqliteArtifactSnapshotRepository:
     """Return the SQLite-backed artifact repository."""
 
@@ -139,6 +147,7 @@ def get_job_submitter() -> LinkedInEasyApplySubmitter:
         submission_repository=get_submission_repository(),
         answer_repository=get_answer_repository(),
         profile_snapshot_repository=get_profile_snapshot_repository(),
+        recruiter_repository=get_recruiter_repository(),
         artifact_repository=get_artifact_repository(),
     )
 

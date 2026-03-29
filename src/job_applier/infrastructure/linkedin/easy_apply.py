@@ -19,6 +19,7 @@ from job_applier.application.repositories import (
     AnswerRepository,
     ArtifactSnapshotRepository,
     ProfileSnapshotRepository,
+    RecruiterInteractionRepository,
     SubmissionRepository,
 )
 from job_applier.application.snapshotting import (
@@ -30,6 +31,7 @@ from job_applier.domain.entities import (
     ApplicationSubmission,
     ArtifactSnapshot,
     JobPosting,
+    RecruiterInteraction,
     utc_now,
 )
 from job_applier.domain.enums import (
@@ -50,6 +52,10 @@ from job_applier.infrastructure.linkedin.question_resolution import (
     ResolvedFieldValue,
     normalize_text,
     pick_option,
+)
+from job_applier.infrastructure.linkedin.recruiter_connect import (
+    LinkedInRecruiterCandidateFinder,
+    PlaywrightRecruiterConnector,
 )
 from job_applier.settings import RuntimeSettings
 
@@ -88,6 +94,7 @@ class EasyApplyExecutionResult:
     notes: str | None = None
     answers: tuple[ApplicationAnswer, ...] = ()
     artifacts: tuple[ArtifactSnapshot, ...] = ()
+    recruiter_interactions: tuple[RecruiterInteraction, ...] = ()
     submitted_at: datetime | None = None
     cv_version: str | None = None
     cover_letter_version: str | None = None
@@ -126,6 +133,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
         self._runtime_settings = runtime_settings
         self._answer_resolver = answer_resolver or LinkedInAnswerResolver()
         self._question_extractor = LinkedInQuestionExtractor()
+        self._recruiter_candidate_finder = LinkedInRecruiterCandidateFinder()
+        self._recruiter_connector = PlaywrightRecruiterConnector(runtime_settings)
         self._session_manager: LinkedInSessionManager | None = None
 
     async def execute(
@@ -182,6 +191,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
     ) -> EasyApplyExecutionResult:
         page = await context.new_page()
         page.set_default_timeout(self._runtime_settings.linkedin_default_timeout_ms)
+        recruiter_interactions: list[RecruiterInteraction] = []
 
         try:
             await page.goto(posting.url, wait_until="domcontentloaded")
@@ -193,6 +203,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     submission_id=submission_id,
                 ),
             )
+            recruiter_candidate = await self._recruiter_candidate_finder.find(page, settings)
 
             easy_apply_button = await self._find_easy_apply_button(page)
             if easy_apply_button is None:
@@ -265,6 +276,45 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         ),
                     )
                     if success:
+                        if recruiter_candidate is not None:
+                            try:
+                                recruiter_attempt = await self._recruiter_connector.connect(
+                                    context,
+                                    recruiter=recruiter_candidate,
+                                    settings=settings,
+                                    posting=posting,
+                                    submission_id=submission_id,
+                                    screenshot_path=run_dir / "recruiter-connect.png",
+                                )
+                            except Exception:  # noqa: BLE001
+                                logger.exception(
+                                    "linkedin_recruiter_connect_error",
+                                    extra={
+                                        "job_posting_id": str(posting.id),
+                                        "submission_id": str(submission_id),
+                                    },
+                                )
+                            else:
+                                recruiter_interactions.append(recruiter_attempt.interaction)
+                                if recruiter_attempt.screenshot_path is not None:
+                                    artifacts.append(
+                                        _build_file_artifact(
+                                            submission_id=submission_id,
+                                            path=recruiter_attempt.screenshot_path,
+                                            artifact_type=ArtifactType.SCREENSHOT,
+                                        ),
+                                    )
+                                logger.info(
+                                    "linkedin_recruiter_connect_result",
+                                    extra={
+                                        "job_posting_id": str(posting.id),
+                                        "submission_id": str(submission_id),
+                                        "status": recruiter_attempt.interaction.status.value,
+                                        "recruiter_name": (
+                                            recruiter_attempt.interaction.recruiter_name
+                                        ),
+                                    },
+                                )
                         return EasyApplyExecutionResult(
                             submission_id=submission_id,
                             started_at=started_at,
@@ -272,6 +322,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             notes=outcome_notes or "LinkedIn Easy Apply submitted successfully.",
                             answers=tuple(answers),
                             artifacts=tuple(artifacts),
+                            recruiter_interactions=tuple(recruiter_interactions),
                             submitted_at=utc_now(),
                             cv_version=settings.profile.cv_filename,
                         )
@@ -811,12 +862,14 @@ class LinkedInEasyApplySubmitter(JobSubmitter):
         submission_repository: SubmissionRepository,
         answer_repository: AnswerRepository,
         profile_snapshot_repository: ProfileSnapshotRepository,
+        recruiter_repository: RecruiterInteractionRepository,
         artifact_repository: ArtifactSnapshotRepository,
     ) -> None:
         self._executor = executor
         self._submission_repository = submission_repository
         self._answer_repository = answer_repository
         self._profile_snapshot_repository = profile_snapshot_repository
+        self._recruiter_repository = recruiter_repository
         self._artifact_repository = artifact_repository
 
     async def submit(
@@ -873,6 +926,8 @@ class LinkedInEasyApplySubmitter(JobSubmitter):
         self._submission_repository.save(record.submission)
         for answer in result.answers:
             self._answer_repository.save(answer)
+        for recruiter_interaction in result.recruiter_interactions:
+            self._recruiter_repository.save(recruiter_interaction)
         for artifact in result.artifacts:
             self._artifact_repository.save(artifact)
         return record

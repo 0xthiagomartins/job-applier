@@ -377,6 +377,30 @@ export function ApplicationHistory(): React.JSX.Element {
                 )}
               </section>
 
+              <section className="space-y-3">
+                <h3 className="text-lg font-semibold text-foreground">Recruiter connect</h3>
+                {selectedApplication.recruiter_interactions.length ? (
+                  selectedApplication.recruiter_interactions.map((interaction) => (
+                    <div
+                      key={interaction.id}
+                      className="rounded-2xl border border-border bg-white p-4 text-sm"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <p className="font-medium text-foreground">{interaction.recruiter_name}</p>
+                        <Badge>{interaction.status}</Badge>
+                      </div>
+                      <p className="mt-2 text-muted-foreground">
+                        {interaction.message_sent || "No message stored."}
+                      </p>
+                    </div>
+                  ))
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    No recruiter interaction was stored for this application.
+                  </p>
+                )}
+              </section>
+
               <section className="grid gap-6 md:grid-cols-2">
                 <div className="space-y-3">
                   <h3 className="text-lg font-semibold text-foreground">Artifacts</h3>

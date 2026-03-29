@@ -24,6 +24,7 @@ from job_applier.domain import (
     ExecutionOrigin,
     FillStrategy,
     QuestionType,
+    RecruiterInteractionStatus,
     ScheduleFrequency,
     SeniorityLevel,
     SubmissionStatus,
@@ -38,11 +39,17 @@ from job_applier.infrastructure.sqlite import (
     SqliteArtifactSnapshotRepository,
     SqliteJobPostingRepository,
     SqliteProfileSnapshotRepository,
+    SqliteRecruiterInteractionRepository,
     SqliteSubmissionHistoryRepository,
     SqliteSubmissionRepository,
     create_session_factory,
 )
-from tests.integration.sqlite_helpers import build_posting, upgrade_to_head, utc_dt
+from tests.integration.sqlite_helpers import (
+    build_posting,
+    build_recruiter_interaction,
+    upgrade_to_head,
+    utc_dt,
+)
 
 
 def test_easy_apply_submitter_persists_only_successful_submissions(tmp_path: Path) -> None:
@@ -57,6 +64,7 @@ def test_easy_apply_submitter_persists_only_successful_submissions(tmp_path: Pat
     submission_repo = SqliteSubmissionRepository(session_factory)
     answer_repo = SqliteAnswerRepository(session_factory)
     snapshot_repo = SqliteProfileSnapshotRepository(session_factory)
+    recruiter_repo = SqliteRecruiterInteractionRepository(session_factory)
     artifact_repo = SqliteArtifactSnapshotRepository(session_factory)
     history_repo = SqliteSubmissionHistoryRepository(session_factory)
 
@@ -105,6 +113,12 @@ def test_easy_apply_submitter_persists_only_successful_submissions(tmp_path: Pat
                             created_at=submitted_at,
                         ),
                     ),
+                    recruiter_interactions=(
+                        build_recruiter_interaction(
+                            submission_id=submission_id,
+                            sent_at=submitted_at,
+                        ),
+                    ),
                     submitted_at=submitted_at,
                     cv_version="resume.pdf",
                 )
@@ -120,6 +134,7 @@ def test_easy_apply_submitter_persists_only_successful_submissions(tmp_path: Pat
         submission_repository=submission_repo,
         answer_repository=answer_repo,
         profile_snapshot_repository=snapshot_repo,
+        recruiter_repository=recruiter_repo,
         artifact_repository=artifact_repo,
     )
 
@@ -142,15 +157,19 @@ def test_easy_apply_submitter_persists_only_successful_submissions(tmp_path: Pat
 
     answers = answer_repo.list_for_submission(successful_attempt.submission.id)
     artifacts = artifact_repo.list_for_submission(successful_attempt.submission.id)
+    recruiter_interactions = recruiter_repo.list_for_submission(successful_attempt.submission.id)
     snapshots = snapshot_repo.list()
     history = history_repo.query(SubmissionHistoryFilters())
 
     assert len(answers) == 1
     assert answers[0].normalized_key == "work_authorization"
     assert len(artifacts) == 1
+    assert len(recruiter_interactions) == 1
+    assert recruiter_interactions[0].status is RecruiterInteractionStatus.SENT
     assert len(snapshots) == 1
     assert history.total == 1
     assert history.items[0].submission.id == successful_attempt.submission.id
+    assert len(history.items[0].recruiter_interactions) == 1
 
 
 def build_user_agent_settings(cv_path: Path) -> UserAgentSettings:
