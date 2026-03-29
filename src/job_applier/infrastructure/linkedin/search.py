@@ -26,6 +26,7 @@ from job_applier.infrastructure.linkedin.auth import (
 )
 from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserAutomationError,
+    BrowserTaskAssessment,
     OpenAIResponsesBrowserAgent,
 )
 from job_applier.settings import RuntimeSettings
@@ -400,15 +401,15 @@ class PlaywrightLinkedInJobsClient:
         await self._pause_before_navigation(page, reason="search_results_entry")
         await page.goto(direct_results_url, wait_until="domcontentloaded")
         await self._ensure_authenticated_page(page)
-        await self._wait_for_search_surface(page)
+        await self._wait_for_search_surface(page, criteria=criteria)
         await self._capture_screenshot(page, run_dir / "jobs-search-entry.png")
-        if await self._search_results_ready(page):
+        if await self._search_results_ready(page, criteria=criteria):
             return
 
         await self._complete_search_with_browser_agent(page, criteria=criteria)
-        await self._wait_for_search_surface(page)
+        await self._wait_for_search_surface(page, criteria=criteria)
         await self._capture_screenshot(page, run_dir / "search-results-ready.png")
-        if await self._search_results_ready(page):
+        if await self._search_results_ready(page, criteria=criteria):
             return
 
         msg = "Could not reach a LinkedIn job results page after the browser agent search flow."
@@ -434,6 +435,10 @@ class PlaywrightLinkedInJobsClient:
             min_action_delay_ms=self._runtime_settings.linkedin_min_action_delay_ms,
             max_action_delay_ms=self._runtime_settings.linkedin_max_action_delay_ms,
         )
+
+        async def search_results_ready(candidate_page: Page) -> bool:
+            return await self._search_results_ready(candidate_page, criteria=criteria)
+
         try:
             await browser_agent.complete_browser_task(
                 page=page,
@@ -448,7 +453,7 @@ class PlaywrightLinkedInJobsClient:
                 ),
                 timeout_seconds=max(30, self._runtime_settings.linkedin_login_timeout_seconds),
                 task_name="linkedin_job_search",
-                is_complete=self._search_results_ready,
+                is_complete=search_results_ready,
                 extra_rules=(
                     (
                         "If the page is still loading, skeletons are visible, or the search box "
@@ -551,35 +556,71 @@ class PlaywrightLinkedInJobsClient:
                 await page.wait_for_load_state("domcontentloaded")
                 return
 
-    async def _wait_for_search_surface(self, page: Page) -> None:
+    async def _wait_for_search_surface(
+        self,
+        page: Page,
+        *,
+        criteria: LinkedInSearchCriteria,
+    ) -> None:
         for _ in range(10):
-            if await self._search_results_ready(page):
+            assessment = await self._assess_search_surface(page, criteria=criteria)
+            if assessment.status == "complete":
                 return
-            if await self._page_looks_busy(page):
-                await page.wait_for_timeout(1_000)
-                continue
+            if assessment.status == "blocked":
+                msg = assessment.summary or "LinkedIn search is blocked on the current screen."
+                raise LinkedInSearchError(msg)
             await page.wait_for_timeout(500)
 
-    async def _search_results_ready(self, page: Page) -> bool:
-        if "/jobs/search" in page.url:
-            if await page.locator("a[href*='/jobs/view/']").count():
-                return True
-            if await page.get_by_text(re.compile(r"no matching jobs|no results", re.I)).count():
-                return True
-            if await page.get_by_text(re.compile(r"easy apply", re.I)).count():
-                return True
-        return False
+    async def _search_results_ready(
+        self,
+        page: Page,
+        *,
+        criteria: LinkedInSearchCriteria,
+    ) -> bool:
+        assessment = await self._assess_search_surface(page, criteria=criteria)
+        return assessment.status == "complete"
 
-    async def _page_looks_busy(self, page: Page) -> bool:
-        busy_locators = (
-            page.get_by_text(re.compile(r"loading", re.I)),
-            page.locator("[aria-busy='true']"),
-            page.locator(".artdeco-loader, .jobs-search-two-pane__spinner"),
+    async def _assess_search_surface(
+        self,
+        page: Page,
+        *,
+        criteria: LinkedInSearchCriteria,
+    ) -> BrowserTaskAssessment:
+        ai_api_key = criteria.ai_api_key or self._runtime_settings.openai_api_key
+        if ai_api_key is None:
+            msg = (
+                "LinkedIn search needs the browser agent state assessor. "
+                "Configure the OpenAI API key in the panel or set JOB_APPLIER_OPENAI_API_KEY."
+            )
+            raise LinkedInSearchError(msg)
+        browser_agent = OpenAIResponsesBrowserAgent(
+            api_key=ai_api_key,
+            model=criteria.ai_model,
+            min_action_delay_ms=self._runtime_settings.linkedin_min_action_delay_ms,
+            max_action_delay_ms=self._runtime_settings.linkedin_max_action_delay_ms,
         )
-        for locator in busy_locators:
-            if await locator.count():
-                return True
-        return False
+        try:
+            return await browser_agent.assess_browser_task(
+                page=page,
+                goal=(
+                    "Determine whether the current LinkedIn page is already a jobs search results "
+                    "surface for the requested query and filters."
+                ),
+                task_name="linkedin_job_search_state",
+                extra_rules=(
+                    (
+                        "Use complete only when the page already shows a jobs results surface, "
+                        "including either job result cards or a clear empty-results state."
+                    ),
+                    (
+                        "Use blocked when the page is an unrelated destination, an error, or a "
+                        "state that prevents search results from appearing."
+                    ),
+                    "Use pending while filters are still applying or the results page is loading.",
+                ),
+            )
+        except BrowserAutomationError as exc:
+            raise LinkedInSearchError(str(exc)) from exc
 
     async def _extract_listing_cards(self, page: Page) -> list[LinkedInCollectedJob]:
         payloads = await page.locator("a[href*='/jobs/view/']").evaluate_all(
