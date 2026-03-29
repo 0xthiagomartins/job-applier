@@ -5,6 +5,15 @@ from job_applier.infrastructure.linkedin.auth import (
     LinkedInCredentials,
     LinkedInSessionManager,
 )
+from job_applier.infrastructure.linkedin.browser_agent import (
+    BrowserAgentAction,
+    BrowserAgentElement,
+    BrowserAgentSnapshot,
+    BrowserAutomationError,
+    OpenAIResponsesBrowserAgent,
+    has_manual_intervention_cues,
+    parse_browser_action,
+)
 from job_applier.infrastructure.linkedin.easy_apply import (
     EasyApplyExecutionResult,
     EasyApplyStep,
@@ -51,6 +60,10 @@ from job_applier.infrastructure.linkedin.search import (
 )
 
 __all__ = [
+    "BrowserAgentAction",
+    "BrowserAgentElement",
+    "BrowserAgentSnapshot",
+    "BrowserAutomationError",
     "EasyApplyExecutionResult",
     "EasyApplyField",
     "EasyApplyStep",
@@ -71,6 +84,7 @@ __all__ = [
     "LinkedInSearchError",
     "LinkedInSessionManager",
     "OpenAIResponsesAnswerGenerator",
+    "OpenAIResponsesBrowserAgent",
     "OpenAIResponsesRecruiterMessageGenerator",
     "PlaywrightLinkedInEasyApplyExecutor",
     "PlaywrightLinkedInJobsClient",
@@ -84,10 +98,12 @@ __all__ = [
     "build_recruiter_message_template",
     "build_search_criteria",
     "finalize_recruiter_message",
+    "has_manual_intervention_cues",
     "infer_seniority",
     "infer_workplace_type",
     "normalize_key",
     "normalize_text",
+    "parse_browser_action",
     "pick_option",
     "select_recruiter_candidate",
 ]

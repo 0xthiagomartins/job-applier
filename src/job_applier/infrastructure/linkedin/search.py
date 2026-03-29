@@ -11,6 +11,7 @@ from typing import Protocol
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from playwright.async_api import BrowserContext, Page, async_playwright
+from pydantic import SecretStr
 
 from job_applier.application.agent_execution import JobFetcher
 from job_applier.application.config import UserAgentSettings
@@ -46,6 +47,8 @@ class LinkedInSearchCriteria:
     seniority: tuple[SeniorityLevel, ...]
     easy_apply_only: bool
     max_pages: int
+    ai_api_key: SecretStr | None = None
+    ai_model: str = "o3-mini"
 
     def to_log_payload(self) -> dict[str, object]:
         """Return a structured payload for logs."""
@@ -99,6 +102,8 @@ def build_search_criteria(
         seniority=settings.search.seniority,
         easy_apply_only=settings.search.easy_apply_only,
         max_pages=max(1, runtime_settings.linkedin_max_search_pages),
+        ai_api_key=settings.ai.api_key,
+        ai_model=settings.ai.model,
     )
 
 
@@ -258,7 +263,7 @@ class PlaywrightLinkedInJobsClient:
 
     async def fetch_jobs(self, criteria: LinkedInSearchCriteria) -> list[LinkedInCollectedJob]:
         async with async_playwright() as playwright:
-            session_manager = self._get_session_manager()
+            session_manager = self._create_session_manager(criteria)
             browser = await playwright.chromium.launch(
                 headless=self._runtime_settings.playwright_headless,
             )
@@ -290,13 +295,26 @@ class PlaywrightLinkedInJobsClient:
             password=runtime_settings.linkedin_password,
         )
 
+    def _create_session_manager(
+        self,
+        criteria: LinkedInSearchCriteria | None = None,
+    ) -> LinkedInSessionManager:
+        self._session_manager = LinkedInSessionManager(
+            credentials=self._credentials_from_settings(self._runtime_settings),
+            storage_state_path=self._runtime_settings.resolved_linkedin_storage_state_path,
+            login_timeout_seconds=self._runtime_settings.linkedin_login_timeout_seconds,
+            ai_api_key=(
+                criteria.ai_api_key
+                if criteria is not None
+                else self._runtime_settings.openai_api_key
+            ),
+            ai_model=criteria.ai_model if criteria is not None else "o3-mini",
+        )
+        return self._session_manager
+
     def _get_session_manager(self) -> LinkedInSessionManager:
         if self._session_manager is None:
-            self._session_manager = LinkedInSessionManager(
-                credentials=self._credentials_from_settings(self._runtime_settings),
-                storage_state_path=self._runtime_settings.resolved_linkedin_storage_state_path,
-                login_timeout_seconds=self._runtime_settings.linkedin_login_timeout_seconds,
-            )
+            return self._create_session_manager()
         return self._session_manager
 
     async def _fetch_jobs_once(

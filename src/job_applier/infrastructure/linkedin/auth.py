@@ -4,36 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from playwright.async_api import Browser, BrowserContext, Locator, Page
+from playwright.async_api import Browser, BrowserContext, Page
 from pydantic import SecretStr
 
-logger = logging.getLogger(__name__)
+from job_applier.infrastructure.linkedin.browser_agent import OpenAIResponsesBrowserAgent
 
-EMAIL_INPUT_SELECTOR = ",".join(
-    (
-        "input[name='session_key']",
-        "input#username",
-        "input[type='email']",
-        "input[autocomplete*='username']",
-    ),
-)
-PASSWORD_INPUT_SELECTOR = ",".join(
-    (
-        "input[name='session_password']",
-        "input#password",
-        "input[type='password']",
-        "input[autocomplete='current-password']",
-    ),
-)
-SUBMIT_BUTTON_SELECTOR = ",".join(
-    (
-        "button[type='submit']",
-        "button[data-litms-control-urn*='login-submit']",
-    ),
-)
+logger = logging.getLogger(__name__)
 
 
 class LinkedInAuthError(RuntimeError):
@@ -57,10 +38,14 @@ class LinkedInSessionManager:
         credentials: LinkedInCredentials,
         storage_state_path: Path,
         login_timeout_seconds: int = 120,
+        ai_api_key: SecretStr | None = None,
+        ai_model: str = "o3-mini",
     ) -> None:
         self._credentials = credentials
         self._storage_state_path = storage_state_path
         self._login_timeout_seconds = login_timeout_seconds
+        self._ai_api_key = ai_api_key
+        self._ai_model = ai_model
 
     async def create_authenticated_context(self, browser: Browser) -> BrowserContext:
         """Return an authenticated context, reusing saved session state when valid."""
@@ -92,14 +77,24 @@ class LinkedInSessionManager:
         """Return whether the current page still needs the login flow."""
 
         current_url = page.url.lower()
-        if "linkedin.com/login" in current_url or "/checkpoint/" in current_url:
+        if any(
+            token in current_url
+            for token in (
+                "linkedin.com/login",
+                "/checkpoint/",
+                "/challenge/",
+            )
+        ):
             return True
 
-        if await self._find_email_input(page).count():
+        if await page.locator("input[type='password']").count():
             return True
-        if await self._find_password_input(page).count():
-            return True
-        if await self._find_submit_button(page).count():
+        try:
+            body_text = await page.locator("body").inner_text(timeout=2_000)
+        except Exception:  # noqa: BLE001
+            body_text = ""
+        normalized_text = re.sub(r"\s+", " ", body_text).strip().lower()
+        if "sign in" in normalized_text and "linkedin" in normalized_text:
             return True
         return False
 
@@ -119,29 +114,29 @@ class LinkedInSessionManager:
         page = await context.new_page()
         try:
             await page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded")
-            await self._find_email_input(page).fill(self._credentials.email)
-            await self._find_password_input(page).fill(
-                self._credentials.password.get_secret_value(),
+            ai_api_key = self._resolve_ai_api_key()
+            if ai_api_key is None:
+                msg = (
+                    "OpenAI API key is required for the LinkedIn browser agent login flow. "
+                    "Configure it in the panel or set JOB_APPLIER_OPENAI_API_KEY."
+                )
+                raise LinkedInAuthError(msg)
+            browser_agent = OpenAIResponsesBrowserAgent(
+                api_key=ai_api_key,
+                model=self._ai_model,
             )
-            await self._find_submit_button(page).click()
+            await browser_agent.complete_linkedin_login(
+                page=page,
+                credentials={
+                    "linkedin_email": self._credentials.email,
+                    "linkedin_password": self._credentials.password.get_secret_value(),
+                },
+                page_requires_login=self.page_requires_login,
+                timeout_seconds=self._login_timeout_seconds,
+            )
             await self._wait_until_authenticated(page)
         finally:
             await page.close()
-
-    def _find_email_input(self, page: Page) -> Locator:
-        """Return the login email/phone input using deterministic selectors."""
-
-        return page.locator(EMAIL_INPUT_SELECTOR).first
-
-    def _find_password_input(self, page: Page) -> Locator:
-        """Return the login password input using deterministic selectors."""
-
-        return page.locator(PASSWORD_INPUT_SELECTOR).first
-
-    def _find_submit_button(self, page: Page) -> Locator:
-        """Return the login submit button using deterministic selectors."""
-
-        return page.locator(SUBMIT_BUTTON_SELECTOR).first
 
     async def _wait_until_authenticated(self, page: Page) -> None:
         """Wait for the login flow to complete, including manual captcha handling."""
@@ -157,3 +152,13 @@ class LinkedInSessionManager:
             "If headful mode is enabled, complete any captcha and try again."
         )
         raise LinkedInAuthError(msg)
+
+    def _resolve_ai_api_key(self) -> SecretStr | None:
+        """Return the API key used by the browser agent login planner."""
+
+        if self._ai_api_key is not None:
+            return self._ai_api_key
+        raw_value = os.getenv("JOB_APPLIER_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+        if raw_value:
+            return SecretStr(raw_value)
+        return None

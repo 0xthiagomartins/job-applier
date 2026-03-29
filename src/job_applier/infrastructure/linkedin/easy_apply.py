@@ -168,7 +168,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 headless=self._runtime_settings.playwright_headless,
             )
             try:
-                context = await self._get_session_manager().create_authenticated_context(browser)
+                context = await self._create_session_manager(settings).create_authenticated_context(
+                    browser
+                )
                 trace_started = await self._start_trace(context)
                 try:
                     result = await self._execute_once(
@@ -1073,13 +1075,26 @@ class PlaywrightLinkedInEasyApplyExecutor:
             password=runtime_settings.linkedin_password,
         )
 
+    def _create_session_manager(
+        self,
+        settings: UserAgentSettings | None = None,
+    ) -> LinkedInSessionManager:
+        self._session_manager = LinkedInSessionManager(
+            credentials=self._credentials_from_settings(self._runtime_settings),
+            storage_state_path=self._runtime_settings.resolved_linkedin_storage_state_path,
+            login_timeout_seconds=self._runtime_settings.linkedin_login_timeout_seconds,
+            ai_api_key=(
+                settings.ai.api_key
+                if settings is not None
+                else self._runtime_settings.openai_api_key
+            ),
+            ai_model=settings.ai.model if settings is not None else "o3-mini",
+        )
+        return self._session_manager
+
     def _get_session_manager(self) -> LinkedInSessionManager:
         if self._session_manager is None:
-            self._session_manager = LinkedInSessionManager(
-                credentials=self._credentials_from_settings(self._runtime_settings),
-                storage_state_path=self._runtime_settings.resolved_linkedin_storage_state_path,
-                login_timeout_seconds=self._runtime_settings.linkedin_login_timeout_seconds,
-            )
+            return self._create_session_manager()
         return self._session_manager
 
     async def _start_trace(self, context: BrowserContext) -> bool:
