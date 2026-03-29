@@ -5,8 +5,9 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import shutil
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,7 +23,11 @@ _submission_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "job_applier_submission_id",
     default=None,
 )
-_configured_signature: tuple[str, bool, str | None] | None = None
+_run_output_dir_var: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "job_applier_run_output_dir",
+    default=None,
+)
+_configured_signature: tuple[str, bool, str | None, str] | None = None
 
 _LOG_RECORD_RESERVED = frozenset(logging.makeLogRecord({}).__dict__.keys()) | {
     "message",
@@ -43,7 +48,7 @@ def configure_logging(settings: RuntimeSettings) -> None:
     global _configured_signature
 
     file_path = str(settings.log_file_path) if settings.log_file_path else None
-    signature = (settings.log_level.upper(), settings.log_json, file_path)
+    signature = (settings.log_level.upper(), settings.log_json, file_path, str(settings.output_dir))
     if _configured_signature == signature:
         return
 
@@ -69,6 +74,10 @@ def configure_logging(settings: RuntimeSettings) -> None:
         file_handler = logging.FileHandler(settings.log_file_path, encoding="utf-8")
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
+
+    output_handler = LastRunDebugHandler(settings.output_dir / "run.log")
+    output_handler.setFormatter(StructuredJsonFormatter())
+    root_logger.addHandler(output_handler)
 
     for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         uvicorn_logger = logging.getLogger(logger_name)
@@ -99,6 +108,141 @@ def bind_submission_context(submission_id: object) -> Iterator[None]:
         yield
     finally:
         _submission_id_var.reset(token)
+
+
+@contextmanager
+def bind_run_output(output_dir: Path | None) -> Iterator[None]:
+    """Attach the current last-run output directory to async log context."""
+
+    token = _run_output_dir_var.set(output_dir)
+    try:
+        yield
+    finally:
+        _run_output_dir_var.reset(token)
+
+
+def reset_run_output(
+    output_dir: Path,
+    *,
+    execution_id: object,
+    origin: str,
+    started_at: datetime,
+) -> None:
+    """Clear the previous debug bundle and bootstrap the current run metadata."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for child in output_dir.iterdir():
+        if child.name == ".gitkeep":
+            continue
+        if child.is_dir():
+            shutil.rmtree(child)
+            continue
+        child.unlink()
+
+    write_output_json(
+        "run.json",
+        {
+            "execution_id": str(execution_id),
+            "origin": origin,
+            "started_at": started_at.isoformat(),
+        },
+        output_dir=output_dir,
+    )
+
+
+def write_output_json(
+    relative_path: str | Path,
+    payload: Mapping[str, object],
+    *,
+    output_dir: Path | None = None,
+) -> None:
+    """Persist one JSON payload into the current run output bundle."""
+
+    target = _resolve_output_path(relative_path, output_dir=output_dir)
+    if target is None:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(
+            _sanitize_for_logs(dict(payload)),
+            indent=2,
+            ensure_ascii=True,
+            default=_json_default,
+        ),
+        encoding="utf-8",
+    )
+
+
+def write_output_text(
+    relative_path: str | Path,
+    content: str,
+    *,
+    output_dir: Path | None = None,
+) -> None:
+    """Persist one text artifact into the current run output bundle."""
+
+    target = _resolve_output_path(relative_path, output_dir=output_dir)
+    if target is None:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+
+
+def append_output_jsonl(
+    relative_path: str | Path,
+    payload: Mapping[str, object],
+    *,
+    output_dir: Path | None = None,
+) -> None:
+    """Append one structured record to a JSONL file in the current run bundle."""
+
+    target = _resolve_output_path(relative_path, output_dir=output_dir)
+    if target is None:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(
+        _sanitize_for_logs(dict(payload)),
+        ensure_ascii=True,
+        default=_json_default,
+    )
+    with target.open("a", encoding="utf-8") as handle:
+        handle.write(f"{line}\n")
+
+
+def _resolve_output_path(relative_path: str | Path, *, output_dir: Path | None) -> Path | None:
+    current_dir = output_dir or _run_output_dir_var.get()
+    if current_dir is None:
+        return None
+    target = current_dir / Path(relative_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+class LastRunDebugHandler(logging.Handler):
+    """Mirror execution-bound logs into the `output/` troubleshooting bundle."""
+
+    def __init__(self, target_path: Path) -> None:
+        super().__init__(level=logging.NOTSET)
+        self._target_path = target_path
+
+    def emit(self, record: logging.LogRecord) -> None:
+        output_dir = _run_output_dir_var.get()
+        execution_id = getattr(record, "execution_id", None) or _execution_id_var.get()
+        if output_dir is None or execution_id is None:
+            return
+
+        try:
+            rendered = self.format(record)
+            target_path = output_dir / self._target_path.name
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            self.acquire()
+            try:
+                with target_path.open("a", encoding="utf-8") as handle:
+                    handle.write(f"{rendered}\n")
+            finally:
+                self.release()
+        except Exception:  # noqa: BLE001
+            self.handleError(record)
 
 
 class StructuredJsonFormatter(logging.Formatter):

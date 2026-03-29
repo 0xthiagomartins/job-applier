@@ -14,6 +14,8 @@ from urllib import error, parse, request
 
 from pydantic import SecretStr
 
+from job_applier.observability import append_output_jsonl, write_output_text
+
 logger = logging.getLogger(__name__)
 
 McpActionType = Literal["click", "type", "wait", "done", "fail"]
@@ -310,6 +312,36 @@ class PlaywrightMcpHttpClient:
         }
         if self._session_id is not None:
             headers["Mcp-Session-Id"] = self._session_id
+        sanitized_request = _sanitize_mcp_transport_payload(body)
+        logger.info(
+            "playwright_mcp_request",
+            extra={
+                "base_url": self._base_url,
+                "request_body": sanitized_request,
+                "session_id": self._session_id,
+            },
+        )
+        append_output_jsonl(
+            "mcp/traffic.jsonl",
+            {
+                "direction": "request",
+                "base_url": self._base_url,
+                "request_body": sanitized_request,
+                "headers": _sanitize_mcp_headers(headers),
+                "session_id": self._session_id,
+            },
+        )
+        append_output_jsonl(
+            "run.log",
+            {
+                "source": "playwright_mcp",
+                "kind": "request",
+                "base_url": self._base_url,
+                "request_body": sanitized_request,
+                "headers": _sanitize_mcp_headers(headers),
+                "session_id": self._session_id,
+            },
+        )
 
         http_request = request.Request(
             self._base_url,
@@ -321,8 +353,46 @@ class PlaywrightMcpHttpClient:
             with request.urlopen(http_request, timeout=self._timeout_seconds) as response:  # noqa: S310
                 response_body = response.read().decode("utf-8", errors="replace")
                 session_id = response.headers.get("Mcp-Session-Id")
+                append_output_jsonl(
+                    "mcp/traffic.jsonl",
+                    {
+                        "direction": "response",
+                        "status": getattr(response, "status", 200),
+                        "session_id": session_id or self._session_id,
+                        "body": response_body,
+                    },
+                )
+                append_output_jsonl(
+                    "run.log",
+                    {
+                        "source": "playwright_mcp",
+                        "kind": "response",
+                        "status": getattr(response, "status", 200),
+                        "session_id": session_id or self._session_id,
+                        "body_excerpt": truncate_text(response_body, limit=1_500),
+                    },
+                )
         except error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            append_output_jsonl(
+                "mcp/traffic.jsonl",
+                {
+                    "direction": "error",
+                    "status": exc.code,
+                    "session_id": self._session_id,
+                    "body": detail,
+                },
+            )
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "playwright_mcp",
+                    "kind": "error",
+                    "status": exc.code,
+                    "session_id": self._session_id,
+                    "body_excerpt": truncate_text(detail, limit=1_500),
+                },
+            )
             if exc.code == 404 and "Session not found" in detail:
                 self._session_id = None
                 self._initialized = False
@@ -335,6 +405,14 @@ class PlaywrightMcpHttpClient:
 
         if session_id:
             self._session_id = session_id
+        logger.info(
+            "playwright_mcp_response",
+            extra={
+                "base_url": self._base_url,
+                "session_id": self._session_id,
+                "response_excerpt": truncate_text(response_body, limit=1_500),
+            },
+        )
 
         parsed_body = parse_mcp_response_body(response_body) if expect_response else {}
         if "error" in parsed_body:
@@ -368,7 +446,7 @@ class OpenAIResponsesPlaywrightMcpAgent:
 
     endpoint = "https://api.openai.com/v1/responses"
 
-    def __init__(self, *, api_key: SecretStr, model: str, max_steps: int = 18) -> None:
+    def __init__(self, *, api_key: SecretStr, model: str, max_steps: int = 24) -> None:
         self._api_key = api_key
         self._model = model
         self._max_steps = max_steps
@@ -383,27 +461,49 @@ class OpenAIResponsesPlaywrightMcpAgent:
         """Drive the MCP browser until the model concludes the login is complete."""
 
         deadline = asyncio.get_running_loop().time() + timeout_seconds
+        recent_actions: list[dict[str, object]] = []
+        previous_snapshot_excerpt = ""
         for step_index in range(self._max_steps):
             snapshot_text = await client.snapshot()
-            if has_manual_intervention_cues(snapshot_text):
-                if asyncio.get_running_loop().time() >= deadline:
-                    break
-                logger.info(
-                    "playwright_mcp_waiting_for_manual_intervention",
-                    extra={"step_index": step_index},
-                )
-                await client.wait(seconds=5)
-                continue
+            snapshot_excerpt = truncate_text(snapshot_text, limit=1_200)
+            snapshot_changed = snapshot_excerpt != previous_snapshot_excerpt
+            write_output_text(f"mcp/snapshots/step-{step_index:02d}.txt", snapshot_text)
+            append_output_jsonl(
+                "mcp/timeline.jsonl",
+                {
+                    "step_index": step_index,
+                    "kind": "snapshot",
+                    "snapshot_excerpt": snapshot_excerpt,
+                    "snapshot_changed": snapshot_changed,
+                },
+            )
 
             remaining_seconds = max(1.0, deadline - asyncio.get_running_loop().time())
             action = await asyncio.wait_for(
-                self._plan_action(snapshot_text=snapshot_text),
+                self._plan_action(
+                    snapshot_text=snapshot_text,
+                    step_index=step_index,
+                    recent_actions=recent_actions[-6:],
+                    snapshot_changed=snapshot_changed,
+                ),
                 timeout=remaining_seconds,
             )
             logger.info(
                 "playwright_mcp_action_planned",
                 extra={
                     "step_index": step_index,
+                    "action_type": action.action_type,
+                    "ref": action.ref,
+                    "element": action.element,
+                    "value_source": action.value_source,
+                    "reasoning": action.reasoning,
+                },
+            )
+            append_output_jsonl(
+                "mcp/timeline.jsonl",
+                {
+                    "step_index": step_index,
+                    "kind": "planned_action",
                     "action_type": action.action_type,
                     "ref": action.ref,
                     "element": action.element,
@@ -419,12 +519,32 @@ class OpenAIResponsesPlaywrightMcpAgent:
                 raise PlaywrightMcpError(msg)
             if action.action_type == "wait":
                 await client.wait(seconds=max(1, action.wait_seconds))
+                recent_actions.append(
+                    {
+                        "step_index": step_index,
+                        "action_type": action.action_type,
+                        "reasoning": action.reasoning,
+                        "snapshot_excerpt": snapshot_excerpt,
+                    }
+                )
+                previous_snapshot_excerpt = snapshot_excerpt
                 continue
             if action.action_type == "click":
                 if action.ref is None:
                     msg = "Playwright MCP agent returned click without a ref."
                     raise PlaywrightMcpError(msg)
                 await client.click(ref=action.ref, element=action.element)
+                recent_actions.append(
+                    {
+                        "step_index": step_index,
+                        "action_type": action.action_type,
+                        "ref": action.ref,
+                        "element": action.element,
+                        "reasoning": action.reasoning,
+                        "snapshot_excerpt": snapshot_excerpt,
+                    }
+                )
+                previous_snapshot_excerpt = snapshot_excerpt
                 continue
             if action.action_type == "type":
                 if action.ref is None:
@@ -435,17 +555,51 @@ class OpenAIResponsesPlaywrightMcpAgent:
                     element=action.element,
                     text=self._resolve_text(action, credentials),
                 )
+                recent_actions.append(
+                    {
+                        "step_index": step_index,
+                        "action_type": action.action_type,
+                        "ref": action.ref,
+                        "element": action.element,
+                        "value_source": action.value_source,
+                        "reasoning": action.reasoning,
+                        "snapshot_excerpt": snapshot_excerpt,
+                    }
+                )
+                previous_snapshot_excerpt = snapshot_excerpt
                 continue
 
         msg = "Playwright MCP agent exhausted the login flow before completion."
         raise PlaywrightMcpError(msg)
 
-    async def _plan_action(self, *, snapshot_text: str) -> PlaywrightMcpAction:
-        response_data = await asyncio.to_thread(self._create_response, snapshot_text)
+    async def _plan_action(
+        self,
+        *,
+        snapshot_text: str,
+        step_index: int,
+        recent_actions: list[dict[str, object]],
+        snapshot_changed: bool,
+    ) -> PlaywrightMcpAction:
+        response_data = await asyncio.to_thread(
+            self._create_response,
+            snapshot_text,
+            step_index,
+            recent_actions,
+            snapshot_changed,
+        )
         raw_output = extract_output_text(response_data)
         logger.info(
             "playwright_mcp_agent_response",
             extra={"model": self._model, "response_text": raw_output},
+        )
+        append_output_jsonl(
+            "llm/login-planner.jsonl",
+            {
+                "kind": "response_text",
+                "step_index": step_index,
+                "model": self._model,
+                "response_text": raw_output,
+            },
         )
         if not raw_output:
             msg = "Playwright MCP agent returned an empty response."
@@ -457,10 +611,19 @@ class OpenAIResponsesPlaywrightMcpAgent:
             raise PlaywrightMcpError(msg) from exc
         return parse_playwright_mcp_action(cast(dict[str, object], payload))
 
-    def _create_response(self, snapshot_text: str) -> dict[str, object]:
+    def _create_response(
+        self,
+        snapshot_text: str,
+        step_index: int,
+        recent_actions: list[dict[str, object]],
+        snapshot_changed: bool,
+    ) -> dict[str, object]:
         prompt_payload = {
             "goal": "Log into LinkedIn successfully.",
-            "snapshot_markdown": truncate_text(snapshot_text, limit=4_000),
+            "step_index": step_index,
+            "snapshot_changed_since_last_step": snapshot_changed,
+            "snapshot_markdown": truncate_text(snapshot_text, limit=5_500),
+            "recent_action_history": recent_actions,
             "available_value_sources": {
                 "linkedin_email": "Use the user's LinkedIn email or phone field.",
                 "linkedin_password": "Use the user's LinkedIn password field.",
@@ -473,6 +636,26 @@ class OpenAIResponsesPlaywrightMcpAgent:
                     "Use linkedin_email and linkedin_password for credential fields. "
                     "Never ask for raw secrets."
                 ),
+                (
+                    "Reason carefully before acting. Prefer the next highest-confidence "
+                    "action over guessing."
+                ),
+                (
+                    "Use recent_action_history to avoid repeating the same failed move "
+                    "on an unchanged snapshot."
+                ),
+                (
+                    "If the password was already entered and a sign-in action is visible, "
+                    "prefer clicking submit."
+                ),
+                (
+                    "Do not declare done while the page still looks like a login, "
+                    "challenge, or checkpoint screen."
+                ),
+                (
+                    "If the screen suggests captcha, email verification, OTP, or human "
+                    "checkpoint, choose wait."
+                ),
                 "Use wait when the page is loading or a human may need to solve verification.",
                 "Use done only when the login flow appears complete.",
                 "Use fail only when no safe next action exists.",
@@ -484,6 +667,7 @@ class OpenAIResponsesPlaywrightMcpAgent:
         )
         body = {
             "model": self._model,
+            "reasoning": {"effort": "high"},
             "input": [
                 {
                     "role": "developer",
@@ -493,7 +677,8 @@ class OpenAIResponsesPlaywrightMcpAgent:
                             "text": (
                                 "You are controlling LinkedIn login through Playwright MCP. "
                                 "The snapshot is an accessibility tree with refs. "
-                                "Pick the safest next action."
+                                "Pick the safest next action. Think in terms of login progression, "
+                                "recent attempts, and whether the page actually changed."
                             ),
                         },
                     ],
@@ -517,6 +702,15 @@ class OpenAIResponsesPlaywrightMcpAgent:
                 },
             },
         }
+        append_output_jsonl(
+            "llm/login-planner.jsonl",
+            {
+                "kind": "request",
+                "step_index": step_index,
+                "model": self._model,
+                "payload": body,
+            },
+        )
         payload_bytes = json.dumps(body, ensure_ascii=True).encode("utf-8")
         http_request = request.Request(
             self.endpoint,
@@ -529,11 +723,31 @@ class OpenAIResponsesPlaywrightMcpAgent:
         )
         try:
             with request.urlopen(http_request, timeout=30) as response:  # noqa: S310
-                return cast(dict[str, object], json.loads(response.read().decode("utf-8")))
+                payload = cast(dict[str, object], json.loads(response.read().decode("utf-8")))
+                append_output_jsonl(
+                    "llm/login-planner.jsonl",
+                    {
+                        "kind": "response_payload",
+                        "step_index": step_index,
+                        "model": self._model,
+                        "payload": payload,
+                    },
+                )
+                return payload
         except error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
             logger.warning(
                 "openai_playwright_mcp_agent_http_error",
-                extra={"status": exc.code, "body": exc.read().decode("utf-8", errors="replace")},
+                extra={"status": exc.code, "body": error_body},
+            )
+            append_output_jsonl(
+                "llm/login-planner.jsonl",
+                {
+                    "kind": "http_error",
+                    "step_index": step_index,
+                    "status": exc.code,
+                    "body": error_body,
+                },
             )
             raise
 
@@ -658,3 +872,27 @@ def parse_playwright_mcp_action(payload: dict[str, object]) -> PlaywrightMcpActi
 def _optional_text(value: object) -> str | None:
     text = collapse_text(value if isinstance(value, str) else None)
     return text or None
+
+
+def _sanitize_mcp_transport_payload(payload: Mapping[str, object]) -> dict[str, object]:
+    sanitized = dict(payload)
+    params = sanitized.get("params")
+    if not isinstance(params, dict):
+        return sanitized
+    arguments = params.get("arguments")
+    if not isinstance(arguments, dict):
+        return sanitized
+    sanitized_arguments = dict(arguments)
+    if "text" in sanitized_arguments:
+        sanitized_arguments["text"] = "[redacted]"
+    params = dict(params)
+    params["arguments"] = sanitized_arguments
+    sanitized["params"] = params
+    return sanitized
+
+
+def _sanitize_mcp_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    sanitized = dict(headers)
+    if "Authorization" in sanitized:
+        sanitized["Authorization"] = "[redacted]"
+    return sanitized

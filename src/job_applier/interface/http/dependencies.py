@@ -179,6 +179,7 @@ def get_successful_submission_store() -> InMemorySuccessfulSubmissionStore:
 def get_agent_orchestrator() -> AgentExecutionOrchestrator:
     """Return the execution orchestrator singleton."""
 
+    settings = get_runtime_settings()
     return AgentExecutionOrchestrator(
         panel_store=get_panel_settings_store(),
         execution_store=get_execution_store(),
@@ -186,6 +187,7 @@ def get_agent_orchestrator() -> AgentExecutionOrchestrator:
         job_fetcher=get_job_fetcher(),
         job_scorer=get_job_scorer(),
         job_submitter=get_job_submitter(),
+        output_dir=settings.output_dir,
     )
 
 

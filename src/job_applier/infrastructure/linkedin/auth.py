@@ -19,6 +19,7 @@ from job_applier.infrastructure.linkedin.playwright_mcp import (
     PlaywrightMcpHttpClient,
     PlaywrightMcpSessionNotFoundError,
 )
+from job_applier.observability import append_output_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -181,10 +182,19 @@ class LinkedInSessionManager:
         )
 
         last_error: PlaywrightMcpError | None = None
-        for attempt in range(2):
+        for attempt in range(3):
             client = PlaywrightMcpHttpClient(
                 base_url=self._playwright_mcp_url,
                 timeout_seconds=self._login_timeout_seconds,
+            )
+            append_output_jsonl(
+                "mcp/login-attempts.jsonl",
+                {
+                    "attempt": attempt + 1,
+                    "event": "attempt_started",
+                    "base_url": self._playwright_mcp_url,
+                    "model": self._ai_model,
+                },
             )
             try:
                 await client.navigate("https://www.linkedin.com/login")
@@ -198,6 +208,14 @@ class LinkedInSessionManager:
                 )
                 self._storage_state_path.parent.mkdir(parents=True, exist_ok=True)
                 await client.save_storage_state(self._storage_state_path)
+                append_output_jsonl(
+                    "mcp/login-attempts.jsonl",
+                    {
+                        "attempt": attempt + 1,
+                        "event": "attempt_completed",
+                        "storage_state_path": str(self._storage_state_path),
+                    },
+                )
                 return
             except PlaywrightMcpSessionNotFoundError as exc:
                 last_error = exc
@@ -205,9 +223,25 @@ class LinkedInSessionManager:
                     "playwright_mcp_session_restarted",
                     extra={"attempt": attempt + 1},
                 )
-                if attempt == 1:
+                append_output_jsonl(
+                    "mcp/login-attempts.jsonl",
+                    {
+                        "attempt": attempt + 1,
+                        "event": "session_not_found",
+                        "message": str(exc),
+                    },
+                )
+                if attempt == 2:
                     break
             except PlaywrightMcpError as exc:
+                append_output_jsonl(
+                    "mcp/login-attempts.jsonl",
+                    {
+                        "attempt": attempt + 1,
+                        "event": "attempt_failed",
+                        "message": str(exc),
+                    },
+                )
                 raise LinkedInAuthError(str(exc)) from exc
             finally:
                 await client.close_browser()

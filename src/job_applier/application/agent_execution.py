@@ -6,6 +6,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Protocol
 from uuid import UUID, uuid4
 
@@ -39,7 +40,13 @@ from job_applier.domain.enums import (
     SubmissionStatus,
 )
 from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
-from job_applier.observability import bind_execution_context
+from job_applier.observability import (
+    append_output_jsonl,
+    bind_execution_context,
+    bind_run_output,
+    reset_run_output,
+    write_output_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +280,7 @@ class AgentExecutionOrchestrator:
         job_fetcher: JobFetcher | None = None,
         job_scorer: JobScorer | None = None,
         job_submitter: JobSubmitter | None = None,
+        output_dir: Path | None = None,
     ) -> None:
         self._panel_store = panel_store
         self._execution_store = execution_store
@@ -280,14 +288,22 @@ class AgentExecutionOrchestrator:
         self._job_fetcher = job_fetcher or EmptyJobFetcher()
         self._job_scorer = job_scorer or PassThroughJobScorer()
         self._job_submitter = job_submitter or NoOpJobSubmitter()
+        self._output_dir = output_dir
 
     async def run_execution(self, *, origin: ExecutionOrigin) -> ExecutionRunSummary:
         """Run one agent execution from config load to application attempts."""
 
         execution_id = uuid4()
         started_at = datetime.now().astimezone()
+        if self._output_dir is not None:
+            reset_run_output(
+                self._output_dir,
+                execution_id=execution_id,
+                origin=origin.value,
+                started_at=started_at,
+            )
 
-        with bind_execution_context(execution_id):
+        with bind_execution_context(execution_id), bind_run_output(self._output_dir):
             return await self._run_execution_bound(
                 execution_id=execution_id, started_at=started_at, origin=origin
             )
@@ -314,6 +330,7 @@ class AgentExecutionOrchestrator:
                 error_count=1,
             )
             self._execution_store.save_execution(summary)
+            self._persist_run_summary(summary)
             self._emit_event(
                 execution_id=execution_id,
                 event_type=ExecutionEventType.EXECUTION_FAILED,
@@ -334,6 +351,8 @@ class AgentExecutionOrchestrator:
             snapshot_id=snapshot.id,
         )
         self._execution_store.save_execution(summary)
+        self._persist_run_settings(settings)
+        self._persist_run_summary(summary)
         self._emit_event(
             execution_id=execution_id,
             event_type=ExecutionEventType.EXECUTION_STARTED,
@@ -357,6 +376,7 @@ class AgentExecutionOrchestrator:
 
         summary = summary.model_copy(update={"jobs_seen": len(jobs)})
         self._execution_store.save_execution(summary)
+        self._persist_run_summary(summary)
         self._emit_event(
             execution_id=execution_id,
             event_type=ExecutionEventType.STEP_REACHED,
@@ -518,6 +538,7 @@ class AgentExecutionOrchestrator:
             },
         )
         self._execution_store.save_execution(final_summary)
+        self._persist_run_summary(final_summary)
         self._emit_event(
             execution_id=execution_id,
             event_type=ExecutionEventType.EXECUTION_COMPLETED,
@@ -564,6 +585,7 @@ class AgentExecutionOrchestrator:
             },
         )
         self._execution_store.save_execution(failed_summary)
+        self._persist_run_summary(failed_summary)
         self._emit_event(
             execution_id=summary.execution_id,
             event_type=ExecutionEventType.EXECUTION_FAILED,
@@ -593,3 +615,58 @@ class AgentExecutionOrchestrator:
             payload_json=json.dumps(payload, sort_keys=True),
         )
         self._execution_store.append_event(event)
+        if self._output_dir is not None:
+            append_output_jsonl(
+                "execution-events.jsonl",
+                {
+                    "id": str(event.id),
+                    "execution_id": str(event.execution_id),
+                    "submission_id": str(event.submission_id) if event.submission_id else None,
+                    "event_type": event.event_type.value,
+                    "timestamp": event.timestamp.isoformat(),
+                    "payload": payload,
+                },
+            )
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "agent_execution",
+                    "event_type": event.event_type.value,
+                    "execution_id": str(event.execution_id),
+                    "submission_id": str(event.submission_id) if event.submission_id else None,
+                    "timestamp": event.timestamp.isoformat(),
+                    "payload": payload,
+                },
+            )
+
+    def _persist_run_settings(self, settings: UserAgentSettings) -> None:
+        if self._output_dir is None:
+            return
+        write_output_json(
+            "settings-summary.json",
+            {
+                "config_version": settings.config_version,
+                "profile": {
+                    "email": settings.profile.email,
+                    "city": settings.profile.city,
+                    "has_cv_path": settings.profile.cv_path is not None,
+                    "positive_filters": list(settings.profile.positive_filters),
+                    "blacklist": list(settings.profile.blacklist),
+                },
+                "search": settings.search.model_dump(mode="json"),
+                "agent": {
+                    "schedule": settings.agent.schedule.model_dump(mode="json"),
+                    "auto_connect_with_recruiter": settings.agent.auto_connect_with_recruiter,
+                },
+                "ai": {
+                    "model": settings.ai.model,
+                    "has_api_key": settings.ai.api_key is not None,
+                },
+                "ruleset": settings.ruleset.model_dump(mode="json"),
+            },
+        )
+
+    def _persist_run_summary(self, summary: ExecutionRunSummary) -> None:
+        if self._output_dir is None:
+            return
+        write_output_json("summary.json", summary.model_dump(mode="json"))

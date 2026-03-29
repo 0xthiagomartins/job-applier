@@ -17,6 +17,7 @@ class RuntimeSettings(BaseSettings):
     """Settings that control local paths and on-premise runtime defaults."""
 
     data_dir: Path = Path("artifacts/runtime")
+    output_dir: Path = Path("output")
     panel_storage_dir: Path | None = None
     database_url: str | None = None
     backend_host: str = "0.0.0.0"
@@ -123,6 +124,7 @@ def initialize_runtime_environment(settings: RuntimeSettings) -> None:
     """Prepare local runtime directories and the default SQLite file."""
 
     settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
     settings.resolved_panel_storage_dir.mkdir(parents=True, exist_ok=True)
     settings.resolved_linkedin_storage_state_path.parent.mkdir(parents=True, exist_ok=True)
     settings.resolved_linkedin_artifacts_dir.mkdir(parents=True, exist_ok=True)
