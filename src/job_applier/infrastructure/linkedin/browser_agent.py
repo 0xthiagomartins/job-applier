@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, cast
 from urllib import error, request
@@ -17,8 +17,9 @@ from pydantic import SecretStr
 logger = logging.getLogger(__name__)
 
 BrowserActionType = Literal["click", "fill", "wait", "done", "fail"]
-BrowserValueSource = Literal["literal", "linkedin_email", "linkedin_password"]
+BrowserValueSource = str
 PageRequiresLogin = Callable[[Page], Awaitable[bool]]
+PageTaskComplete = Callable[[Page], Awaitable[bool]]
 
 STRUCTURED_OUTPUT_SCHEMA = {
     "type": "object",
@@ -34,8 +35,10 @@ STRUCTURED_OUTPUT_SCHEMA = {
         },
         "value_source": {
             "type": ["string", "null"],
-            "enum": ["literal", "linkedin_email", "linkedin_password", None],
-            "description": "Use secret sources for credentials and literal for plain text.",
+            "description": (
+                "Use literal for plain text or one of the task-specific value sources "
+                "described in the prompt."
+            ),
         },
         "value": {
             "type": ["string", "null"],
@@ -290,31 +293,90 @@ class OpenAIResponsesBrowserAgent:
     ) -> None:
         """Drive the LinkedIn login flow until the session becomes authenticated."""
 
+        async def login_complete(candidate_page: Page) -> bool:
+            return not await page_requires_login(candidate_page)
+
+        await self.complete_browser_task(
+            page=page,
+            available_values=credentials,
+            goal="Authenticate to LinkedIn so the automation can search and apply for jobs.",
+            timeout_seconds=timeout_seconds,
+            task_name="linkedin_login",
+            is_complete=login_complete,
+            extra_rules=(
+                (
+                    "Use linkedin_email and linkedin_password for credential fields. "
+                    "Never ask for raw secrets."
+                ),
+                (
+                    "If the password was already entered and a sign-in action is visible, "
+                    "prefer clicking submit."
+                ),
+                (
+                    "Do not declare done while the page still looks like a login, "
+                    "challenge, or checkpoint screen."
+                ),
+                (
+                    "If the screen suggests captcha, email verification, OTP, or human "
+                    "checkpoint, choose wait."
+                ),
+            ),
+        )
+
+    async def complete_browser_task(
+        self,
+        *,
+        page: Page,
+        available_values: Mapping[BrowserValueSource, str],
+        goal: str,
+        timeout_seconds: int,
+        task_name: str,
+        is_complete: PageTaskComplete,
+        extra_rules: Sequence[str] = (),
+    ) -> None:
+        """Drive one volatile browser task until its completion predicate succeeds."""
+
         deadline = asyncio.get_running_loop().time() + timeout_seconds
+        recent_actions: list[dict[str, object]] = []
+        previous_snapshot_signature = ""
+
         for step_index in range(self._max_steps):
-            if not await page_requires_login(page):
+            if await is_complete(page):
                 return
 
             snapshot = await self._snapshotter.capture(page)
+            snapshot_signature = f"{snapshot.url}|{snapshot.title}|{snapshot.visible_text}"
+            snapshot_changed = snapshot_signature != previous_snapshot_signature
             if has_manual_intervention_cues(snapshot):
                 if asyncio.get_running_loop().time() >= deadline:
                     break
                 logger.info(
                     "linkedin_browser_agent_waiting_for_manual_intervention",
-                    extra={"step_index": step_index, "url": snapshot.url},
+                    extra={"step_index": step_index, "task_name": task_name, "url": snapshot.url},
                 )
                 await page.wait_for_timeout(5_000)
+                previous_snapshot_signature = snapshot_signature
                 continue
 
             remaining_seconds = max(1.0, deadline - asyncio.get_running_loop().time())
             action = await asyncio.wait_for(
-                self._plan_login_action(snapshot=snapshot),
+                self._plan_action(
+                    snapshot=snapshot,
+                    goal=goal,
+                    task_name=task_name,
+                    available_values=available_values,
+                    step_index=step_index,
+                    recent_actions=recent_actions[-6:],
+                    snapshot_changed=snapshot_changed,
+                    extra_rules=extra_rules,
+                ),
                 timeout=remaining_seconds,
             )
             logger.info(
                 "linkedin_browser_agent_action_planned",
                 extra={
                     "step_index": step_index,
+                    "task_name": task_name,
                     "action_type": action.action_type,
                     "element_id": action.element_id,
                     "value_source": action.value_source,
@@ -322,19 +384,53 @@ class OpenAIResponsesBrowserAgent:
                     "url": snapshot.url,
                 },
             )
-            await self._execute_action(page=page, action=action, credentials=credentials)
+            await self._execute_action(page=page, action=action, values=available_values)
+            recent_actions.append(
+                {
+                    "step_index": step_index,
+                    "task_name": task_name,
+                    "action_type": action.action_type,
+                    "element_id": action.element_id,
+                    "value_source": action.value_source,
+                    "reasoning": action.reasoning,
+                    "url": snapshot.url,
+                    "snapshot_changed": snapshot_changed,
+                }
+            )
+            previous_snapshot_signature = snapshot_signature
 
-        if not await page_requires_login(page):
+        if await is_complete(page):
             return
-        msg = "Browser agent exhausted the LinkedIn login flow before authentication completed."
+        msg = f"Browser agent exhausted the {task_name} task before completion."
         raise BrowserAutomationError(msg)
 
-    async def _plan_login_action(self, *, snapshot: BrowserAgentSnapshot) -> BrowserAgentAction:
-        response_data = await asyncio.to_thread(self._create_response, snapshot)
+    async def _plan_action(
+        self,
+        *,
+        snapshot: BrowserAgentSnapshot,
+        goal: str,
+        task_name: str,
+        available_values: Mapping[BrowserValueSource, str],
+        step_index: int,
+        recent_actions: Sequence[dict[str, object]],
+        snapshot_changed: bool,
+        extra_rules: Sequence[str],
+    ) -> BrowserAgentAction:
+        response_data = await asyncio.to_thread(
+            self._create_response,
+            snapshot,
+            goal,
+            task_name,
+            available_values,
+            step_index,
+            recent_actions,
+            snapshot_changed,
+            extra_rules,
+        )
         raw_output = self._extract_output_text(response_data)
         logger.info(
             "linkedin_browser_agent_response",
-            extra={"model": self._model, "response_text": raw_output},
+            extra={"model": self._model, "task_name": task_name, "response_text": raw_output},
         )
         if not raw_output:
             msg = "Browser agent returned an empty response."
@@ -345,10 +441,24 @@ class OpenAIResponsesBrowserAgent:
             msg = "Browser agent returned invalid JSON."
             raise BrowserAutomationError(msg) from exc
         action = parse_browser_action(payload)
-        self._validate_action_against_snapshot(action, snapshot=snapshot)
+        self._validate_action_against_snapshot(
+            action,
+            snapshot=snapshot,
+            available_values=available_values,
+        )
         return action
 
-    def _create_response(self, snapshot: BrowserAgentSnapshot) -> dict[str, object]:
+    def _create_response(
+        self,
+        snapshot: BrowserAgentSnapshot,
+        goal: str,
+        task_name: str,
+        available_values: Mapping[BrowserValueSource, str],
+        step_index: int,
+        recent_actions: Sequence[dict[str, object]],
+        snapshot_changed: bool,
+        extra_rules: Sequence[str],
+    ) -> dict[str, object]:
         elements_payload = [
             {
                 "element_id": element.element_id,
@@ -366,7 +476,10 @@ class OpenAIResponsesBrowserAgent:
             for element in snapshot.elements
         ]
         prompt_payload = {
-            "goal": "Authenticate to LinkedIn so the automation can search and apply for jobs.",
+            "goal": goal,
+            "task_name": task_name,
+            "step_index": step_index,
+            "snapshot_changed_since_last_step": snapshot_changed,
             "page": {
                 "url": snapshot.url,
                 "title": snapshot.title,
@@ -374,27 +487,31 @@ class OpenAIResponsesBrowserAgent:
                 "elements": elements_payload,
             },
             "available_value_sources": {
-                "linkedin_email": "Fill the user's LinkedIn email or phone login field.",
-                "linkedin_password": "Fill the user's LinkedIn password field.",
+                key: (f"Use the task-owned value source {key}. Never ask for the raw value.")
+                for key in available_values
+                if key != "literal"
             },
+            "recent_action_history": list(recent_actions),
             "rules": [
                 "Return exactly one next action.",
                 "Only reference element ids that exist in the page snapshot.",
-                (
-                    "Use linkedin_email and linkedin_password for credential fields. "
-                    "Never ask for the raw secrets."
-                ),
+                "Use literal for plain text that is not sensitive.",
                 (
                     "Use wait when the page is loading, animating, "
                     "or a human may need to solve verification."
                 ),
-                "Use done only when the login flow appears complete.",
+                (
+                    "Use recent_action_history to avoid repeating the same failed move "
+                    "on an unchanged screen."
+                ),
+                "Use done only when the task goal appears complete.",
                 "Use fail only when no safe next action exists.",
+                *extra_rules,
             ],
         }
         logger.info(
             "linkedin_browser_agent_prompt",
-            extra={"model": self._model, "prompt_payload": prompt_payload},
+            extra={"model": self._model, "task_name": task_name, "prompt_payload": prompt_payload},
         )
 
         body = {
@@ -406,8 +523,9 @@ class OpenAIResponsesBrowserAgent:
                         {
                             "type": "input_text",
                             "text": (
-                                "You are controlling a browser for a LinkedIn login flow. "
-                                "Pick the safest next action based on the current page snapshot."
+                                "You are controlling a browser for a LinkedIn task. "
+                                "Pick the safest next action based on the current page snapshot, "
+                                "the current goal, and the recent action history."
                             ),
                         },
                     ],
@@ -480,7 +598,7 @@ class OpenAIResponsesBrowserAgent:
         *,
         page: Page,
         action: BrowserAgentAction,
-        credentials: dict[BrowserValueSource, str],
+        values: Mapping[BrowserValueSource, str],
     ) -> None:
         if action.action_type == "wait":
             await page.wait_for_timeout(max(1, action.wait_seconds) * 1_000)
@@ -501,7 +619,7 @@ class OpenAIResponsesBrowserAgent:
             return
 
         if action.action_type == "fill":
-            value = self._resolve_fill_value(action, credentials)
+            value = self._resolve_fill_value(action, values)
             await locator.click()
             await locator.fill(value)
             await page.wait_for_timeout(350)
@@ -517,16 +635,17 @@ class OpenAIResponsesBrowserAgent:
     def _resolve_fill_value(
         self,
         action: BrowserAgentAction,
-        credentials: dict[BrowserValueSource, str],
+        values: Mapping[BrowserValueSource, str],
     ) -> str:
         if action.value_source == "literal":
             if action.value is None:
                 msg = "Browser agent returned literal fill without a value."
                 raise BrowserAutomationError(msg)
             return action.value
-        if action.value_source in credentials:
-            return credentials[action.value_source]
-        msg = "Browser agent returned an unsupported credential source."
+        source = action.value_source
+        if source is not None and source in values:
+            return values[source]
+        msg = "Browser agent returned an unsupported task value source."
         raise BrowserAutomationError(msg)
 
     async def _settle_page(self, page: Page) -> None:
@@ -541,6 +660,7 @@ class OpenAIResponsesBrowserAgent:
         action: BrowserAgentAction,
         *,
         snapshot: BrowserAgentSnapshot,
+        available_values: Mapping[BrowserValueSource, str],
     ) -> None:
         valid_element_ids = {element.element_id for element in snapshot.elements}
         if action.action_type in {"click", "fill"} and action.element_id not in valid_element_ids:
@@ -548,6 +668,12 @@ class OpenAIResponsesBrowserAgent:
             raise BrowserAutomationError(msg)
         if action.action_type == "fill" and action.value_source is None:
             msg = "Browser agent returned fill without a value_source."
+            raise BrowserAutomationError(msg)
+        if action.action_type == "fill" and action.value_source not in {
+            "literal",
+            *available_values.keys(),
+        }:
+            msg = "Browser agent returned a value_source that does not belong to the current task."
             raise BrowserAutomationError(msg)
 
 
@@ -560,7 +686,7 @@ def parse_browser_action(payload: dict[str, object]) -> BrowserAgentAction:
         raise BrowserAutomationError(msg)
 
     value_source = payload.get("value_source")
-    if value_source not in {"literal", "linkedin_email", "linkedin_password", None}:
+    if value_source is not None and not isinstance(value_source, str):
         msg = "Browser agent returned an unsupported value_source."
         raise BrowserAutomationError(msg)
 
@@ -577,7 +703,7 @@ def parse_browser_action(payload: dict[str, object]) -> BrowserAgentAction:
     return BrowserAgentAction(
         action_type=cast(BrowserActionType, action_type),
         element_id=_optional_text(payload.get("element_id")),
-        value_source=cast(BrowserValueSource | None, value_source),
+        value_source=_optional_text(value_source),
         value=_optional_text(payload.get("value")),
         wait_seconds=max(0, wait_seconds),
         reasoning=str(payload.get("reasoning") or "").strip(),

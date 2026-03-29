@@ -23,11 +23,16 @@ from job_applier.infrastructure.linkedin.auth import (
     LinkedInCredentials,
     LinkedInSessionManager,
 )
+from job_applier.infrastructure.linkedin.browser_agent import (
+    BrowserAutomationError,
+    OpenAIResponsesBrowserAgent,
+)
 from job_applier.settings import RuntimeSettings
 
 logger = logging.getLogger(__name__)
 
 LINKEDIN_JOBS_URL = "https://www.linkedin.com/jobs/"
+LINKEDIN_JOBS_SEARCH_URL = "https://www.linkedin.com/jobs/search/"
 RESULTS_PER_PAGE = 25
 
 
@@ -115,6 +120,20 @@ def build_paginated_search_url(url: str, *, page_index: int) -> str:
     params["start"] = str(page_index * RESULTS_PER_PAGE)
     updated_query = urlencode(params, doseq=True)
     return urlunparse(parsed._replace(query=updated_query))
+
+
+def build_search_results_url(criteria: LinkedInSearchCriteria) -> str:
+    """Build the primary LinkedIn results URL used by the search flow."""
+
+    params: dict[str, str] = {
+        "keywords": criteria.keywords_text,
+        "location": criteria.location,
+    }
+    if criteria.easy_apply_only:
+        params["f_AL"] = "true"
+    if criteria.posted_within_hours <= 24:
+        params["f_TPR"] = "r86400"
+    return f"{LINKEDIN_JOBS_SEARCH_URL}?{urlencode(params)}"
 
 
 def infer_workplace_type(text: str) -> WorkplaceType | None:
@@ -372,23 +391,78 @@ class PlaywrightLinkedInJobsClient:
         *,
         run_dir: Path,
     ) -> None:
-        await page.goto(LINKEDIN_JOBS_URL, wait_until="domcontentloaded")
+        direct_results_url = build_search_results_url(criteria)
+        await page.goto(direct_results_url, wait_until="domcontentloaded")
         await self._ensure_authenticated_page(page)
-        await self._capture_screenshot(page, run_dir / "jobs-home.png")
-        await self._fill_input(
-            page,
-            patterns=(r"Search by title, skill, or company", r"Search jobs"),
-            value=criteria.keywords_text,
+        await self._wait_for_search_surface(page)
+        await self._capture_screenshot(page, run_dir / "jobs-search-entry.png")
+        if await self._search_results_ready(page):
+            return
+
+        await self._complete_search_with_browser_agent(page, criteria=criteria)
+        await self._wait_for_search_surface(page)
+        await self._capture_screenshot(page, run_dir / "search-results-ready.png")
+        if await self._search_results_ready(page):
+            return
+
+        msg = "Could not reach a LinkedIn job results page after the browser agent search flow."
+        raise LinkedInSearchError(msg)
+
+    async def _complete_search_with_browser_agent(
+        self,
+        page: Page,
+        *,
+        criteria: LinkedInSearchCriteria,
+    ) -> None:
+        ai_api_key = criteria.ai_api_key or self._runtime_settings.openai_api_key
+        if ai_api_key is None:
+            msg = (
+                "LinkedIn search reached an unexpected page and needs the browser agent fallback. "
+                "Configure the OpenAI API key in the panel or set JOB_APPLIER_OPENAI_API_KEY."
+            )
+            raise LinkedInSearchError(msg)
+
+        browser_agent = OpenAIResponsesBrowserAgent(
+            api_key=ai_api_key,
+            model=criteria.ai_model,
         )
-        await self._fill_input(
-            page,
-            patterns=(r"City, state, or zip code", r"Search by location"),
-            value=criteria.location,
-        )
-        await page.get_by_role("button", name=re.compile(r"Search", re.I)).click()
-        await page.wait_for_load_state("domcontentloaded")
-        await self._apply_filters(page, criteria)
-        await self._capture_screenshot(page, run_dir / "filters-applied.png")
+        try:
+            await browser_agent.complete_browser_task(
+                page=page,
+                available_values={
+                    "search_keywords": criteria.keywords_text,
+                    "search_location": criteria.location,
+                },
+                goal=(
+                    "Reach the LinkedIn jobs search results page for the current user. "
+                    "The results should reflect the requested keywords and location, "
+                    "and the base filters must be last 24 hours and Easy Apply only."
+                ),
+                timeout_seconds=max(30, self._runtime_settings.linkedin_login_timeout_seconds),
+                task_name="linkedin_job_search",
+                is_complete=self._search_results_ready,
+                extra_rules=(
+                    (
+                        "If the page is still loading, skeletons are visible, or the search box "
+                        "has not rendered yet, prefer wait over guessing."
+                    ),
+                    (
+                        "Use search_keywords for the job title or skills query field and "
+                        "search_location for the location field when those inputs exist."
+                    ),
+                    (
+                        "If the results page already shows job cards or a no-results state, "
+                        "choose done."
+                    ),
+                    ("If a search submit action is visible after filling the query, click it."),
+                    (
+                        "If an Easy Apply or Past 24 hours filter is visible and inactive, "
+                        "activate it before declaring done."
+                    ),
+                ),
+            )
+        except BrowserAutomationError as exc:
+            raise LinkedInSearchError(str(exc)) from exc
 
     async def _fill_input(self, page: Page, *, patterns: tuple[str, ...], value: str) -> None:
         for pattern in patterns:
@@ -468,6 +542,36 @@ class PlaywrightLinkedInJobsClient:
                 await submit.first.click()
                 await page.wait_for_load_state("domcontentloaded")
                 return
+
+    async def _wait_for_search_surface(self, page: Page) -> None:
+        for _ in range(10):
+            if await self._search_results_ready(page):
+                return
+            if await self._page_looks_busy(page):
+                await page.wait_for_timeout(1_000)
+                continue
+            await page.wait_for_timeout(500)
+
+    async def _search_results_ready(self, page: Page) -> bool:
+        if "/jobs/search" in page.url:
+            if await page.locator("a[href*='/jobs/view/']").count():
+                return True
+            if await page.get_by_text(re.compile(r"no matching jobs|no results", re.I)).count():
+                return True
+            if await page.get_by_text(re.compile(r"easy apply", re.I)).count():
+                return True
+        return False
+
+    async def _page_looks_busy(self, page: Page) -> bool:
+        busy_locators = (
+            page.get_by_text(re.compile(r"loading", re.I)),
+            page.locator("[aria-busy='true']"),
+            page.locator(".artdeco-loader, .jobs-search-two-pane__spinner"),
+        )
+        for locator in busy_locators:
+            if await locator.count():
+                return True
+        return False
 
     async def _extract_listing_cards(self, page: Page) -> list[LinkedInCollectedJob]:
         payloads = await page.locator("a[href*='/jobs/view/']").evaluate_all(

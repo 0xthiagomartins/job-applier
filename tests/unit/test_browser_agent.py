@@ -1,6 +1,5 @@
 from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserAgentSnapshot,
-    BrowserAutomationError,
     has_manual_intervention_cues,
     parse_browser_action,
 )
@@ -24,22 +23,20 @@ def test_parse_browser_action_accepts_credential_fill_payload() -> None:
     assert action.reasoning
 
 
-def test_parse_browser_action_rejects_unknown_value_source() -> None:
-    try:
-        parse_browser_action(
-            {
-                "action_type": "fill",
-                "element_id": "agent-3",
-                "value_source": "secret_text",
-                "value": None,
-                "wait_seconds": 0,
-                "reasoning": "invalid",
-            }
-        )
-    except BrowserAutomationError:
-        return
+def test_parse_browser_action_accepts_task_specific_value_source() -> None:
+    action = parse_browser_action(
+        {
+            "action_type": "fill",
+            "element_id": "agent-3",
+            "value_source": "search_keywords",
+            "value": None,
+            "wait_seconds": 0,
+            "reasoning": "Fill the job search field with the configured search keywords.",
+        }
+    )
 
-    raise AssertionError("Expected BrowserAutomationError for invalid value_source")
+    assert action.action_type == "fill"
+    assert action.value_source == "search_keywords"
 
 
 def test_manual_intervention_detection_flags_captcha_and_otp_pages() -> None:

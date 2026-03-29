@@ -21,6 +21,7 @@ from job_applier.infrastructure.linkedin.search import (
     LinkedInSearchCriteria,
     build_paginated_search_url,
     build_search_criteria,
+    build_search_results_url,
     infer_seniority,
     infer_workplace_type,
 )
@@ -40,6 +41,7 @@ def test_search_criteria_and_parser_normalize_linkedin_jobs(tmp_path: Path) -> N
         "https://www.linkedin.com/jobs/search/?keywords=python&location=Remote",
         page_index=2,
     )
+    direct_results_url = build_search_results_url(criteria)
 
     parser = LinkedInJobParser()
     posting = parser.parse(
@@ -58,6 +60,10 @@ def test_search_criteria_and_parser_normalize_linkedin_jobs(tmp_path: Path) -> N
     assert criteria.keywords_text == "python automation"
     assert criteria.max_pages == 3
     assert "start=50" in paginated
+    assert "keywords=python+automation" in direct_results_url
+    assert "location=Remote" in direct_results_url
+    assert "f_AL=true" in direct_results_url
+    assert "f_TPR=r86400" in direct_results_url
     assert infer_workplace_type("This is a remote-first role.") is WorkplaceType.REMOTE
     assert (
         infer_seniority("We are hiring for a mid-senior level backend role.")

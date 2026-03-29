@@ -4,6 +4,25 @@
 
 Job Applier is an open source system for assisted job application automation with strong submission auditability.
 
+## What the agent does
+
+```mermaid
+flowchart TD
+    A[Open LinkedIn] --> B[Log in]
+    B --> C[Search jobs]
+    C --> D[Filter by last 24 hours]
+    D --> E[Filter by Easy Apply]
+    E --> F{For each job}
+    F --> G[Analyze job fit]
+    G --> H[Apply with Easy Apply]
+    H --> I[Persist successful application]
+    I --> F
+    F --> J[Close LinkedIn]
+    J --> K[Finish MCP connection]
+```
+
+At a high level, the agent logs into LinkedIn, searches recent Easy Apply jobs, evaluates each opportunity, applies when the job passes the fit rules, saves the successful application, and then closes the browser flow cleanly.
+
 The current repository bootstrap already includes:
 
 - Python 3.14 project management with `uv`
