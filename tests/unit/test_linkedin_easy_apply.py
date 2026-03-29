@@ -117,20 +117,24 @@ def test_question_extractor_returns_standardized_field_structure() -> None:
             "question_raw": "How many years of experience do you have with Python?",
             "control_kind": "select",
             "input_type": "select",
+            "dom_ref": "job-applier-3",
             "name": "experience_python",
             "dom_id": "experience-python",
             "required": True,
             "prefilled": False,
             "current_value": "",
             "options": ["Select an option", "2", "4", "8"],
+            "option_refs": ["index:0", "value:two", "value:four", "value:eight"],
         }
     )
 
     assert field.question_raw == "How many years of experience do you have with Python?"
     assert field.question_type is QuestionType.YEARS_EXPERIENCE
     assert field.control_kind == "select"
+    assert field.dom_ref == "job-applier-3"
     assert field.required is True
     assert field.options == ("Select an option", "2", "4", "8")
+    assert field.option_refs == ("index:0", "value:two", "value:four", "value:eight")
     assert field.classification_confidence >= 0.9
     assert field.classification_rule == "years_experience"
     assert field.normalized_key == "how_many_years_of_experience_do_you_have_with_python"

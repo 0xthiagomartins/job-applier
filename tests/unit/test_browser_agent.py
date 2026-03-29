@@ -2,6 +2,7 @@ from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserAgentSnapshot,
     has_manual_intervention_cues,
     parse_browser_action,
+    parse_browser_task_assessment,
 )
 
 
@@ -51,3 +52,19 @@ def test_manual_intervention_detection_flags_captcha_and_otp_pages() -> None:
     )
 
     assert has_manual_intervention_cues(snapshot) is True
+
+
+def test_parse_browser_task_assessment_accepts_blocked_state() -> None:
+    assessment = parse_browser_task_assessment(
+        {
+            "status": "blocked",
+            "confidence": 0.94,
+            "summary": "The form still shows a required field warning for phone number.",
+            "evidence": ["required", "phone number", "warning"],
+        }
+    )
+
+    assert assessment.status == "blocked"
+    assert assessment.confidence == 0.94
+    assert assessment.summary
+    assert assessment.evidence == ("required", "phone number", "warning")

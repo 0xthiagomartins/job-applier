@@ -21,6 +21,13 @@ BrowserActionType = Literal["click", "fill", "wait", "done", "fail"]
 BrowserValueSource = str
 PageRequiresLogin = Callable[[Page], Awaitable[bool]]
 PageTaskComplete = Callable[[Page], Awaitable[bool]]
+BrowserAssessmentStatus = Literal[
+    "complete",
+    "blocked",
+    "pending",
+    "manual_intervention",
+    "unknown",
+]
 
 STRUCTURED_OUTPUT_SCHEMA = {
     "type": "object",
@@ -68,6 +75,34 @@ STRUCTURED_OUTPUT_SCHEMA = {
         "wait_seconds",
         "reasoning",
     ],
+}
+
+STRUCTURED_ASSESSMENT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "status": {
+            "type": "string",
+            "enum": ["complete", "blocked", "pending", "manual_intervention", "unknown"],
+        },
+        "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+        },
+        "summary": {
+            "type": "string",
+            "description": "Short human-readable summary of the current browser state.",
+        },
+        "evidence": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Short signals visible in the page snapshot that support the assessment."
+            ),
+        },
+    },
+    "required": ["status", "confidence", "summary", "evidence"],
 }
 
 INTERACTIVE_SELECTORS = ",".join(
@@ -142,6 +177,16 @@ class BrowserAgentAction:
     action_intent: str | None
     wait_seconds: int
     reasoning: str
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserTaskAssessment:
+    """Structured interpretation of the current browser state."""
+
+    status: BrowserAssessmentStatus
+    confidence: float
+    summary: str
+    evidence: tuple[str, ...] = ()
 
 
 def collapse_text(value: str | None) -> str:
@@ -425,6 +470,52 @@ class OpenAIResponsesBrowserAgent:
         msg = f"Browser agent exhausted the {task_name} task before completion."
         raise BrowserAutomationError(msg)
 
+    async def assess_browser_task(
+        self,
+        *,
+        page: Page,
+        goal: str,
+        task_name: str,
+        extra_rules: Sequence[str] = (),
+        recent_actions: Sequence[dict[str, object]] = (),
+        step_index: int = 0,
+    ) -> BrowserTaskAssessment:
+        """Return a structured assessment of the current browser state."""
+
+        snapshot = await self._snapshotter.capture(page)
+        if has_manual_intervention_cues(snapshot):
+            return BrowserTaskAssessment(
+                status="manual_intervention",
+                confidence=0.99,
+                summary=(
+                    "The page looks like a verification or checkpoint screen that needs a human."
+                ),
+                evidence=("manual_intervention_cue_detected", snapshot.title or snapshot.url),
+            )
+        response_data = await asyncio.to_thread(
+            self._create_assessment_response,
+            snapshot,
+            goal,
+            task_name,
+            step_index,
+            recent_actions,
+            extra_rules,
+        )
+        raw_output = self._extract_output_text(response_data)
+        logger.info(
+            "linkedin_browser_agent_assessment_response",
+            extra={"model": self._model, "task_name": task_name, "response_text": raw_output},
+        )
+        if not raw_output:
+            msg = "Browser agent returned an empty assessment."
+            raise BrowserAutomationError(msg)
+        try:
+            payload = json.loads(raw_output)
+        except json.JSONDecodeError as exc:
+            msg = "Browser agent returned invalid JSON for the browser assessment."
+            raise BrowserAutomationError(msg) from exc
+        return parse_browser_task_assessment(payload)
+
     async def perform_single_task_action(
         self,
         *,
@@ -638,6 +729,124 @@ class OpenAIResponsesBrowserAgent:
             )
             raise
 
+    def _create_assessment_response(
+        self,
+        snapshot: BrowserAgentSnapshot,
+        goal: str,
+        task_name: str,
+        step_index: int,
+        recent_actions: Sequence[dict[str, object]],
+        extra_rules: Sequence[str],
+    ) -> dict[str, object]:
+        elements_payload = [
+            {
+                "element_id": element.element_id,
+                "tag": element.tag,
+                "role": element.role,
+                "label": element.label,
+                "text": truncate_text(element.text or "", limit=120) or None,
+                "placeholder": element.placeholder,
+                "name": element.name,
+                "input_type": element.input_type,
+                "href": element.href,
+                "current_value": truncate_text(element.current_value or "", limit=80) or None,
+                "disabled": element.disabled,
+            }
+            for element in snapshot.elements
+        ]
+        prompt_payload = {
+            "goal": goal,
+            "task_name": task_name,
+            "step_index": step_index,
+            "page": {
+                "url": snapshot.url,
+                "title": snapshot.title,
+                "visible_text": snapshot.visible_text,
+                "elements": elements_payload,
+            },
+            "recent_action_history": list(recent_actions),
+            "rules": [
+                "Assess the current page state only. Do not propose a next action.",
+                "Use complete only when the goal is already achieved on the visible page.",
+                (
+                    "Use blocked when the page shows a visible validation error, "
+                    "denial, or a dead end."
+                ),
+                (
+                    "Use pending when the page still looks like loading, processing, "
+                    "or waiting for the UI to settle."
+                ),
+                (
+                    "Use manual_intervention when a human needs to solve captcha, OTP, "
+                    "or another checkpoint."
+                ),
+                "Use unknown when the snapshot does not provide enough evidence yet.",
+                "Keep summary short and concrete.",
+                "Use evidence for short visible clues from the page.",
+                *extra_rules,
+            ],
+        }
+        logger.info(
+            "linkedin_browser_agent_assessment_prompt",
+            extra={"model": self._model, "task_name": task_name, "prompt_payload": prompt_payload},
+        )
+
+        body = {
+            "model": self._model,
+            "input": [
+                {
+                    "role": "developer",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "You are assessing a browser state for a LinkedIn task. "
+                                "Return only a structured assessment of whether the goal "
+                                "is already complete, blocked, pending, requires manual "
+                                "intervention, or is still unknown."
+                            ),
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": json.dumps(prompt_payload, ensure_ascii=True),
+                        },
+                    ],
+                },
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "browser_task_assessment",
+                    "schema": STRUCTURED_ASSESSMENT_SCHEMA,
+                    "strict": True,
+                },
+            },
+        }
+        payload_bytes = json.dumps(body, ensure_ascii=True).encode("utf-8")
+        http_request = request.Request(
+            self.endpoint,
+            data=payload_bytes,
+            headers={
+                "Authorization": f"Bearer {self._api_key.get_secret_value()}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with request.urlopen(http_request, timeout=30) as response:  # noqa: S310
+                return cast(dict[str, object], json.loads(response.read().decode("utf-8")))
+        except error.HTTPError as exc:
+            logger.warning(
+                "openai_browser_agent_assessment_http_error",
+                extra={"status": exc.code, "body": exc.read().decode("utf-8", errors="replace")},
+            )
+            raise
+
     def _extract_output_text(self, response_data: dict[str, object]) -> str:
         direct_output = response_data.get("output_text")
         if isinstance(direct_output, str):
@@ -787,6 +996,38 @@ def parse_browser_action(payload: dict[str, object]) -> BrowserAgentAction:
         action_intent=_optional_text(payload.get("action_intent")),
         wait_seconds=max(0, wait_seconds),
         reasoning=str(payload.get("reasoning") or "").strip(),
+    )
+
+
+def parse_browser_task_assessment(payload: dict[str, object]) -> BrowserTaskAssessment:
+    """Validate the structured state assessment returned by the browser planner."""
+
+    status = payload.get("status")
+    if status not in {"complete", "blocked", "pending", "manual_intervention", "unknown"}:
+        msg = "Browser agent returned an unsupported assessment status."
+        raise BrowserAutomationError(msg)
+
+    confidence_raw = payload.get("confidence", 0.0)
+    if not isinstance(confidence_raw, (int, float, str)):
+        msg = "Browser agent returned an invalid assessment confidence."
+        raise BrowserAutomationError(msg)
+    try:
+        confidence = float(confidence_raw)
+    except (TypeError, ValueError) as exc:
+        msg = "Browser agent returned an invalid assessment confidence."
+        raise BrowserAutomationError(msg) from exc
+
+    evidence_raw = payload.get("evidence", ())
+    evidence_items = evidence_raw if isinstance(evidence_raw, list) else ()
+    evidence = tuple(
+        item.strip() for item in evidence_items if isinstance(item, str) and item.strip()
+    )
+
+    return BrowserTaskAssessment(
+        status=cast(BrowserAssessmentStatus, status),
+        confidence=max(0.0, min(1.0, confidence)),
+        summary=str(payload.get("summary") or "").strip(),
+        evidence=evidence,
     )
 
 

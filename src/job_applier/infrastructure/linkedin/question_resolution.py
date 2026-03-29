@@ -77,6 +77,7 @@ class EasyApplyField:
     control_kind: ControlKind
     classification_confidence: float = 0.0
     classification_rule: str | None = None
+    dom_ref: str | None = None
     dom_id: str | None = None
     name: str | None = None
     input_type: str | None = None
@@ -84,6 +85,7 @@ class EasyApplyField:
     prefilled: bool = False
     current_value: str = ""
     options: tuple[str, ...] = ()
+    option_refs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,6 +312,7 @@ class LinkedInQuestionExtractor:
             control_kind=typed_control,
             classification_confidence=classification.confidence,
             classification_rule=classification.matched_rule,
+            dom_ref=str(payload.get("dom_ref")) if payload.get("dom_ref") else None,
             dom_id=str(payload.get("dom_id")) if payload.get("dom_id") else None,
             name=str(payload.get("name")) if payload.get("name") else None,
             input_type=input_type,
@@ -317,6 +320,15 @@ class LinkedInQuestionExtractor:
             prefilled=bool(payload.get("prefilled")),
             current_value=str(payload.get("current_value") or ""),
             options=options,
+            option_refs=self._extract_option_refs(payload),
+        )
+
+    def _extract_option_refs(self, payload: dict[str, object]) -> tuple[str, ...]:
+        raw_option_refs = payload.get("option_refs", ())
+        if not isinstance(raw_option_refs, (list, tuple)):
+            return ()
+        return tuple(
+            item.strip() for item in raw_option_refs if isinstance(item, str) and item.strip()
         )
 
 

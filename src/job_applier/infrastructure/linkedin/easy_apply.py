@@ -54,6 +54,7 @@ from job_applier.infrastructure.linkedin.auth import (
 from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserAgentAction,
     BrowserAutomationError,
+    BrowserTaskAssessment,
     OpenAIResponsesBrowserAgent,
 )
 from job_applier.infrastructure.linkedin.question_resolution import (
@@ -62,7 +63,6 @@ from job_applier.infrastructure.linkedin.question_resolution import (
     LinkedInQuestionExtractor,
     ResolvedFieldValue,
     normalize_text,
-    pick_option,
 )
 from job_applier.infrastructure.linkedin.recruiter_connect import (
     LinkedInRecruiterCandidateFinder,
@@ -72,13 +72,6 @@ from job_applier.observability import bind_submission_context
 from job_applier.settings import RuntimeSettings
 
 logger = logging.getLogger(__name__)
-
-SUCCESS_PATTERNS = (
-    r"your application was sent",
-    r"application submitted",
-    r"application sent",
-    r"you.re all set",
-)
 
 
 class LinkedInEasyApplyError(RuntimeError):
@@ -388,7 +381,20 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                 "reasoning": action.reasoning,
                             },
                         )
-                        success, outcome_notes = await self._await_submission_outcome(page)
+                        success, outcome_notes = await self._await_submission_outcome(
+                            page,
+                            settings=settings,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            execution_events=execution_events,
+                            recent_actions=(
+                                {
+                                    "action_type": action.action_type,
+                                    "action_intent": action.action_intent,
+                                    "reasoning": action.reasoning,
+                                },
+                            ),
+                        )
                         artifacts.extend(
                             await self._capture_debug_bundle(
                                 page,
@@ -512,8 +518,22 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             notes=outcome_notes or "LinkedIn did not confirm the application.",
                         )
 
-                    errors = await self._collect_validation_errors(page)
-                    if errors:
+                    assessment_status, assessment_notes = await self._assess_easy_apply_step_state(
+                        page,
+                        settings=settings,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
+                        execution_events=execution_events,
+                        step=step,
+                        recent_actions=(
+                            {
+                                "action_type": action.action_type,
+                                "action_intent": action.action_intent,
+                                "reasoning": action.reasoning,
+                            },
+                        ),
+                    )
+                    if assessment_status == "blocked":
                         artifacts.extend(
                             await self._capture_debug_bundle(
                                 page,
@@ -529,15 +549,16 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             event_type=ExecutionEventType.JOB_PROCESSED,
                             payload={
                                 "job_posting_id": str(posting.id),
-                                "reason": "validation_error",
+                                "reason": "agentic_step_blocked",
                                 "status": SubmissionStatus.FAILED.value,
+                                "notes": assessment_notes,
                             },
                         )
                         return EasyApplyExecutionResult(
                             submission_id=submission_id,
                             started_at=started_at,
                             status=SubmissionStatus.FAILED,
-                            notes=_join_errors(errors),
+                            notes=assessment_notes,
                         )
 
                 artifacts.extend(
@@ -717,10 +738,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 locator = await self._find_control_locator(root, field)
                 if locator is None:
                     return None
-                option = pick_option(field.options, preferred=resolution.value)
-                if option is None:
+                option_index = _pick_option_index(field.options, preferred=resolution.value)
+                if option_index is None:
                     return None
-                await locator.select_option(label=option)
+                option = field.options[option_index]
+                await self._select_field_option(locator, field, option_index=option_index)
                 return option
             case "checkbox":
                 locator = await self._find_control_locator(root, field)
@@ -733,9 +755,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 await locator.uncheck()
                 return "No"
             case "radio":
-                option = pick_option(field.options, preferred=resolution.value)
-                if option is None:
+                option_index = _pick_option_index(field.options, preferred=resolution.value)
+                if option_index is None:
                     return None
+                option = field.options[option_index]
                 if await self._check_radio_option(root, field, option):
                     return option
                 return None
@@ -752,11 +775,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
         field: EasyApplyField,
         option: str,
     ) -> bool:
-        option_pattern = re.compile(re.escape(option), re.I)
-        for locator in (
-            root.get_by_role("radio", name=option_pattern),
-            root.get_by_label(option_pattern),
-        ):
+        option_index = _pick_option_index(field.options, preferred=option)
+        if option_index is None:
+            return False
+        option_ref = (
+            field.option_refs[option_index] if len(field.option_refs) > option_index else None
+        )
+        if option_ref:
+            locator = root.locator(_attribute_selector("data-job-applier-option-ref", option_ref))
             if await locator.count():
                 await locator.first.check()
                 return True
@@ -765,13 +791,16 @@ class PlaywrightLinkedInEasyApplyExecutor:
             group = root.locator(
                 f'input[type="radio"]{_attribute_selector("name", field.name)}',
             )
-            option_index = field.options.index(option)
             if await group.count() > option_index:
                 await group.nth(option_index).check()
                 return True
         return False
 
     async def _find_control_locator(self, root: Locator, field: EasyApplyField) -> Locator | None:
+        if field.dom_ref:
+            locator = root.locator(_attribute_selector("data-job-applier-field-ref", field.dom_ref))
+            if await locator.count():
+                return locator.first
         if field.dom_id:
             locator = root.locator(_attribute_selector("id", field.dom_id))
             if await locator.count():
@@ -780,11 +809,26 @@ class PlaywrightLinkedInEasyApplyExecutor:
             locator = root.locator(_attribute_selector("name", field.name))
             if await locator.count():
                 return locator.first
-        label_pattern = re.compile(re.escape(field.question_raw[:60]), re.I)
-        locator = root.get_by_label(label_pattern)
-        if await locator.count():
-            return locator.first
         return None
+
+    async def _select_field_option(
+        self,
+        locator: Locator,
+        field: EasyApplyField,
+        *,
+        option_index: int,
+    ) -> None:
+        option_ref = (
+            field.option_refs[option_index] if len(field.option_refs) > option_index else None
+        )
+        if option_ref is not None:
+            if option_ref.startswith("value:"):
+                await locator.select_option(value=option_ref.removeprefix("value:"))
+                return
+            if option_ref.startswith("index:"):
+                await locator.select_option(index=int(option_ref.removeprefix("index:")))
+                return
+        await locator.select_option(index=option_index)
 
     async def _extract_step(self, page: Page, *, fallback_step_index: int) -> EasyApplyStep:
         root = await self._easy_apply_root(page)
@@ -793,6 +837,18 @@ class PlaywrightLinkedInEasyApplyExecutor:
             (node) => {
               const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
               const labels = Array.from(node.querySelectorAll("label"));
+              let refCounter = 1;
+
+              const ensureRef = (element, attributeName) => {
+                const existing = collapse(element.getAttribute(attributeName));
+                if (existing) {
+                  return existing;
+                }
+                const ref = `job-applier-${refCounter}`;
+                refCounter += 1;
+                element.setAttribute(attributeName, ref);
+                return ref;
+              };
 
               const questionFor = (element) => {
                 const ariaLabel = collapse(element.getAttribute("aria-label"));
@@ -860,8 +916,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
 
               const fields = [];
               const textControls = node.querySelectorAll([
-                "input:not([type=radio]):not([type=checkbox])",
-                ":not([type=hidden]):not([disabled])",
+                "input:not([type=radio]):not([type=checkbox]):not([type=hidden]):not([disabled])",
                 "select:not([disabled])",
                 "textarea:not([disabled])",
               ].join(", "));
@@ -883,8 +938,20 @@ class PlaywrightLinkedInEasyApplyExecutor:
                   tag === "select"
                     ? collapse(element.options[element.selectedIndex]?.text || "")
                     : collapse(element.value || "");
+                const domRef = ensureRef(element, "data-job-applier-field-ref");
+                const selectOptionRefs =
+                  tag === "select"
+                    ? Array.from(element.options).map((option, index) => {
+                        const optionValue = collapse(option.value);
+                        if (optionValue) {
+                          return `value:${optionValue}`;
+                        }
+                        return `index:${index}`;
+                      })
+                    : [];
 
                 fields.push({
+                  dom_ref: domRef,
                   dom_id: element.getAttribute("id"),
                   name: element.getAttribute("name"),
                   input_type: type,
@@ -902,6 +969,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                           .map((option) => collapse(option.textContent))
                           .filter(Boolean)
                       : [],
+                  option_refs: selectOptionRefs,
                 });
               }
 
@@ -920,7 +988,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     (candidate.getAttribute("name") || candidate.getAttribute("id")) === groupName,
                 );
                 const selected = group.find((candidate) => candidate.checked);
+                const optionRefs = group.map((candidate) =>
+                  ensureRef(candidate, "data-job-applier-option-ref"),
+                );
                 fields.push({
+                  dom_ref: ensureRef(input, "data-job-applier-field-ref"),
                   dom_id: input.getAttribute("id"),
                   name: input.getAttribute("name"),
                   input_type: "radio",
@@ -933,12 +1005,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
                   prefilled: Boolean(selected),
                   current_value: selected ? optionLabel(selected) : "",
                   options: group.map((candidate) => optionLabel(candidate)).filter(Boolean),
+                  option_refs: optionRefs,
                 });
               }
 
               const checkboxes = node.querySelectorAll("input[type=checkbox]:not([disabled])");
               for (const input of checkboxes) {
                 fields.push({
+                  dom_ref: ensureRef(input, "data-job-applier-field-ref"),
                   dom_id: input.getAttribute("id"),
                   name: input.getAttribute("name"),
                   input_type: "checkbox",
@@ -1117,50 +1191,131 @@ class PlaywrightLinkedInEasyApplyExecutor:
         )
         return action
 
-    async def _await_submission_outcome(self, page: Page) -> tuple[bool, str | None]:
-        for _ in range(20):
-            if await self._submission_success_detected(page):
-                return True, "LinkedIn Easy Apply submitted successfully."
-            errors = await self._collect_validation_errors(page)
-            if errors:
-                return False, _join_errors(errors)
-            await page.wait_for_timeout(500)
-        return False, "LinkedIn did not confirm the submission result in time."
+    async def _await_submission_outcome(
+        self,
+        page: Page,
+        *,
+        settings: UserAgentSettings,
+        execution_id: UUID,
+        submission_id: UUID,
+        execution_events: list[ExecutionEvent],
+        recent_actions: tuple[dict[str, object], ...] = (),
+    ) -> tuple[bool, str | None]:
+        for attempt_index in range(20):
+            assessment = await self._assess_browser_state_with_agent(
+                page,
+                settings=settings,
+                task_name="linkedin_easy_apply_submission_state",
+                goal=(
+                    "Determine whether the LinkedIn Easy Apply flow has already submitted the "
+                    "application, is still processing, or is blocked by a visible issue."
+                ),
+                extra_rules=(
+                    (
+                        "Use complete only when the visible screen strongly indicates that the "
+                        "application was already sent or finished."
+                    ),
+                    (
+                        "Use blocked when the page shows a missing field, validation issue, or "
+                        "another visible problem preventing completion."
+                    ),
+                    "Use pending while the UI is still transitioning or loading.",
+                ),
+                recent_actions=recent_actions,
+                step_index=attempt_index,
+            )
+            self._record_event(
+                execution_events,
+                execution_id=execution_id,
+                submission_id=submission_id,
+                event_type=ExecutionEventType.STEP_REACHED,
+                payload={
+                    "stage": "easy_apply_submission_assessment",
+                    "attempt_index": attempt_index,
+                    "status": assessment.status,
+                    "confidence": assessment.confidence,
+                    "summary": assessment.summary,
+                    "evidence": list(assessment.evidence),
+                },
+            )
+            if assessment.status == "complete":
+                return True, assessment.summary or "LinkedIn Easy Apply submitted successfully."
+            if assessment.status == "blocked":
+                return False, assessment.summary or "LinkedIn blocked the application flow."
+            await page.wait_for_timeout(750)
+        return False, "LinkedIn did not confirm the application result in time."
 
-    async def _submission_success_detected(self, page: Page) -> bool:
-        for pattern in SUCCESS_PATTERNS:
-            locator = page.get_by_text(re.compile(pattern, re.I))
-            if await locator.count():
-                return True
-
-        done_button = page.get_by_role("button", name=re.compile(r"done|close|dismiss", re.I))
-        submit_button = page.get_by_role(
-            "button",
-            name=re.compile(r"submit application|send application", re.I),
+    async def _assess_easy_apply_step_state(
+        self,
+        page: Page,
+        *,
+        settings: UserAgentSettings,
+        execution_id: UUID,
+        submission_id: UUID,
+        execution_events: list[ExecutionEvent],
+        step: EasyApplyStep,
+        recent_actions: tuple[dict[str, object], ...] = (),
+    ) -> tuple[str, str | None]:
+        assessment = await self._assess_browser_state_with_agent(
+            page,
+            settings=settings,
+            task_name="linkedin_easy_apply_step_state",
+            goal=(
+                "Assess whether the current LinkedIn Easy Apply step is ready to continue, "
+                "still settling, or blocked by a visible issue after the latest action."
+            ),
+            extra_rules=(
+                "Use blocked when the screen shows a visible validation or completeness issue.",
+                (
+                    "Use complete only when the current step is clearly ready for the next "
+                    "stage or has already advanced."
+                ),
+                "Use pending while the step is still rendering or saving.",
+            ),
+            recent_actions=recent_actions,
+            step_index=step.step_index,
         )
-        return await done_button.count() > 0 and await submit_button.count() == 0
+        self._record_event(
+            execution_events,
+            execution_id=execution_id,
+            submission_id=submission_id,
+            event_type=ExecutionEventType.STEP_REACHED,
+            payload={
+                "stage": "easy_apply_step_assessment",
+                "step_index": step.step_index,
+                "status": assessment.status,
+                "confidence": assessment.confidence,
+                "summary": assessment.summary,
+                "evidence": list(assessment.evidence),
+            },
+        )
+        if assessment.status == "blocked":
+            return "blocked", assessment.summary
+        return assessment.status, assessment.summary
 
-    async def _collect_validation_errors(self, page: Page) -> tuple[str, ...]:
+    async def _assess_browser_state_with_agent(
+        self,
+        page: Page,
+        *,
+        settings: UserAgentSettings,
+        task_name: str,
+        goal: str,
+        extra_rules: tuple[str, ...] = (),
+        recent_actions: tuple[dict[str, object], ...] = (),
+        step_index: int = 0,
+    ) -> BrowserTaskAssessment:
+        browser_agent = self._create_browser_agent(settings)
         try:
-            root = await self._easy_apply_root(page)
-        except LinkedInEasyApplyError:
-            return ()
-
-        messages: list[str] = []
-        for selector in (
-            ".artdeco-inline-feedback__message",
-            ".fb-form-element__error",
-            "[role='alert']",
-            "[aria-live='assertive']",
-        ):
-            locator = root.locator(selector)
-            count = await locator.count()
-            for index in range(min(count, 8)):
-                text = normalize_text(await locator.nth(index).inner_text())
-                if text:
-                    messages.append(text)
-        unique = tuple(dict.fromkeys(messages))
-        return unique
+            return await browser_agent.assess_browser_task(
+                page=page,
+                goal=goal,
+                task_name=task_name,
+                extra_rules=extra_rules,
+                recent_actions=recent_actions,
+                step_index=step_index,
+            )
+        except BrowserAutomationError as exc:
+            raise LinkedInEasyApplyError(str(exc)) from exc
 
     async def _easy_apply_root(self, page: Page) -> Locator:
         for selector in (
@@ -1540,8 +1695,19 @@ def _attribute_selector(attribute: str, value: str) -> str:
     return f'[{attribute}="{escaped}"]'
 
 
-def _join_errors(errors: tuple[str, ...]) -> str:
-    return "; ".join(error for error in errors if error)
+def _pick_option_index(options: tuple[str, ...], *, preferred: str | None) -> int | None:
+    if not options:
+        return None
+    if preferred is None:
+        return 0
+    normalized_preferred = normalize_text(preferred)
+    for index, option in enumerate(options):
+        if normalize_text(option) == normalized_preferred:
+            return index
+    for index, option in enumerate(options):
+        if normalized_preferred in normalize_text(option):
+            return index
+    return 0
 
 
 def _build_file_artifact(
