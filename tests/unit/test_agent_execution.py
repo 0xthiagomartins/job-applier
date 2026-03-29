@@ -159,6 +159,82 @@ def test_scheduler_runs_once_per_slot_and_supports_manual_trigger(tmp_path: Path
     assert fake_orchestrator.origins == [ExecutionOrigin.SCHEDULED, ExecutionOrigin.MANUAL]
 
 
+def test_orchestrator_only_submits_jobs_that_pass_scoring(tmp_path: Path) -> None:
+    panel_store = build_ready_panel_store(tmp_path / "panel")
+    execution_store = LocalExecutionStore(root_dir=tmp_path / "executions")
+    submission_store = InMemorySuccessfulSubmissionStore()
+
+    rejected_posting = JobPosting(
+        platform=Platform.LINKEDIN,
+        url="https://www.linkedin.com/jobs/view/rejected",
+        title="Operations Coordinator",
+        company_name="Acme",
+        description_raw="Administrative routines and coordination.",
+    )
+    accepted_posting = JobPosting(
+        platform=Platform.LINKEDIN,
+        url="https://www.linkedin.com/jobs/view/accepted",
+        title="Senior Python Automation Engineer",
+        company_name="Beta",
+        description_raw="Python automation with FastAPI.",
+    )
+
+    class FakeFetcher(JobFetcher):
+        async def fetch(self, settings):
+            del settings
+            return [rejected_posting, accepted_posting]
+
+    class FakeScorer(JobScorer):
+        async def score(self, settings, posting):
+            del settings
+            if posting.id == rejected_posting.id:
+                return ScoredJobPosting(
+                    posting=posting,
+                    selected=False,
+                    score=0.2,
+                    reason="Rejected with score 0.20 < 0.55",
+                )
+            return ScoredJobPosting(posting=posting, selected=True, score=0.91, reason="accepted")
+
+    class FakeSubmitter(JobSubmitter):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def submit(self, settings, posting, *, execution_id, origin):
+            del settings, execution_id
+            self.calls.append(posting.title)
+            return SubmissionAttempt(
+                submission=ApplicationSubmission(
+                    job_posting_id=posting.id,
+                    execution_origin=origin,
+                ),
+            )
+
+    submitter = FakeSubmitter()
+    orchestrator = AgentExecutionOrchestrator(
+        panel_store=panel_store,
+        execution_store=execution_store,
+        successful_submission_store=submission_store,
+        job_fetcher=FakeFetcher(),
+        job_scorer=FakeScorer(),
+        job_submitter=submitter,
+    )
+
+    summary = asyncio.run(orchestrator.run_execution(origin=ExecutionOrigin.MANUAL))
+    events = execution_store.list_events(summary.execution_id)
+
+    assert summary.status is AgentExecutionStatus.COMPLETED
+    assert summary.jobs_seen == 2
+    assert summary.jobs_selected == 1
+    assert summary.successful_submissions == 1
+    assert submitter.calls == ["Senior Python Automation Engineer"]
+    assert any(
+        event["event_type"] == ExecutionEventType.STEP_REACHED.value
+        and event["payload_json"].find("score_rejected") != -1
+        for event in events
+    )
+
+
 def build_ready_panel_store(root_dir: Path) -> LocalPanelSettingsStore:
     store = LocalPanelSettingsStore(root_dir=root_dir)
     store.save_profile(

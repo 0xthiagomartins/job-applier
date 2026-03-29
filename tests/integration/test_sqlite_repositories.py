@@ -4,6 +4,10 @@ from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
+from sqlalchemy.exc import IntegrityError
+
+from job_applier.domain import ApplicationSubmission, ExecutionOrigin
 from job_applier.infrastructure.sqlite import create_session_factory
 from job_applier.infrastructure.sqlite.repositories import (
     SqliteAnswerRepository,
@@ -107,3 +111,45 @@ def test_sqlite_repositories_support_roundtrip_crud(tmp_path: Path) -> None:
     assert submission_repo.get(saved_submission.id) is None
     assert snapshot_repo.get(saved_snapshot.id) is None
     assert posting_repo.get(saved_posting.id) is None
+
+
+def test_sqlite_repositories_enforce_foreign_keys_for_submission_links(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'repository-fks.db').resolve()}"
+    upgrade_to_head(database_url)
+    session_factory = create_session_factory(database_url)
+
+    submission_repo = SqliteSubmissionRepository(session_factory)
+    artifact_repo = SqliteArtifactSnapshotRepository(session_factory)
+    recruiter_repo = SqliteRecruiterInteractionRepository(session_factory)
+    event_repo = SqliteExecutionEventRepository(session_factory)
+
+    missing_submission_id = uuid4()
+
+    with pytest.raises(IntegrityError):
+        submission_repo.save(
+            ApplicationSubmission(
+                job_posting_id=uuid4(),
+                execution_origin=ExecutionOrigin.MANUAL,
+            ),
+        )
+
+    with pytest.raises(IntegrityError):
+        artifact_repo.save(
+            build_artifact(submission_id=missing_submission_id, created_at=utc_dt(28, 11))
+        )
+
+    with pytest.raises(IntegrityError):
+        recruiter_repo.save(
+            build_recruiter_interaction(
+                submission_id=missing_submission_id, sent_at=utc_dt(28, 11)
+            ),
+        )
+
+    with pytest.raises(IntegrityError):
+        event_repo.save(
+            build_execution_event(
+                execution_id=uuid4(),
+                submission_id=missing_submission_id,
+                timestamp=utc_dt(28, 11),
+            ),
+        )

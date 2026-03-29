@@ -105,6 +105,8 @@ npm run typecheck
 npm run build
 ```
 
+The lean test philosophy for this repo lives in [docs/testing-strategy.md](docs/testing-strategy.md).
+
 ## On-premise container
 
 The repository already includes a single `Dockerfile` for the on-premise flow:
