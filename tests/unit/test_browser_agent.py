@@ -3,6 +3,7 @@ from job_applier.infrastructure.linkedin.browser_agent import (
     has_manual_intervention_cues,
     parse_browser_action,
     parse_browser_task_assessment,
+    summarize_browser_action_error,
 )
 
 
@@ -68,3 +69,11 @@ def test_parse_browser_task_assessment_accepts_blocked_state() -> None:
     assert assessment.confidence == 0.94
     assert assessment.summary
     assert assessment.evidence == ("required", "phone number", "warning")
+
+
+def test_summarize_browser_action_error_normalizes_overlay_interception() -> None:
+    message = summarize_browser_action_error(
+        RuntimeError("Locator.click: dialog intercepts pointer events while clicking the target")
+    )
+
+    assert message == "The chosen target is blocked by an open dialog or overlay."

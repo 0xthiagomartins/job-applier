@@ -164,6 +164,7 @@ class BrowserAgentSnapshot:
     title: str
     visible_text: str
     elements: tuple[BrowserAgentElement, ...]
+    active_surface: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,7 +253,63 @@ class BrowserDomSnapshotter:
                 const label = document.querySelector(`label[for="${id}"]`);
                 return collapse(label?.innerText || label?.textContent || "");
               };
-              const nodes = Array.from(document.querySelectorAll(interactiveSelectors));
+              const describeSurface = (node) => {
+                if (!node) {
+                  return "";
+                }
+                const labelledBy = collapse(node.getAttribute("aria-labelledby"));
+                if (labelledBy) {
+                  const heading = labelledBy
+                    .split(/\\s+/)
+                    .map((id) => document.getElementById(id))
+                    .find((item) => item && collapse(item.innerText || item.textContent || ""));
+                  if (heading) {
+                    return collapse(heading.innerText || heading.textContent || "");
+                  }
+                }
+                const ariaLabel = collapse(node.getAttribute("aria-label"));
+                if (ariaLabel) {
+                  return ariaLabel;
+                }
+                const heading = node.querySelector("h1, h2, h3, [role='heading']");
+                if (heading && collapse(heading.innerText || heading.textContent || "")) {
+                  return collapse(heading.innerText || heading.textContent || "");
+                }
+                return collapse(node.innerText || node.textContent || "").slice(0, 120);
+              };
+              const surfaceSelectors = [
+                "dialog[open]",
+                "[role='dialog'][open]",
+                "[role='dialog']",
+                "[aria-modal='true']",
+                "[data-testid='dialog']",
+              ].join(", ");
+              const visibleSurfaces = Array.from(document.querySelectorAll(surfaceSelectors))
+                .filter(isVisible)
+                .map((node, index) => {
+                  const rect = node.getBoundingClientRect();
+                  const style = window.getComputedStyle(node);
+                  const zIndex = Number.parseInt(style.zIndex || "0", 10);
+                  return {
+                    node,
+                    index,
+                    area: rect.width * rect.height,
+                    zIndex: Number.isFinite(zIndex) ? zIndex : 0,
+                    label: describeSurface(node),
+                  };
+                })
+                .sort((left, right) => {
+                  if (left.zIndex !== right.zIndex) {
+                    return right.zIndex - left.zIndex;
+                  }
+                  if (left.area !== right.area) {
+                    return right.area - left.area;
+                  }
+                  return right.index - left.index;
+                });
+              const activeSurface = visibleSurfaces[0] || null;
+              const scopeRoot = activeSurface ? activeSurface.node : document;
+              const nodes = Array.from(scopeRoot.querySelectorAll(interactiveSelectors));
               const items = [];
               let counter = 1;
 
@@ -281,10 +338,13 @@ class BrowserDomSnapshotter:
                 }
               }
 
-              const visibleText = collapse(document.body?.innerText || "");
+              const visibleText = collapse(
+                activeSurface ? activeSurface.node.innerText : (document.body?.innerText || ""),
+              );
               return {
                 visible_text: visibleText,
                 elements: items,
+                active_surface: activeSurface ? activeSurface.label : "",
               };
             }
             """,
@@ -321,6 +381,7 @@ class BrowserDomSnapshotter:
                 limit=self._max_visible_text,
             ),
             elements=elements,
+            active_surface=_optional_text(raw_payload.get("active_surface")),
         )
 
 
@@ -402,6 +463,7 @@ class OpenAIResponsesBrowserAgent:
 
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         recent_actions: list[dict[str, object]] = []
+        execution_feedback: list[dict[str, object]] = []
         previous_snapshot_signature = ""
 
         for step_index in range(self._max_steps):
@@ -431,6 +493,7 @@ class OpenAIResponsesBrowserAgent:
                     available_values=available_values,
                     step_index=step_index,
                     recent_actions=recent_actions[-6:],
+                    execution_feedback=execution_feedback[-4:],
                     snapshot_changed=snapshot_changed,
                     extra_rules=extra_rules,
                     allowed_action_types=allowed_action_types,
@@ -450,7 +513,25 @@ class OpenAIResponsesBrowserAgent:
                     "url": snapshot.url,
                 },
             )
-            await self._execute_action(page=page, action=action, values=available_values)
+            try:
+                await self._execute_action(page=page, action=action, values=available_values)
+            except BrowserAutomationError as exc:
+                feedback = {
+                    "step_index": step_index,
+                    "task_name": task_name,
+                    "failed_action_type": action.action_type,
+                    "element_id": action.element_id,
+                    "action_intent": action.action_intent,
+                    "message": str(exc),
+                    "url": snapshot.url,
+                }
+                execution_feedback.append(feedback)
+                logger.info(
+                    "linkedin_browser_agent_action_failed",
+                    extra=feedback,
+                )
+                previous_snapshot_signature = ""
+                continue
             recent_actions.append(
                 {
                     "step_index": step_index,
@@ -530,33 +611,68 @@ class OpenAIResponsesBrowserAgent:
     ) -> BrowserAgentAction:
         """Plan and execute one browser action for the current page state."""
 
-        snapshot = await self._snapshotter.capture(page)
-        action = await self._plan_action(
-            snapshot=snapshot,
-            goal=goal,
-            task_name=task_name,
-            available_values=available_values,
-            step_index=step_index,
-            recent_actions=recent_actions,
-            snapshot_changed=True,
-            extra_rules=extra_rules,
-            allowed_action_types=allowed_action_types,
-        )
-        logger.info(
-            "linkedin_browser_agent_single_action_planned",
-            extra={
-                "task_name": task_name,
-                "step_index": step_index,
-                "action_type": action.action_type,
-                "action_intent": action.action_intent,
-                "element_id": action.element_id,
-                "value_source": action.value_source,
-                "reasoning": action.reasoning,
-                "url": snapshot.url,
-            },
-        )
-        await self._execute_action(page=page, action=action, values=available_values)
-        return action
+        feedback_history: list[dict[str, object]] = []
+        history = list(recent_actions)
+        for attempt_index in range(3):
+            snapshot = await self._snapshotter.capture(page)
+            action = await self._plan_action(
+                snapshot=snapshot,
+                goal=goal,
+                task_name=task_name,
+                available_values=available_values,
+                step_index=step_index,
+                recent_actions=history[-6:],
+                execution_feedback=feedback_history[-4:],
+                snapshot_changed=True,
+                extra_rules=extra_rules,
+                allowed_action_types=allowed_action_types,
+            )
+            logger.info(
+                "linkedin_browser_agent_single_action_planned",
+                extra={
+                    "task_name": task_name,
+                    "step_index": step_index,
+                    "attempt_index": attempt_index,
+                    "action_type": action.action_type,
+                    "action_intent": action.action_intent,
+                    "element_id": action.element_id,
+                    "value_source": action.value_source,
+                    "reasoning": action.reasoning,
+                    "url": snapshot.url,
+                },
+            )
+            try:
+                await self._execute_action(page=page, action=action, values=available_values)
+            except BrowserAutomationError as exc:
+                feedback = {
+                    "attempt_index": attempt_index,
+                    "task_name": task_name,
+                    "failed_action_type": action.action_type,
+                    "element_id": action.element_id,
+                    "action_intent": action.action_intent,
+                    "message": str(exc),
+                    "url": snapshot.url,
+                }
+                feedback_history.append(feedback)
+                history.append(
+                    {
+                        "step_index": step_index,
+                        "task_name": task_name,
+                        "action_type": action.action_type,
+                        "element_id": action.element_id,
+                        "action_intent": action.action_intent,
+                        "reasoning": action.reasoning,
+                        "url": snapshot.url,
+                        "execution_feedback": str(exc),
+                    }
+                )
+                logger.info("linkedin_browser_agent_single_action_failed", extra=feedback)
+                if attempt_index >= 2:
+                    raise
+                continue
+            return action
+        msg = f"Browser agent could not complete a safe single action for {task_name}."
+        raise BrowserAutomationError(msg)
 
     async def _plan_action(
         self,
@@ -567,6 +683,7 @@ class OpenAIResponsesBrowserAgent:
         available_values: Mapping[BrowserValueSource, str],
         step_index: int,
         recent_actions: Sequence[dict[str, object]],
+        execution_feedback: Sequence[dict[str, object]],
         snapshot_changed: bool,
         extra_rules: Sequence[str],
         allowed_action_types: Sequence[BrowserActionType] | None,
@@ -579,6 +696,7 @@ class OpenAIResponsesBrowserAgent:
             available_values,
             step_index,
             recent_actions,
+            execution_feedback,
             snapshot_changed,
             extra_rules,
         )
@@ -612,6 +730,7 @@ class OpenAIResponsesBrowserAgent:
         available_values: Mapping[BrowserValueSource, str],
         step_index: int,
         recent_actions: Sequence[dict[str, object]],
+        execution_feedback: Sequence[dict[str, object]],
         snapshot_changed: bool,
         extra_rules: Sequence[str],
     ) -> dict[str, object]:
@@ -639,6 +758,7 @@ class OpenAIResponsesBrowserAgent:
             "page": {
                 "url": snapshot.url,
                 "title": snapshot.title,
+                "active_surface": snapshot.active_surface,
                 "visible_text": snapshot.visible_text,
                 "elements": elements_payload,
             },
@@ -648,17 +768,22 @@ class OpenAIResponsesBrowserAgent:
                 if key != "literal"
             },
             "recent_action_history": list(recent_actions),
+            "execution_feedback_history": list(execution_feedback),
             "rules": [
                 "Return exactly one next action.",
                 "Only reference element ids that exist in the page snapshot.",
+                (
+                    "If page.active_surface is present, treat it as the current blocking "
+                    "surface and prioritize actions inside it over the dimmed background."
+                ),
                 "Use literal for plain text that is not sensitive.",
                 (
                     "Use wait when the page is loading, animating, "
                     "or a human may need to solve verification."
                 ),
                 (
-                    "Use recent_action_history to avoid repeating the same failed move "
-                    "on an unchanged screen."
+                    "Use recent_action_history and execution_feedback_history to avoid "
+                    "repeating the same failed move on an unchanged screen."
                 ),
                 (
                     "Set action_intent to a short snake_case phrase when it helps "
@@ -761,6 +886,7 @@ class OpenAIResponsesBrowserAgent:
             "page": {
                 "url": snapshot.url,
                 "title": snapshot.title,
+                "active_surface": snapshot.active_surface,
                 "visible_text": snapshot.visible_text,
                 "elements": elements_payload,
             },
@@ -889,20 +1015,24 @@ class OpenAIResponsesBrowserAgent:
             raise BrowserAutomationError(msg)
 
         locator = self._locator_for_action(page, action)
-        await locator.scroll_into_view_if_needed()
+        try:
+            await locator.scroll_into_view_if_needed()
 
-        if action.action_type == "click":
-            await self._pause_before_click(page)
-            await locator.click()
-            await self._settle_page(page)
-            return
+            if action.action_type == "click":
+                await self._pause_before_click(page)
+                await locator.click()
+                await self._settle_page(page)
+                return
 
-        if action.action_type == "fill":
-            value = self._resolve_fill_value(action, values)
-            await locator.click()
-            await locator.fill(value)
-            await page.wait_for_timeout(350)
-            return
+            if action.action_type == "fill":
+                value = self._resolve_fill_value(action, values)
+                await locator.click()
+                await locator.fill(value)
+                await page.wait_for_timeout(350)
+                return
+        except Exception as exc:  # noqa: BLE001
+            msg = summarize_browser_action_error(exc)
+            raise BrowserAutomationError(msg) from exc
 
     async def _pause_before_click(self, page: Page) -> None:
         delay_ms = random.randint(self._min_action_delay_ms, self._max_action_delay_ms)
@@ -1029,6 +1159,22 @@ def parse_browser_task_assessment(payload: dict[str, object]) -> BrowserTaskAsse
         summary=str(payload.get("summary") or "").strip(),
         evidence=evidence,
     )
+
+
+def summarize_browser_action_error(error: Exception) -> str:
+    """Return a planner-friendly summary for browser action failures."""
+
+    message = collapse_text(str(error))
+    lowered = message.lower()
+    if "intercepts pointer events" in lowered:
+        return "The chosen target is blocked by an open dialog or overlay."
+    if "element is not attached" in lowered:
+        return "The chosen target disappeared before the action could finish."
+    if "element is not visible" in lowered:
+        return "The chosen target is no longer visible."
+    if "timeout" in lowered:
+        return "The chosen action timed out before the page accepted it."
+    return truncate_text(message, limit=220)
 
 
 def _optional_text(value: object) -> str | None:
