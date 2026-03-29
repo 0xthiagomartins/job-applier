@@ -21,6 +21,10 @@ def test_runtime_settings_fall_back_to_local_sqlite(tmp_path: Path) -> None:
         "-y",
         "@playwright/mcp@latest",
     )
+    assert settings.linkedin_min_action_delay_ms == 350
+    assert settings.linkedin_max_action_delay_ms == 950
+    assert settings.linkedin_min_navigation_delay_ms == 800
+    assert settings.linkedin_max_navigation_delay_ms == 1_800
 
 
 def test_runtime_settings_normalize_playwright_mcp_root_url() -> None:

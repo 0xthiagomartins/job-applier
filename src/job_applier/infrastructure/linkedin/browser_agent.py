@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -44,6 +45,10 @@ STRUCTURED_OUTPUT_SCHEMA = {
             "type": ["string", "null"],
             "description": "Literal text to fill when value_source is literal.",
         },
+        "action_intent": {
+            "type": ["string", "null"],
+            "description": "Short machine-readable intent for the action, when relevant.",
+        },
         "wait_seconds": {
             "type": "integer",
             "minimum": 0,
@@ -54,7 +59,15 @@ STRUCTURED_OUTPUT_SCHEMA = {
             "description": "Short explanation of why this is the next action.",
         },
     },
-    "required": ["action_type", "element_id", "value_source", "value", "wait_seconds", "reasoning"],
+    "required": [
+        "action_type",
+        "element_id",
+        "value_source",
+        "value",
+        "action_intent",
+        "wait_seconds",
+        "reasoning",
+    ],
 }
 
 INTERACTIVE_SELECTORS = ",".join(
@@ -126,6 +139,7 @@ class BrowserAgentAction:
     element_id: str | None
     value_source: BrowserValueSource | None
     value: str | None
+    action_intent: str | None
     wait_seconds: int
     reasoning: str
 
@@ -277,11 +291,15 @@ class OpenAIResponsesBrowserAgent:
         model: str,
         max_steps: int = 18,
         snapshotter: BrowserDomSnapshotter | None = None,
+        min_action_delay_ms: int = 350,
+        max_action_delay_ms: int = 950,
     ) -> None:
         self._api_key = api_key
         self._model = model
         self._max_steps = max_steps
         self._snapshotter = snapshotter or BrowserDomSnapshotter()
+        self._min_action_delay_ms = max(0, min_action_delay_ms)
+        self._max_action_delay_ms = max(self._min_action_delay_ms, max_action_delay_ms)
 
     async def complete_linkedin_login(
         self,
@@ -333,6 +351,7 @@ class OpenAIResponsesBrowserAgent:
         task_name: str,
         is_complete: PageTaskComplete,
         extra_rules: Sequence[str] = (),
+        allowed_action_types: Sequence[BrowserActionType] | None = None,
     ) -> None:
         """Drive one volatile browser task until its completion predicate succeeds."""
 
@@ -369,6 +388,7 @@ class OpenAIResponsesBrowserAgent:
                     recent_actions=recent_actions[-6:],
                     snapshot_changed=snapshot_changed,
                     extra_rules=extra_rules,
+                    allowed_action_types=allowed_action_types,
                 ),
                 timeout=remaining_seconds,
             )
@@ -378,6 +398,7 @@ class OpenAIResponsesBrowserAgent:
                     "step_index": step_index,
                     "task_name": task_name,
                     "action_type": action.action_type,
+                    "action_intent": action.action_intent,
                     "element_id": action.element_id,
                     "value_source": action.value_source,
                     "reasoning": action.reasoning,
@@ -404,6 +425,48 @@ class OpenAIResponsesBrowserAgent:
         msg = f"Browser agent exhausted the {task_name} task before completion."
         raise BrowserAutomationError(msg)
 
+    async def perform_single_task_action(
+        self,
+        *,
+        page: Page,
+        available_values: Mapping[BrowserValueSource, str],
+        goal: str,
+        task_name: str,
+        extra_rules: Sequence[str] = (),
+        allowed_action_types: Sequence[BrowserActionType] | None = None,
+        recent_actions: Sequence[dict[str, object]] = (),
+        step_index: int = 0,
+    ) -> BrowserAgentAction:
+        """Plan and execute one browser action for the current page state."""
+
+        snapshot = await self._snapshotter.capture(page)
+        action = await self._plan_action(
+            snapshot=snapshot,
+            goal=goal,
+            task_name=task_name,
+            available_values=available_values,
+            step_index=step_index,
+            recent_actions=recent_actions,
+            snapshot_changed=True,
+            extra_rules=extra_rules,
+            allowed_action_types=allowed_action_types,
+        )
+        logger.info(
+            "linkedin_browser_agent_single_action_planned",
+            extra={
+                "task_name": task_name,
+                "step_index": step_index,
+                "action_type": action.action_type,
+                "action_intent": action.action_intent,
+                "element_id": action.element_id,
+                "value_source": action.value_source,
+                "reasoning": action.reasoning,
+                "url": snapshot.url,
+            },
+        )
+        await self._execute_action(page=page, action=action, values=available_values)
+        return action
+
     async def _plan_action(
         self,
         *,
@@ -415,6 +478,7 @@ class OpenAIResponsesBrowserAgent:
         recent_actions: Sequence[dict[str, object]],
         snapshot_changed: bool,
         extra_rules: Sequence[str],
+        allowed_action_types: Sequence[BrowserActionType] | None,
     ) -> BrowserAgentAction:
         response_data = await asyncio.to_thread(
             self._create_response,
@@ -445,6 +509,7 @@ class OpenAIResponsesBrowserAgent:
             action,
             snapshot=snapshot,
             available_values=available_values,
+            allowed_action_types=allowed_action_types,
         )
         return action
 
@@ -503,6 +568,10 @@ class OpenAIResponsesBrowserAgent:
                 (
                     "Use recent_action_history to avoid repeating the same failed move "
                     "on an unchanged screen."
+                ),
+                (
+                    "Set action_intent to a short snake_case phrase when it helps "
+                    "the caller interpret the action."
                 ),
                 "Use done only when the task goal appears complete.",
                 "Use fail only when no safe next action exists.",
@@ -614,6 +683,7 @@ class OpenAIResponsesBrowserAgent:
         await locator.scroll_into_view_if_needed()
 
         if action.action_type == "click":
+            await self._pause_before_click(page)
             await locator.click()
             await self._settle_page(page)
             return
@@ -624,6 +694,11 @@ class OpenAIResponsesBrowserAgent:
             await locator.fill(value)
             await page.wait_for_timeout(350)
             return
+
+    async def _pause_before_click(self, page: Page) -> None:
+        delay_ms = random.randint(self._min_action_delay_ms, self._max_action_delay_ms)
+        logger.info("linkedin_browser_agent_delay", extra={"delay_ms": delay_ms})
+        await page.wait_for_timeout(delay_ms)
 
     def _locator_for_action(self, page: Page, action: BrowserAgentAction) -> Locator:
         if action.element_id is None:
@@ -661,7 +736,11 @@ class OpenAIResponsesBrowserAgent:
         *,
         snapshot: BrowserAgentSnapshot,
         available_values: Mapping[BrowserValueSource, str],
+        allowed_action_types: Sequence[BrowserActionType] | None,
     ) -> None:
+        if allowed_action_types is not None and action.action_type not in set(allowed_action_types):
+            msg = "Browser agent returned an action type that is not allowed for this task."
+            raise BrowserAutomationError(msg)
         valid_element_ids = {element.element_id for element in snapshot.elements}
         if action.action_type in {"click", "fill"} and action.element_id not in valid_element_ids:
             msg = "Browser agent referenced an element that does not exist in the snapshot."
@@ -705,6 +784,7 @@ def parse_browser_action(payload: dict[str, object]) -> BrowserAgentAction:
         element_id=_optional_text(payload.get("element_id")),
         value_source=_optional_text(value_source),
         value=_optional_text(payload.get("value")),
+        action_intent=_optional_text(payload.get("action_intent")),
         wait_seconds=max(0, wait_seconds),
         reasoning=str(payload.get("reasoning") or "").strip(),
     )

@@ -154,6 +154,8 @@ class LinkedInSessionManager:
             browser_agent = OpenAIResponsesBrowserAgent(
                 api_key=ai_api_key,
                 model=self._ai_model,
+                min_action_delay_ms=350,
+                max_action_delay_ms=950,
             )
             await browser_agent.complete_linkedin_login(
                 page=page,

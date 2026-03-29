@@ -12,6 +12,7 @@ def test_parse_browser_action_accepts_credential_fill_payload() -> None:
             "element_id": "agent-2",
             "value_source": "linkedin_email",
             "value": None,
+            "action_intent": "fill_login_identifier",
             "wait_seconds": 0,
             "reasoning": "The visible email field should receive the LinkedIn login.",
         }
@@ -20,6 +21,7 @@ def test_parse_browser_action_accepts_credential_fill_payload() -> None:
     assert action.action_type == "fill"
     assert action.element_id == "agent-2"
     assert action.value_source == "linkedin_email"
+    assert action.action_intent == "fill_login_identifier"
     assert action.reasoning
 
 
@@ -30,6 +32,7 @@ def test_parse_browser_action_accepts_task_specific_value_source() -> None:
             "element_id": "agent-3",
             "value_source": "search_keywords",
             "value": None,
+            "action_intent": "fill_search_keywords",
             "wait_seconds": 0,
             "reasoning": "Fill the job search field with the configured search keywords.",
         }

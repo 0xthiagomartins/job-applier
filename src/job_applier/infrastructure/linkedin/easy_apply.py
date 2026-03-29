@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 import traceback
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Protocol
 from uuid import UUID, uuid4
 
 from playwright.async_api import BrowserContext, Locator, Page, async_playwright
@@ -50,6 +51,11 @@ from job_applier.infrastructure.linkedin.auth import (
     LinkedInCredentials,
     LinkedInSessionManager,
 )
+from job_applier.infrastructure.linkedin.browser_agent import (
+    BrowserAgentAction,
+    BrowserAutomationError,
+    OpenAIResponsesBrowserAgent,
+)
 from job_applier.infrastructure.linkedin.question_resolution import (
     EasyApplyField,
     LinkedInAnswerResolver,
@@ -66,8 +72,6 @@ from job_applier.observability import bind_submission_context
 from job_applier.settings import RuntimeSettings
 
 logger = logging.getLogger(__name__)
-
-ActionKind = Literal["next", "review", "submit"]
 
 SUCCESS_PATTERNS = (
     r"your application was sent",
@@ -229,6 +233,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
 
         try:
             with bind_submission_context(submission_id):
+                await self._pause_before_navigation(page, reason="job_detail_open")
                 await page.goto(posting.url, wait_until="domcontentloaded")
                 await self._ensure_authenticated_page(page)
                 artifacts.extend(
@@ -241,12 +246,31 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 )
                 recruiter_candidate = await self._recruiter_candidate_finder.find(page, settings)
 
-                easy_apply_button = await self._find_easy_apply_button(page)
-                if easy_apply_button is None:
-                    notes = "Easy Apply button not available for this posting."
+                try:
+                    await self._open_easy_apply_modal_with_agent(
+                        page,
+                        settings=settings,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
+                        execution_events=execution_events,
+                    )
+                except LinkedInEasyApplyError as exc:
+                    notes = str(exc) or "Browser agent could not open the Easy Apply modal."
                     logger.info(
-                        "linkedin_easy_apply_skipped",
-                        extra={"job_posting_id": str(posting.id), "origin": origin.value},
+                        "linkedin_easy_apply_unavailable",
+                        extra={
+                            "job_posting_id": str(posting.id),
+                            "origin": origin.value,
+                            "notes": notes,
+                        },
+                    )
+                    artifacts.extend(
+                        await self._capture_debug_bundle(
+                            page,
+                            run_dir=run_dir,
+                            submission_id=submission_id,
+                            label="failure_open_easy_apply",
+                        ),
                     )
                     self._record_event(
                         execution_events,
@@ -256,19 +280,17 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         payload={
                             "job_posting_id": str(posting.id),
                             "origin": origin.value,
-                            "reason": "easy_apply_unavailable",
-                            "status": SubmissionStatus.SKIPPED.value,
+                            "reason": "easy_apply_modal_open_failed",
+                            "status": SubmissionStatus.FAILED.value,
+                            "notes": notes,
                         },
                     )
                     return EasyApplyExecutionResult(
                         submission_id=submission_id,
                         started_at=started_at,
-                        status=SubmissionStatus.SKIPPED,
+                        status=SubmissionStatus.FAILED,
                         notes=notes,
                     )
-
-                await easy_apply_button.click()
-                await self._wait_for_easy_apply_modal(page)
 
                 max_steps = 10
                 for fallback_step_index in range(max_steps):
@@ -316,10 +338,17 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     answers.extend(step_answers)
                     artifacts.extend(step_artifacts)
 
-                    action = await self._find_primary_action(page)
-                    if action is None:
-                        errors = await self._collect_validation_errors(page)
-                        notes = _join_errors(errors) or "No LinkedIn step action was available."
+                    try:
+                        action = await self._progress_easy_apply_step_with_agent(
+                            page,
+                            settings=settings,
+                            step=step,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            execution_events=execution_events,
+                        )
+                    except LinkedInEasyApplyError as exc:
+                        notes = str(exc) or "Browser agent could not progress the Easy Apply flow."
                         artifacts.extend(
                             await self._capture_debug_bundle(
                                 page,
@@ -335,8 +364,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             event_type=ExecutionEventType.JOB_PROCESSED,
                             payload={
                                 "job_posting_id": str(posting.id),
-                                "reason": "missing_primary_action",
+                                "reason": "agentic_primary_action_failed",
                                 "status": SubmissionStatus.FAILED.value,
+                                "notes": notes,
                             },
                         )
                         return EasyApplyExecutionResult(
@@ -346,9 +376,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             notes=notes,
                         )
 
-                    action_kind, action_locator = action
-                    if action_kind == "submit":
-                        await self._prepare_submit_step(page)
+                    if action.action_intent == "submit_application":
                         self._record_event(
                             execution_events,
                             execution_id=execution_id,
@@ -357,9 +385,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             payload={
                                 "job_posting_id": str(posting.id),
                                 "step_index": step.step_index,
+                                "reasoning": action.reasoning,
                             },
                         )
-                        await action_locator.click()
                         success, outcome_notes = await self._await_submission_outcome(page)
                         artifacts.extend(
                             await self._capture_debug_bundle(
@@ -483,9 +511,6 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             status=SubmissionStatus.FAILED,
                             notes=outcome_notes or "LinkedIn did not confirm the application.",
                         )
-
-                    await action_locator.click()
-                    await page.wait_for_timeout(700)
 
                     errors = await self._collect_validation_errors(page)
                     if errors:
@@ -958,33 +983,139 @@ class PlaywrightLinkedInEasyApplyExecutor:
         )
         return EasyApplyStep(step_index=step_index, total_steps=total, fields=fields)
 
-    async def _find_primary_action(self, page: Page) -> tuple[ActionKind, Locator] | None:
-        root = await self._easy_apply_root(page)
-        candidates: tuple[tuple[ActionKind, Locator], ...] = (
-            (
-                "submit",
-                root.get_by_role(
-                    "button",
-                    name=re.compile(r"submit application|send application", re.I),
-                ),
-            ),
-            ("review", root.get_by_role("button", name=re.compile(r"review", re.I))),
-            ("next", root.get_by_role("button", name=re.compile(r"next", re.I))),
-        )
-        for kind, locator in candidates:
-            if await locator.count():
-                return kind, locator.first
-        return None
+    async def _open_easy_apply_modal_with_agent(
+        self,
+        page: Page,
+        *,
+        settings: UserAgentSettings,
+        execution_id: UUID,
+        submission_id: UUID,
+        execution_events: list[ExecutionEvent],
+    ) -> None:
+        browser_agent = self._create_browser_agent(settings)
+        recent_actions: list[dict[str, object]] = []
 
-    async def _prepare_submit_step(self, page: Page) -> None:
-        root = await self._easy_apply_root(page)
-        for pattern in (r"follow", r"job alert", r"stay up to date"):
-            checkbox = root.get_by_label(re.compile(pattern, re.I))
-            if await checkbox.count():
-                try:
-                    await checkbox.first.uncheck()
-                except Exception:  # noqa: BLE001
-                    logger.debug("linkedin_easy_apply_optional_checkbox_skip", exc_info=True)
+        try:
+            for step_index in range(6):
+                if await self._easy_apply_modal_visible(page):
+                    return
+
+                action = await browser_agent.perform_single_task_action(
+                    page=page,
+                    available_values={},
+                    goal=(
+                        "Open the LinkedIn Easy Apply modal for the current job posting. "
+                        "Click the control that starts the application flow. "
+                        "Do not click Save, share, close, or unrelated page navigation."
+                    ),
+                    task_name="linkedin_open_easy_apply",
+                    extra_rules=(
+                        "If the Easy Apply modal is already visible, choose done.",
+                        (
+                            "If the job page does not currently expose a way to start an "
+                            "Easy Apply flow, choose fail."
+                        ),
+                        (
+                            "When clicking the control that starts the application flow, "
+                            "set action_intent to open_easy_apply."
+                        ),
+                    ),
+                    allowed_action_types=("click", "wait", "done", "fail"),
+                    recent_actions=recent_actions[-4:],
+                    step_index=step_index,
+                )
+                recent_actions.append(
+                    {
+                        "step_index": step_index,
+                        "action_type": action.action_type,
+                        "action_intent": action.action_intent,
+                        "reasoning": action.reasoning,
+                    }
+                )
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.STEP_REACHED,
+                    payload={
+                        "stage": "easy_apply_open_action",
+                        "step_index": step_index,
+                        "action_type": action.action_type,
+                        "action_intent": action.action_intent,
+                        "reasoning": action.reasoning,
+                    },
+                )
+                if await self._easy_apply_modal_visible(page):
+                    return
+                if action.action_type == "done":
+                    break
+        except BrowserAutomationError as exc:
+            raise LinkedInEasyApplyError(str(exc)) from exc
+
+        msg = (
+            "Browser agent could not open the LinkedIn Easy Apply modal from the current job page."
+        )
+        raise LinkedInEasyApplyError(msg)
+
+    async def _progress_easy_apply_step_with_agent(
+        self,
+        page: Page,
+        *,
+        settings: UserAgentSettings,
+        step: EasyApplyStep,
+        execution_id: UUID,
+        submission_id: UUID,
+        execution_events: list[ExecutionEvent],
+    ) -> BrowserAgentAction:
+        browser_agent = self._create_browser_agent(settings)
+        try:
+            action = await browser_agent.perform_single_task_action(
+                page=page,
+                available_values={},
+                goal=(
+                    "Advance the current LinkedIn Easy Apply step. "
+                    "If this is the final step, submit the application. "
+                    "Do not click dismiss, close, save, or unrelated controls."
+                ),
+                task_name="linkedin_easy_apply_primary_action",
+                extra_rules=(
+                    (
+                        "Do not fill any field in this task. "
+                        "The form fields are already handled elsewhere."
+                    ),
+                    (
+                        "If the current step is complete and a primary button "
+                        "advances the flow, click it."
+                    ),
+                    (
+                        "If the current step shows the final application send action, click it and "
+                        "set action_intent to submit_application."
+                    ),
+                    (
+                        "If the current step shows a review or next action, click it and set "
+                        "action_intent to advance_step."
+                    ),
+                    "If the page is still updating, choose wait.",
+                ),
+                allowed_action_types=("click", "wait", "done", "fail"),
+                step_index=step.step_index,
+            )
+        except BrowserAutomationError as exc:
+            raise LinkedInEasyApplyError(str(exc)) from exc
+        self._record_event(
+            execution_events,
+            execution_id=execution_id,
+            submission_id=submission_id,
+            event_type=ExecutionEventType.STEP_REACHED,
+            payload={
+                "stage": "easy_apply_primary_action",
+                "step_index": step.step_index,
+                "action_type": action.action_type,
+                "action_intent": action.action_intent,
+                "reasoning": action.reasoning,
+            },
+        )
+        return action
 
     async def _await_submission_outcome(self, page: Page) -> tuple[bool, str | None]:
         for _ in range(20):
@@ -1031,22 +1162,6 @@ class PlaywrightLinkedInEasyApplyExecutor:
         unique = tuple(dict.fromkeys(messages))
         return unique
 
-    async def _find_easy_apply_button(self, page: Page) -> Locator | None:
-        button = page.get_by_role("button", name=re.compile(r"easy apply", re.I))
-        if await button.count():
-            return button.first
-        return None
-
-    async def _wait_for_easy_apply_modal(self, page: Page) -> None:
-        for _ in range(20):
-            try:
-                await self._easy_apply_root(page)
-                return
-            except LinkedInEasyApplyError:
-                await page.wait_for_timeout(250)
-        msg = "LinkedIn Easy Apply modal did not open."
-        raise LinkedInEasyApplyError(msg)
-
     async def _easy_apply_root(self, page: Page) -> Locator:
         for selector in (
             ".jobs-easy-apply-modal",
@@ -1058,6 +1173,13 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 return locator.first
         msg = "LinkedIn Easy Apply dialog is not visible."
         raise LinkedInEasyApplyError(msg)
+
+    async def _easy_apply_modal_visible(self, page: Page) -> bool:
+        try:
+            await self._easy_apply_root(page)
+        except LinkedInEasyApplyError:
+            return False
+        return True
 
     async def _ensure_authenticated_page(self, page: Page) -> None:
         if await self._get_session_manager().page_requires_login(page):
@@ -1107,6 +1229,29 @@ class PlaywrightLinkedInEasyApplyExecutor:
         if self._session_manager is None:
             return self._create_session_manager()
         return self._session_manager
+
+    def _create_browser_agent(self, settings: UserAgentSettings) -> OpenAIResponsesBrowserAgent:
+        api_key = settings.ai.api_key or self._runtime_settings.openai_api_key
+        if api_key is None:
+            msg = (
+                "OpenAI API key is required for the agentic LinkedIn Easy Apply flow. "
+                "Configure it in the panel or set JOB_APPLIER_OPENAI_API_KEY."
+            )
+            raise LinkedInEasyApplyError(msg)
+        return OpenAIResponsesBrowserAgent(
+            api_key=api_key,
+            model=settings.ai.model,
+            min_action_delay_ms=self._runtime_settings.linkedin_min_action_delay_ms,
+            max_action_delay_ms=self._runtime_settings.linkedin_max_action_delay_ms,
+        )
+
+    async def _pause_before_navigation(self, page: Page, *, reason: str) -> None:
+        delay_ms = random.randint(
+            self._runtime_settings.linkedin_min_navigation_delay_ms,
+            self._runtime_settings.linkedin_max_navigation_delay_ms,
+        )
+        logger.info("linkedin_navigation_delay", extra={"reason": reason, "delay_ms": delay_ms})
+        await page.wait_for_timeout(delay_ms)
 
     async def _start_trace(self, context: BrowserContext) -> bool:
         try:

@@ -40,6 +40,10 @@ class RuntimeSettings(BaseSettings):
     linkedin_max_search_pages: int = 2
     linkedin_default_timeout_ms: int = 15_000
     linkedin_login_timeout_seconds: int = 120
+    linkedin_min_action_delay_ms: int = 350
+    linkedin_max_action_delay_ms: int = 950
+    linkedin_min_navigation_delay_ms: int = 800
+    linkedin_max_navigation_delay_ms: int = 1_800
     openai_api_key: SecretStr | None = None
     bootstrap_panel_on_empty_state: bool = True
     bootstrap_profile_name: str | None = None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import re
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -364,6 +365,10 @@ class PlaywrightLinkedInJobsClient:
 
             for page_index in range(criteria.max_pages):
                 if page_index > 0:
+                    await self._pause_before_navigation(
+                        page,
+                        reason="search_results_pagination",
+                    )
                     await page.goto(
                         build_paginated_search_url(search_url, page_index=page_index),
                         wait_until="domcontentloaded",
@@ -392,6 +397,7 @@ class PlaywrightLinkedInJobsClient:
         run_dir: Path,
     ) -> None:
         direct_results_url = build_search_results_url(criteria)
+        await self._pause_before_navigation(page, reason="search_results_entry")
         await page.goto(direct_results_url, wait_until="domcontentloaded")
         await self._ensure_authenticated_page(page)
         await self._wait_for_search_surface(page)
@@ -425,6 +431,8 @@ class PlaywrightLinkedInJobsClient:
         browser_agent = OpenAIResponsesBrowserAgent(
             api_key=ai_api_key,
             model=criteria.ai_model,
+            min_action_delay_ms=self._runtime_settings.linkedin_min_action_delay_ms,
+            max_action_delay_ms=self._runtime_settings.linkedin_max_action_delay_ms,
         )
         try:
             await browser_agent.complete_browser_task(
@@ -623,6 +631,7 @@ class PlaywrightLinkedInJobsClient:
     ) -> LinkedInCollectedJob:
         detail_page = await context.new_page()
         try:
+            await self._pause_before_navigation(detail_page, reason="job_detail_open")
             await detail_page.goto(listing.url, wait_until="domcontentloaded")
             await self._ensure_authenticated_page(detail_page)
             detail_payload = await detail_page.evaluate(
@@ -686,6 +695,14 @@ class PlaywrightLinkedInJobsClient:
         run_dir = self._runtime_settings.resolved_linkedin_artifacts_dir / timestamp
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
+
+    async def _pause_before_navigation(self, page: Page, *, reason: str) -> None:
+        delay_ms = random.randint(
+            self._runtime_settings.linkedin_min_navigation_delay_ms,
+            self._runtime_settings.linkedin_max_navigation_delay_ms,
+        )
+        logger.info("linkedin_navigation_delay", extra={"reason": reason, "delay_ms": delay_ms})
+        await page.wait_for_timeout(delay_ms)
 
 
 def _workplace_option_name(workplace_type: WorkplaceType) -> str:
