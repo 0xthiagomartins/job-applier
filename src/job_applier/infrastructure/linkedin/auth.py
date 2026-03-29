@@ -4,14 +4,36 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from playwright.async_api import Browser, BrowserContext, Page
+from playwright.async_api import Browser, BrowserContext, Locator, Page
 from pydantic import SecretStr
 
 logger = logging.getLogger(__name__)
+
+EMAIL_INPUT_SELECTOR = ",".join(
+    (
+        "input[name='session_key']",
+        "input#username",
+        "input[type='email']",
+        "input[autocomplete*='username']",
+    ),
+)
+PASSWORD_INPUT_SELECTOR = ",".join(
+    (
+        "input[name='session_password']",
+        "input#password",
+        "input[type='password']",
+        "input[autocomplete='current-password']",
+    ),
+)
+SUBMIT_BUTTON_SELECTOR = ",".join(
+    (
+        "button[type='submit']",
+        "button[data-litms-control-urn*='login-submit']",
+    ),
+)
 
 
 class LinkedInAuthError(RuntimeError):
@@ -73,13 +95,12 @@ class LinkedInSessionManager:
         if "linkedin.com/login" in current_url or "/checkpoint/" in current_url:
             return True
 
-        for locator in (
-            page.get_by_label(re.compile(r"email|phone", re.I)),
-            page.get_by_label(re.compile(r"password", re.I)),
-            page.get_by_role("button", name=re.compile(r"sign in", re.I)),
-        ):
-            if await locator.count():
-                return True
+        if await self._find_email_input(page).count():
+            return True
+        if await self._find_password_input(page).count():
+            return True
+        if await self._find_submit_button(page).count():
+            return True
         return False
 
     async def _is_authenticated(self, context: BrowserContext) -> bool:
@@ -98,14 +119,29 @@ class LinkedInSessionManager:
         page = await context.new_page()
         try:
             await page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded")
-            await page.get_by_label(re.compile(r"email|phone", re.I)).fill(self._credentials.email)
-            await page.get_by_label(re.compile(r"password", re.I)).fill(
+            await self._find_email_input(page).fill(self._credentials.email)
+            await self._find_password_input(page).fill(
                 self._credentials.password.get_secret_value(),
             )
-            await page.get_by_role("button", name=re.compile(r"sign in", re.I)).click()
+            await self._find_submit_button(page).click()
             await self._wait_until_authenticated(page)
         finally:
             await page.close()
+
+    def _find_email_input(self, page: Page) -> Locator:
+        """Return the login email/phone input using deterministic selectors."""
+
+        return page.locator(EMAIL_INPUT_SELECTOR).first
+
+    def _find_password_input(self, page: Page) -> Locator:
+        """Return the login password input using deterministic selectors."""
+
+        return page.locator(PASSWORD_INPUT_SELECTOR).first
+
+    def _find_submit_button(self, page: Page) -> Locator:
+        """Return the login submit button using deterministic selectors."""
+
+        return page.locator(SUBMIT_BUTTON_SELECTOR).first
 
     async def _wait_until_authenticated(self, page: Page) -> None:
         """Wait for the login flow to complete, including manual captcha handling."""
