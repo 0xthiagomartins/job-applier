@@ -80,6 +80,10 @@ class PlaywrightMcpError(RuntimeError):
     """Raised when the Playwright MCP handshake or tool calls fail."""
 
 
+class PlaywrightMcpSessionNotFoundError(PlaywrightMcpError):
+    """Raised when the MCP server no longer recognizes the current session."""
+
+
 @dataclass(frozen=True, slots=True)
 class PlaywrightMcpAction:
     """One browser step planned from an MCP accessibility snapshot."""
@@ -158,7 +162,7 @@ class PlaywrightMcpHttpClient:
 
         if self._initialized:
             return
-        response = await asyncio.to_thread(
+        await asyncio.to_thread(
             self._send_jsonrpc,
             {
                 "jsonrpc": "2.0",
@@ -175,11 +179,10 @@ class PlaywrightMcpHttpClient:
             },
             True,
         )
-        session_id = cast(str | None, response["session_id"])
+        session_id = self._session_id
         if not session_id:
             msg = "Playwright MCP did not return a session id."
             raise PlaywrightMcpError(msg)
-        self._session_id = session_id
         await asyncio.to_thread(
             self._send_jsonrpc,
             {
@@ -256,8 +259,12 @@ class PlaywrightMcpHttpClient:
     async def close_browser(self) -> None:
         """Close the remote browser session after exporting state."""
 
+        if not self._initialized:
+            return
         try:
             await self.call_tool("browser_close", {})
+        except PlaywrightMcpSessionNotFoundError:
+            return
         except PlaywrightMcpError:
             logger.exception("playwright_mcp_browser_close_failed")
 
@@ -265,6 +272,18 @@ class PlaywrightMcpHttpClient:
         """Call one MCP tool and return the result payload."""
 
         await self.initialize()
+        response_body = await self._call_tool_once(name, arguments)
+        result = response_body.get("result")
+        if not isinstance(result, dict):
+            msg = f"Playwright MCP tool {name!r} returned an unexpected response."
+            raise PlaywrightMcpError(msg)
+        return cast(dict[str, object], result)
+
+    async def _call_tool_once(
+        self,
+        name: str,
+        arguments: dict[str, object],
+    ) -> dict[str, object]:
         response = await asyncio.to_thread(
             self._send_jsonrpc,
             {
@@ -278,12 +297,7 @@ class PlaywrightMcpHttpClient:
             },
             True,
         )
-        response_body = cast(dict[str, object], response["body"])
-        result = response_body.get("result")
-        if not isinstance(result, dict):
-            msg = f"Playwright MCP tool {name!r} returned an unexpected response."
-            raise PlaywrightMcpError(msg)
-        return cast(dict[str, object], result)
+        return cast(dict[str, object], response["body"])
 
     def _send_jsonrpc(
         self,
@@ -309,11 +323,18 @@ class PlaywrightMcpHttpClient:
                 session_id = response.headers.get("Mcp-Session-Id")
         except error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code == 404 and "Session not found" in detail:
+                self._session_id = None
+                self._initialized = False
+                raise PlaywrightMcpSessionNotFoundError(detail) from exc
             msg = f"Playwright MCP request failed with status {exc.code}: {detail}"
             raise PlaywrightMcpError(msg) from exc
         except error.URLError as exc:
             msg = f"Could not reach Playwright MCP at {self._base_url}: {exc.reason}"
             raise PlaywrightMcpError(msg) from exc
+
+        if session_id:
+            self._session_id = session_id
 
         parsed_body = parse_mcp_response_body(response_body) if expect_response else {}
         if "error" in parsed_body:

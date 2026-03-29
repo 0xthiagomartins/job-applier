@@ -17,6 +17,7 @@ from job_applier.infrastructure.linkedin.playwright_mcp import (
     OpenAIResponsesPlaywrightMcpAgent,
     PlaywrightMcpError,
     PlaywrightMcpHttpClient,
+    PlaywrightMcpSessionNotFoundError,
 )
 
 logger = logging.getLogger(__name__)
@@ -174,31 +175,47 @@ class LinkedInSessionManager:
             msg = "Playwright MCP URL is required for MCP-backed LinkedIn login."
             raise LinkedInAuthError(msg)
 
-        client = PlaywrightMcpHttpClient(
-            base_url=self._playwright_mcp_url,
-            timeout_seconds=self._login_timeout_seconds,
-        )
         agent = OpenAIResponsesPlaywrightMcpAgent(
             api_key=ai_api_key,
             model=self._ai_model,
         )
-        try:
-            await client.navigate("https://www.linkedin.com/login")
-            await agent.complete_linkedin_login(
-                client=client,
-                credentials={
-                    "linkedin_email": self._credentials.email,
-                    "linkedin_password": self._credentials.password.get_secret_value(),
-                },
+
+        last_error: PlaywrightMcpError | None = None
+        for attempt in range(2):
+            client = PlaywrightMcpHttpClient(
+                base_url=self._playwright_mcp_url,
                 timeout_seconds=self._login_timeout_seconds,
             )
-            self._storage_state_path.parent.mkdir(parents=True, exist_ok=True)
-            await client.save_storage_state(self._storage_state_path)
-        except PlaywrightMcpError as exc:
-            raise LinkedInAuthError(str(exc)) from exc
-        finally:
-            await client.close_browser()
-            await client.shutdown()
+            try:
+                await client.navigate("https://www.linkedin.com/login")
+                await agent.complete_linkedin_login(
+                    client=client,
+                    credentials={
+                        "linkedin_email": self._credentials.email,
+                        "linkedin_password": self._credentials.password.get_secret_value(),
+                    },
+                    timeout_seconds=self._login_timeout_seconds,
+                )
+                self._storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+                await client.save_storage_state(self._storage_state_path)
+                return
+            except PlaywrightMcpSessionNotFoundError as exc:
+                last_error = exc
+                logger.warning(
+                    "playwright_mcp_session_restarted",
+                    extra={"attempt": attempt + 1},
+                )
+                if attempt == 1:
+                    break
+            except PlaywrightMcpError as exc:
+                raise LinkedInAuthError(str(exc)) from exc
+            finally:
+                await client.close_browser()
+                await client.shutdown()
+
+        if last_error is not None:
+            raise LinkedInAuthError(str(last_error)) from last_error
+        raise LinkedInAuthError("Playwright MCP login failed unexpectedly.")
 
     async def _wait_until_authenticated(self, page: Page) -> None:
         """Wait for the login flow to complete, including manual captcha handling."""

@@ -6,6 +6,7 @@ from pydantic import SecretStr
 from job_applier.infrastructure.linkedin.auth import LinkedInCredentials, LinkedInSessionManager
 from job_applier.infrastructure.linkedin.playwright_mcp import (
     PlaywrightMcpHttpClient,
+    PlaywrightMcpSessionNotFoundError,
     extract_mcp_text_content,
     normalize_playwright_mcp_url,
     parse_mcp_response_body,
@@ -135,4 +136,87 @@ def test_linkedin_session_manager_can_bootstrap_login_through_playwright_mcp(
         "save:storage-state.json",
         "close_browser",
         "shutdown",
+    ]
+
+
+def test_linkedin_session_manager_retries_when_playwright_mcp_loses_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    login_attempts = {"count": 0}
+
+    class FakeClient:
+        def __init__(self, *, base_url: str, timeout_seconds: int) -> None:
+            assert base_url == "http://localhost:8931/mcp"
+            assert timeout_seconds == 90
+            login_attempts["count"] += 1
+            self._attempt = login_attempts["count"]
+
+        async def navigate(self, url: str) -> None:
+            events.append(f"navigate:{self._attempt}:{url}")
+
+        async def save_storage_state(self, path: Path) -> None:
+            events.append(f"save:{self._attempt}:{path.name}")
+            path.write_text("{}", encoding="utf-8")
+
+        async def close_browser(self) -> None:
+            events.append(f"close_browser:{self._attempt}")
+
+        async def shutdown(self) -> None:
+            events.append(f"shutdown:{self._attempt}")
+
+    class FakeAgent:
+        def __init__(self, *, api_key: SecretStr, model: str) -> None:
+            assert api_key.get_secret_value() == "sk-test"
+            assert model == "o3-mini"
+
+        async def complete_linkedin_login(
+            self,
+            *,
+            client: PlaywrightMcpHttpClient,
+            credentials: dict[str, str],
+            timeout_seconds: int,
+        ) -> None:
+            assert credentials["linkedin_email"] == "thiago@example.com"
+            assert credentials["linkedin_password"] == "linkedin-secret"
+            assert timeout_seconds == 90
+            if login_attempts["count"] == 1:
+                raise PlaywrightMcpSessionNotFoundError("Session not found")
+            events.append("agent_login_success")
+
+    monkeypatch.setattr(
+        "job_applier.infrastructure.linkedin.auth.PlaywrightMcpHttpClient",
+        FakeClient,
+    )
+    monkeypatch.setattr(
+        "job_applier.infrastructure.linkedin.auth.OpenAIResponsesPlaywrightMcpAgent",
+        FakeAgent,
+    )
+
+    manager = LinkedInSessionManager(
+        credentials=LinkedInCredentials(
+            email="thiago@example.com",
+            password=SecretStr("linkedin-secret"),
+        ),
+        storage_state_path=tmp_path / "storage-state.json",
+        login_timeout_seconds=90,
+        ai_api_key=SecretStr("sk-test"),
+        ai_model="o3-mini",
+        playwright_mcp_url="http://localhost:8931/mcp",
+    )
+
+    import asyncio
+
+    asyncio.run(manager._login_via_mcp())
+
+    assert events == [
+        "navigate:1:https://www.linkedin.com/login",
+        "close_browser:1",
+        "shutdown:1",
+        "navigate:2:https://www.linkedin.com/login",
+        "agent_login_success",
+        "save:2:storage-state.json",
+        "close_browser:2",
+        "shutdown:2",
     ]
