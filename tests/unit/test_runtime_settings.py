@@ -13,6 +13,7 @@ def test_runtime_settings_fall_back_to_local_sqlite(tmp_path: Path) -> None:
 
     assert settings.resolved_panel_storage_dir == tmp_path / "runtime" / "panel"
     assert settings.resolved_database_url == expected_database_url
+    assert settings.resolved_playwright_mcp_url == "http://127.0.0.1:8931"
 
 
 def test_initialize_runtime_environment_creates_panel_dir_and_sqlite_file(tmp_path: Path) -> None:

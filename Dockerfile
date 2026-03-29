@@ -18,7 +18,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     JOB_APPLIER_DATABASE_URL=sqlite:////data/job-applier.db \
     JOB_APPLIER_BACKEND_HOST=0.0.0.0 \
     JOB_APPLIER_BACKEND_PORT=8000 \
-    JOB_APPLIER_PANEL_PORT=3000
+    JOB_APPLIER_PANEL_PORT=3000 \
+    JOB_APPLIER_PLAYWRIGHT_MCP_HOST=127.0.0.1 \
+    JOB_APPLIER_PLAYWRIGHT_MCP_PORT=8931
+
+ARG PLAYWRIGHT_MCP_NPM_SPEC=@playwright/mcp@latest
 
 WORKDIR /app
 
@@ -32,6 +36,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv
+RUN npm install -g "${PLAYWRIGHT_MCP_NPM_SPEC}" \
+    && ln -s "$(npm root -g)/@playwright/mcp/cli.js" /usr/local/bin/job-applier-playwright-mcp
 
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
@@ -44,7 +50,7 @@ RUN chmod +x /app/docker/entrypoint.sh \
 
 COPY --from=panel-builder /workspace/apps/panel /app/apps/panel
 
-EXPOSE 3000 8000
+EXPOSE 3000 8000 8931
 VOLUME ["/data"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/docker/entrypoint.sh"]

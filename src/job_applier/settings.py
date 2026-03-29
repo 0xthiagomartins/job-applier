@@ -21,6 +21,9 @@ class RuntimeSettings(BaseSettings):
     backend_host: str = "0.0.0.0"
     backend_port: int = 8000
     panel_port: int = 3000
+    playwright_mcp_url: AnyUrl | None = None
+    playwright_mcp_host: str = "127.0.0.1"
+    playwright_mcp_port: int = 8931
     scheduler_poll_interval_seconds: int = 30
     playwright_headless: bool = False
     playwright_trace_enabled: bool = True
@@ -69,6 +72,14 @@ class RuntimeSettings(BaseSettings):
         if self.database_url:
             return self.database_url
         return f"sqlite:///{(self.data_dir / 'job-applier.db').resolve()}"
+
+    @property
+    def resolved_playwright_mcp_url(self) -> str:
+        """Return the external Playwright MCP URL or the default local sidecar address."""
+
+        if self.playwright_mcp_url is not None:
+            return str(self.playwright_mcp_url)
+        return f"http://{self.playwright_mcp_host}:{self.playwright_mcp_port}"
 
     @property
     def resolved_linkedin_storage_state_path(self) -> Path:

@@ -112,6 +112,8 @@ The lean test philosophy for this repo lives in [docs/testing-strategy.md](docs/
 The repository already includes a single `Dockerfile` for the on-premise flow:
 
 - backend API and panel run inside the same container;
+- if `JOB_APPLIER_PLAYWRIGHT_MCP_URL` is empty, the container also starts a local Playwright MCP sidecar;
+- if `JOB_APPLIER_PLAYWRIGHT_MCP_URL` is provided, the container skips the local MCP and uses the external one;
 - if `JOB_APPLIER_DATABASE_URL` is not provided, the app creates and uses a local SQLite file in `/data`;
 - for Linux hosts, Playwright can open a visible browser on the host display so the user can watch the automation and step in for captchas.
 
