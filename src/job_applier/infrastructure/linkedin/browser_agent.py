@@ -17,10 +17,11 @@ from pydantic import SecretStr
 
 logger = logging.getLogger(__name__)
 
-BrowserActionType = Literal["click", "fill", "scroll", "wait", "done", "fail"]
+BrowserActionType = Literal["click", "fill", "press", "scroll", "wait", "done", "fail"]
 BrowserValueSource = str
 BrowserScrollTarget = Literal["active_surface", "page"]
 BrowserScrollDirection = Literal["down", "up"]
+BrowserPressKey = Literal["Enter", "Tab", "Escape", "ArrowDown", "ArrowUp", "Space"]
 PageRequiresLogin = Callable[[Page], Awaitable[bool]]
 PageTaskComplete = Callable[[Page], Awaitable[bool]]
 BrowserAssessmentStatus = Literal[
@@ -37,7 +38,7 @@ STRUCTURED_OUTPUT_SCHEMA = {
     "properties": {
         "action_type": {
             "type": "string",
-            "enum": ["click", "fill", "scroll", "wait", "done", "fail"],
+            "enum": ["click", "fill", "press", "scroll", "wait", "done", "fail"],
         },
         "element_id": {
             "type": ["string", "null"],
@@ -57,6 +58,11 @@ STRUCTURED_OUTPUT_SCHEMA = {
         "action_intent": {
             "type": ["string", "null"],
             "description": "Short machine-readable intent for the action, when relevant.",
+        },
+        "key_name": {
+            "type": ["string", "null"],
+            "enum": ["Enter", "Tab", "Escape", "ArrowDown", "ArrowUp", "Space", None],
+            "description": "Keyboard key to press for press actions.",
         },
         "scroll_target": {
             "type": ["string", "null"],
@@ -93,6 +99,7 @@ STRUCTURED_OUTPUT_SCHEMA = {
         "value_source",
         "value",
         "action_intent",
+        "key_name",
         "scroll_target",
         "scroll_direction",
         "scroll_amount",
@@ -140,6 +147,7 @@ INTERACTIVE_SELECTORS = ",".join(
         "[role='link']",
         "[role='textbox']",
         "[role='combobox']",
+        "[role='option']",
         "[role='checkbox']",
         "[role='radio']",
         "[contenteditable='true']",
@@ -205,6 +213,7 @@ class BrowserAgentAction:
     value_source: BrowserValueSource | None
     value: str | None
     action_intent: str | None
+    key_name: BrowserPressKey | None
     scroll_target: BrowserScrollTarget | None
     scroll_direction: BrowserScrollDirection | None
     scroll_amount: int
@@ -384,6 +393,65 @@ class BrowserDomSnapshotter:
                         }
                         return collapse(pieces.filter(Boolean).join(" "));
                       };
+                      const splitIds = (value) =>
+                        collapse(value)
+                          .split(/\\s+/)
+                          .map((item) => item.trim())
+                          .filter(Boolean);
+                      const collectPopupNodesForField = (fieldNode) => {
+                        if (!fieldNode || fieldNode.nodeType !== 1) {
+                          return [];
+                        }
+                        const relatedRoots = [];
+                        const seenRoots = new Set();
+                        const pushRoot = (candidate) => {
+                          if (!candidate || candidate.nodeType !== 1 || seenRoots.has(candidate)) {
+                            return;
+                          }
+                          seenRoots.add(candidate);
+                          relatedRoots.push(candidate);
+                        };
+                        for (const attributeName of ["aria-controls", "aria-owns", "list"]) {
+                          for (const id of splitIds(fieldNode.getAttribute(attributeName))) {
+                            pushRoot(document.getElementById(id));
+                          }
+                        }
+                        for (const id of splitIds(
+                          fieldNode.getAttribute("aria-activedescendant"),
+                        )) {
+                          pushRoot(document.getElementById(id));
+                        }
+                        const nodes = [];
+                        const seenNodes = new Set();
+                        const pushNode = (candidate) => {
+                          if (!candidate || candidate.nodeType !== 1 || seenNodes.has(candidate)) {
+                            return;
+                          }
+                          if (!isVisible(candidate)) {
+                            return;
+                          }
+                          seenNodes.add(candidate);
+                          nodes.push(candidate);
+                        };
+                        for (const root of relatedRoots) {
+                          pushNode(root);
+                          for (const optionNode of root.querySelectorAll(interactiveSelectors)) {
+                            if (optionNode === fieldNode) {
+                              continue;
+                            }
+                            pushNode(optionNode);
+                          }
+                        }
+                        if (nodes.length === 0) {
+                          for (const optionNode of document.querySelectorAll("[role='option']")) {
+                            if (optionNode === fieldNode) {
+                              continue;
+                            }
+                            pushNode(optionNode);
+                          }
+                        }
+                        return nodes;
+                      };
                       document
                         .querySelectorAll("[data-job-applier-agent-id]")
                         .forEach((node) => node.removeAttribute("data-job-applier-agent-id"));
@@ -440,8 +508,21 @@ class BrowserDomSnapshotter:
                           "true",
                         );
                       }
+                      const activeField =
+                        activeSurface &&
+                        document.activeElement &&
+                        document.activeElement.nodeType === 1 &&
+                        activeSurface.node.contains(document.activeElement)
+                          ? document.activeElement
+                          : null;
+                      const relatedPopupNodes = activeField
+                        ? collectPopupNodesForField(activeField)
+                        : [];
                       const nodes = activeSurface
-                        ? Array.from(activeSurface.node.querySelectorAll(interactiveSelectors))
+                        ? [
+                            ...Array.from(activeSurface.node.querySelectorAll(interactiveSelectors)),
+                            ...relatedPopupNodes,
+                          ]
                             .filter((node) => node && node.nodeType === 1)
                             .filter(isVisible)
                             .filter((node, index, collection) => collection.indexOf(node) === index)
@@ -1241,6 +1322,10 @@ class OpenAIResponsesBrowserAgent:
                     "submit the current goal, click it instead of scrolling again."
                 ),
                 (
+                    "Use press for keyboard confirmation when a combobox, autocomplete, "
+                    "or suggestion list likely needs Enter, Tab, or arrow navigation."
+                ),
+                (
                     "Do not repeat the same failed click on an unchanged screen when scrolling "
                     "could reveal more content."
                 ),
@@ -1486,6 +1571,21 @@ class OpenAIResponsesBrowserAgent:
         if action.action_type == "fail":
             msg = action.reasoning or "Browser agent reported that no safe action was available."
             raise BrowserAutomationError(msg)
+        if action.action_type == "press":
+            if action.key_name is None:
+                msg = "Browser agent returned press without a key_name."
+                raise BrowserAutomationError(msg)
+            await self._pause_before_click(page)
+            try:
+                await page.keyboard.press(action.key_name)
+                if action.key_name in {"Enter", "Tab", "Space"}:
+                    await self._settle_page(page)
+                else:
+                    await page.wait_for_timeout(350)
+                return
+            except Exception as exc:  # noqa: BLE001
+                msg = summarize_browser_action_error(exc)
+                raise BrowserAutomationError(msg) from exc
         if action.action_type == "scroll":
             await self._pause_before_click(page)
             await self._execute_scroll(page, action)
@@ -1592,6 +1692,16 @@ class OpenAIResponsesBrowserAgent:
         if action.action_type in {"click", "fill"} and action.element_id not in valid_element_ids:
             msg = "Browser agent referenced an element that does not exist in the snapshot."
             raise BrowserAutomationError(msg)
+        if action.action_type == "press" and action.key_name not in {
+            "Enter",
+            "Tab",
+            "Escape",
+            "ArrowDown",
+            "ArrowUp",
+            "Space",
+        }:
+            msg = "Browser agent returned press without a supported key_name."
+            raise BrowserAutomationError(msg)
         if action.action_type == "scroll":
             if action.scroll_target not in {"active_surface", "page"}:
                 msg = "Browser agent returned scroll without a valid scroll_target."
@@ -1645,13 +1755,25 @@ def parse_browser_action(payload: dict[str, object]) -> BrowserAgentAction:
     """Validate the structured action returned by the browser planner."""
 
     action_type = payload.get("action_type")
-    if action_type not in {"click", "fill", "scroll", "wait", "done", "fail"}:
+    if action_type not in {"click", "fill", "press", "scroll", "wait", "done", "fail"}:
         msg = "Browser agent returned an unsupported action_type."
         raise BrowserAutomationError(msg)
 
     value_source = payload.get("value_source")
     if value_source is not None and not isinstance(value_source, str):
         msg = "Browser agent returned an unsupported value_source."
+        raise BrowserAutomationError(msg)
+
+    key_name = payload.get("key_name")
+    if key_name is not None and key_name not in {
+        "Enter",
+        "Tab",
+        "Escape",
+        "ArrowDown",
+        "ArrowUp",
+        "Space",
+    }:
+        msg = "Browser agent returned an unsupported key_name."
         raise BrowserAutomationError(msg)
 
     scroll_target = payload.get("scroll_target")
@@ -1690,6 +1812,7 @@ def parse_browser_action(payload: dict[str, object]) -> BrowserAgentAction:
         value_source=_optional_text(value_source),
         value=_optional_text(payload.get("value")),
         action_intent=_optional_text(payload.get("action_intent")),
+        key_name=cast(BrowserPressKey | None, _optional_text(key_name)),
         scroll_target=cast(BrowserScrollTarget | None, _optional_text(scroll_target)),
         scroll_direction=cast(BrowserScrollDirection | None, _optional_text(scroll_direction)),
         scroll_amount=max(100, min(1_600, scroll_amount)),

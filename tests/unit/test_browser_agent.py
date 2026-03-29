@@ -71,6 +71,25 @@ def test_parse_browser_action_accepts_surface_scroll_payload() -> None:
     assert action.scroll_amount == 640
 
 
+def test_parse_browser_action_accepts_press_payload() -> None:
+    action = parse_browser_action(
+        {
+            "action_type": "press",
+            "element_id": None,
+            "value_source": None,
+            "value": None,
+            "action_intent": "confirm_autocomplete_choice",
+            "key_name": "Enter",
+            "wait_seconds": 0,
+            "reasoning": "The current combobox likely needs keyboard confirmation.",
+        }
+    )
+
+    assert action.action_type == "press"
+    assert action.key_name == "Enter"
+    assert action.action_intent == "confirm_autocomplete_choice"
+
+
 def test_manual_intervention_detection_flags_captcha_and_otp_pages() -> None:
     snapshot = BrowserAgentSnapshot(
         url="https://www.linkedin.com/checkpoint/challenge/",
@@ -164,6 +183,71 @@ def test_browser_dom_snapshotter_focus_locator_prioritizes_visible_modal_control
                     for element in after.elements
                 )
                 assert "Continue to next step" in after.visible_text or "Next" in after.visible_text
+            finally:
+                await browser.close()
+
+    asyncio.run(scenario())
+
+
+def test_browser_dom_snapshotter_focus_locator_includes_popup_options_for_active_field() -> None:
+    async def scenario() -> None:
+        snapshotter = BrowserDomSnapshotter(max_elements=12, max_visible_text=600)
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                await page.set_content(
+                    """
+                    <style>
+                      body { margin: 0; font-family: sans-serif; }
+                      .dialog {
+                        position: fixed;
+                        inset: 80px auto auto 120px;
+                        width: 520px;
+                        background: white;
+                        border: 1px solid #ddd;
+                        z-index: 20;
+                        padding: 16px;
+                      }
+                      .portal {
+                        position: fixed;
+                        inset: 220px auto auto 160px;
+                        width: 360px;
+                        background: white;
+                        border: 1px solid #ddd;
+                        z-index: 30;
+                      }
+                      .option { padding: 12px 16px; }
+                    </style>
+                    <div class="dialog" role="dialog" aria-label="Apply to Example Corp">
+                      <label for="city">City</label>
+                      <input
+                        id="city"
+                        aria-label="City"
+                        role="combobox"
+                        aria-autocomplete="list"
+                        aria-controls="city-options"
+                        aria-expanded="true"
+                        value="Sao"
+                      />
+                    </div>
+                    <div class="portal" id="city-options" role="listbox">
+                      <div class="option" role="option">Sao Paulo, Sao Paulo, Brazil</div>
+                      <div class="option" role="option">Sao Jose dos Campos, Sao Paulo, Brazil</div>
+                    </div>
+                    """
+                )
+                await page.locator("#city").focus()
+
+                snapshot = await snapshotter.capture(
+                    page,
+                    focus_locator=page.locator('[role="dialog"]'),
+                )
+                labels = {element.label for element in snapshot.elements}
+                texts = {element.text for element in snapshot.elements}
+
+                assert any("Sao Paulo" in (text or "") for text in texts)
+                assert "City" in labels
             finally:
                 await browser.close()
 

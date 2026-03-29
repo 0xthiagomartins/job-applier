@@ -114,6 +114,41 @@ class EasyApplyExecutionResult:
             raise ValueError(msg)
 
 
+@dataclass(frozen=True, slots=True)
+class TextFieldInteractionState:
+    """Interactive state for a filled text-like control."""
+
+    current_value: str
+    focused: bool
+    role: str | None
+    aria_autocomplete: str | None
+    aria_expanded: bool
+    has_popup_binding: bool
+    active_descendant: str | None
+    visible_option_count: int
+    visible_option_texts: tuple[str, ...] = ()
+
+    @property
+    def has_value(self) -> bool:
+        return bool(normalize_text(self.current_value))
+
+    @property
+    def needs_agentic_follow_up(self) -> bool:
+        return bool(
+            self.visible_option_count
+            or self.aria_expanded
+            or self.active_descendant
+            or (
+                self.focused
+                and (
+                    self.role == "combobox"
+                    or self.aria_autocomplete is not None
+                    or self.has_popup_binding
+                )
+            )
+        )
+
+
 class EasyApplyExecutor(Protocol):
     """Boundary used by the submitter to run the browser automation."""
 
@@ -672,7 +707,13 @@ class PlaywrightLinkedInEasyApplyExecutor:
             if resolution is None:
                 continue
 
-            applied_value = await self._apply_field_value(root, field, resolution, settings)
+            applied_value = await self._apply_field_value(
+                page,
+                root,
+                field,
+                resolution,
+                settings,
+            )
             if applied_value is None:
                 continue
 
@@ -732,6 +773,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
 
     async def _apply_field_value(
         self,
+        page: Page,
         root: Locator,
         field: EasyApplyField,
         resolution: ResolvedFieldValue,
@@ -743,10 +785,16 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 if locator is None:
                     return None
                 current_value = await locator.input_value()
-                if normalize_text(current_value) == normalize_text(resolution.value):
-                    return resolution.value
-                await locator.fill(resolution.value)
-                return resolution.value
+                if normalize_text(current_value) != normalize_text(resolution.value):
+                    await locator.click()
+                    await locator.fill(resolution.value)
+                    await page.wait_for_timeout(250)
+                return await self._complete_text_field_interaction(
+                    page=page,
+                    field=field,
+                    target_value=resolution.value,
+                    settings=settings,
+                )
             case "select":
                 locator = await self._find_control_locator(root, field)
                 if locator is None:
@@ -789,6 +837,217 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     return None
                 await locator.set_input_files(settings.profile.cv_path)
                 return settings.profile.cv_filename or Path(settings.profile.cv_path).name
+
+    async def _complete_text_field_interaction(
+        self,
+        *,
+        page: Page,
+        field: EasyApplyField,
+        target_value: str,
+        settings: UserAgentSettings,
+    ) -> str:
+        browser_agent = self._create_browser_agent(settings)
+        recent_actions: list[dict[str, object]] = []
+
+        for attempt_index in range(4):
+            root = await self._easy_apply_root(page)
+            locator = await self._find_control_locator(root, field)
+            if locator is None:
+                msg = (
+                    "LinkedIn removed the current form field while the agent was trying to "
+                    "finalize it."
+                )
+                raise LinkedInEasyApplyError(msg)
+            state = await self._inspect_text_field_interaction(locator)
+            if self._text_field_interaction_complete(state):
+                return state.current_value or target_value
+
+            action = await browser_agent.perform_single_task_action(
+                page=page,
+                available_values={},
+                goal=(
+                    "Finish the interaction for the already-filled LinkedIn Easy Apply field "
+                    "so the current step accepts the value without advancing or closing the form."
+                ),
+                task_name="linkedin_easy_apply_finalize_field_interaction",
+                extra_rules=(
+                    f"The already-filled field label is {field.question_raw!r}.",
+                    f"The intended accepted value is {target_value!r}.",
+                    "Do not clear or overwrite the field value in this task.",
+                    (
+                        "If an autocomplete, combobox, suggestion list, or dropdown choice is "
+                        "visible for the current field, select the best matching option for the "
+                        "intended value."
+                    ),
+                    (
+                        "If the current field likely needs keyboard confirmation or blur, use "
+                        "press with Enter, Tab, ArrowDown, or ArrowUp before Enter when needed."
+                    ),
+                    (
+                        "Do not click Continue, Next, Review, Submit, Dismiss, Close, Back, or "
+                        "other step-level controls in this task."
+                    ),
+                    (
+                        "If choices for the current field are hidden below the visible area of "
+                        "the blocking surface, scroll the active surface rather than the page."
+                    ),
+                    (
+                        "Use done only when the current field appears accepted and no chooser "
+                        "for it still needs attention."
+                    ),
+                ),
+                allowed_action_types=("click", "press", "scroll", "wait", "done", "fail"),
+                recent_actions=recent_actions[-6:],
+                step_index=attempt_index,
+                focus_locator=root,
+            )
+            recent_actions.append(
+                {
+                    "attempt_index": attempt_index,
+                    "action_type": action.action_type,
+                    "action_intent": action.action_intent,
+                    "reasoning": action.reasoning,
+                    "field_key": field.normalized_key,
+                }
+            )
+            if action.action_type in {"done", "fail"}:
+                break
+
+        root = await self._easy_apply_root(page)
+        locator = await self._find_control_locator(root, field)
+        if locator is None:
+            msg = "LinkedIn changed the current field before the interaction could finish."
+            raise LinkedInEasyApplyError(msg)
+        final_state = await self._inspect_text_field_interaction(locator)
+        if final_state.needs_agentic_follow_up or not final_state.has_value:
+            msg = (
+                "Browser agent could not finish the interactive field flow for the current "
+                "LinkedIn Easy Apply step."
+            )
+            raise LinkedInEasyApplyError(msg)
+        return final_state.current_value or target_value
+
+    async def _inspect_text_field_interaction(self, locator: Locator) -> TextFieldInteractionState:
+        payload = await locator.evaluate(
+            """
+            (node) => {
+              const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
+              const isVisible = (candidate) => {
+                if (!candidate || candidate.nodeType !== 1) {
+                  return false;
+                }
+                const style = window.getComputedStyle(candidate);
+                const rect = candidate.getBoundingClientRect();
+                if (
+                  rect.width <= 0 ||
+                  rect.height <= 0 ||
+                  rect.bottom <= 0 ||
+                  rect.right <= 0 ||
+                  rect.top >= window.innerHeight ||
+                  rect.left >= window.innerWidth
+                ) {
+                  return false;
+                }
+                return style.visibility !== "hidden" && style.display !== "none";
+              };
+              const splitIds = (value) =>
+                collapse(value)
+                  .split(/\\s+/)
+                  .map((item) => item.trim())
+                  .filter(Boolean);
+              const relatedRoots = [];
+              const seenRoots = new Set();
+              const pushRoot = (candidate) => {
+                if (!candidate || candidate.nodeType !== 1 || seenRoots.has(candidate)) {
+                  return;
+                }
+                seenRoots.add(candidate);
+                relatedRoots.push(candidate);
+              };
+              for (const attributeName of ["aria-controls", "aria-owns", "list"]) {
+                for (const id of splitIds(node.getAttribute(attributeName))) {
+                  pushRoot(document.getElementById(id));
+                }
+              }
+              for (const id of splitIds(node.getAttribute("aria-activedescendant"))) {
+                pushRoot(document.getElementById(id));
+              }
+              const optionTexts = [];
+              const seenOptions = new Set();
+              const pushOption = (candidate) => {
+                if (!candidate || candidate.nodeType !== 1 || seenOptions.has(candidate)) {
+                  return;
+                }
+                if (!isVisible(candidate)) {
+                  return;
+                }
+                const text = collapse(
+                  candidate.innerText
+                  || candidate.textContent
+                  || candidate.getAttribute("aria-label")
+                  || ""
+                );
+                if (!text) {
+                  return;
+                }
+                seenOptions.add(candidate);
+                optionTexts.push(text);
+              };
+              for (const root of relatedRoots) {
+                pushOption(root);
+                for (const optionNode of root.querySelectorAll(
+                  "[role='option'], li, button, div"
+                )) {
+                  pushOption(optionNode);
+                }
+              }
+              if (
+                optionTexts.length === 0 &&
+                document.activeElement === node
+              ) {
+                for (const optionNode of document.querySelectorAll("[role='option']")) {
+                  pushOption(optionNode);
+                }
+              }
+              return {
+                current_value: collapse(
+                  node.value
+                  || node.textContent
+                  || node.getAttribute("value")
+                  || ""
+                ),
+                focused: document.activeElement === node,
+                role: collapse(node.getAttribute("role")),
+                aria_autocomplete: collapse(node.getAttribute("aria-autocomplete")),
+                aria_expanded: node.getAttribute("aria-expanded") === "true",
+                has_popup_binding: ["aria-controls", "aria-owns", "list"].some(
+                  (attributeName) => splitIds(node.getAttribute(attributeName)).length > 0,
+                ),
+                active_descendant: collapse(node.getAttribute("aria-activedescendant")),
+                visible_option_count: optionTexts.length,
+                visible_option_texts: optionTexts.slice(0, 6),
+              };
+            }
+            """
+        )
+        return TextFieldInteractionState(
+            current_value=str(payload.get("current_value") or "").strip(),
+            focused=bool(payload.get("focused")),
+            role=normalize_text(payload.get("role") or "") or None,
+            aria_autocomplete=normalize_text(payload.get("aria_autocomplete") or "") or None,
+            aria_expanded=bool(payload.get("aria_expanded")),
+            has_popup_binding=bool(payload.get("has_popup_binding")),
+            active_descendant=normalize_text(payload.get("active_descendant") or "") or None,
+            visible_option_count=int(payload.get("visible_option_count") or 0),
+            visible_option_texts=tuple(
+                str(item).strip()
+                for item in (payload.get("visible_option_texts") or ())
+                if str(item).strip()
+            ),
+        )
+
+    def _text_field_interaction_complete(self, state: TextFieldInteractionState) -> bool:
+        return state.has_value and not state.needs_agentic_follow_up
 
     async def _check_radio_option(
         self,
