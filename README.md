@@ -73,6 +73,7 @@ Runtime behavior:
 - the first successful login saves a reusable session in `artifacts/runtime/linkedin/storage-state.json`;
 - later runs reuse that storage state automatically;
 - if LinkedIn expires the session, the app clears the saved state and logs in again;
+- when `JOB_APPLIER_PLAYWRIGHT_MCP_URL` is configured, the login bootstrap runs through Playwright MCP and exports the storage state back to the Python app;
 - in headful mode, the browser stays visible so the user can solve captcha or checkpoint screens.
 - when the panel state is still empty, the app bootstraps a local profile automatically from `.env` and tries to import a CV from `~/Documents`.
 
@@ -112,7 +113,7 @@ The lean test philosophy for this repo lives in [docs/testing-strategy.md](docs/
 The repository already includes a single `Dockerfile` for the on-premise flow:
 
 - backend API and panel run inside the same container;
-- if `JOB_APPLIER_PLAYWRIGHT_MCP_URL` is empty, the container also starts a local Playwright MCP sidecar;
+- if `JOB_APPLIER_PLAYWRIGHT_MCP_URL` is empty, the container also starts a local Playwright MCP sidecar and points the backend to `http://localhost:8931/mcp`;
 - if `JOB_APPLIER_PLAYWRIGHT_MCP_URL` is provided, the container skips the local MCP and uses the external one;
 - if `JOB_APPLIER_DATABASE_URL` is not provided, the app creates and uses a local SQLite file in `/data`;
 - for Linux hosts, Playwright can open a visible browser on the host display so the user can watch the automation and step in for captchas.

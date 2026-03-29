@@ -1089,6 +1089,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 else self._runtime_settings.openai_api_key
             ),
             ai_model=settings.ai.model if settings is not None else "o3-mini",
+            playwright_mcp_url=(
+                self._runtime_settings.resolved_playwright_mcp_url
+                if self._runtime_settings.playwright_mcp_url is not None
+                else None
+            ),
         )
         return self._session_manager
 

@@ -21,6 +21,19 @@ from job_applier.infrastructure.linkedin.easy_apply import (
     LinkedInEasyApplySubmitter,
     PlaywrightLinkedInEasyApplyExecutor,
 )
+from job_applier.infrastructure.linkedin.playwright_mcp import (
+    OpenAIResponsesPlaywrightMcpAgent,
+    PlaywrightMcpAction,
+    PlaywrightMcpError,
+    PlaywrightMcpHttpClient,
+    extract_mcp_text_content,
+    normalize_playwright_mcp_url,
+    parse_mcp_response_body,
+    parse_playwright_mcp_action,
+)
+from job_applier.infrastructure.linkedin.playwright_mcp import (
+    has_manual_intervention_cues as has_playwright_mcp_manual_intervention_cues,
+)
 from job_applier.infrastructure.linkedin.question_resolution import (
     EasyApplyField,
     GeneratedAnswer,
@@ -85,9 +98,13 @@ __all__ = [
     "LinkedInSessionManager",
     "OpenAIResponsesAnswerGenerator",
     "OpenAIResponsesBrowserAgent",
+    "OpenAIResponsesPlaywrightMcpAgent",
     "OpenAIResponsesRecruiterMessageGenerator",
     "PlaywrightLinkedInEasyApplyExecutor",
     "PlaywrightLinkedInJobsClient",
+    "PlaywrightMcpAction",
+    "PlaywrightMcpError",
+    "PlaywrightMcpHttpClient",
     "PlaywrightRecruiterConnector",
     "QuestionClassification",
     "ResolvedFieldValue",
@@ -97,13 +114,18 @@ __all__ = [
     "build_paginated_search_url",
     "build_recruiter_message_template",
     "build_search_criteria",
+    "extract_mcp_text_content",
     "finalize_recruiter_message",
     "has_manual_intervention_cues",
+    "has_playwright_mcp_manual_intervention_cues",
     "infer_seniority",
     "infer_workplace_type",
     "normalize_key",
+    "normalize_playwright_mcp_url",
     "normalize_text",
+    "parse_mcp_response_body",
     "parse_browser_action",
+    "parse_playwright_mcp_action",
     "pick_option",
     "select_recruiter_candidate",
 ]

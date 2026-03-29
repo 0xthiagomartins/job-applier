@@ -13,6 +13,11 @@ from playwright.async_api import Browser, BrowserContext, Page
 from pydantic import SecretStr
 
 from job_applier.infrastructure.linkedin.browser_agent import OpenAIResponsesBrowserAgent
+from job_applier.infrastructure.linkedin.playwright_mcp import (
+    OpenAIResponsesPlaywrightMcpAgent,
+    PlaywrightMcpError,
+    PlaywrightMcpHttpClient,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +45,14 @@ class LinkedInSessionManager:
         login_timeout_seconds: int = 120,
         ai_api_key: SecretStr | None = None,
         ai_model: str = "o3-mini",
+        playwright_mcp_url: str | None = None,
     ) -> None:
         self._credentials = credentials
         self._storage_state_path = storage_state_path
         self._login_timeout_seconds = login_timeout_seconds
         self._ai_api_key = ai_api_key
         self._ai_model = ai_model
+        self._playwright_mcp_url = playwright_mcp_url
 
     async def create_authenticated_context(self, browser: Browser) -> BrowserContext:
         """Return an authenticated context, reusing saved session state when valid."""
@@ -62,10 +69,20 @@ class LinkedInSessionManager:
             self.clear_saved_state()
 
         fresh_context = await browser.new_context()
-        await self._login(fresh_context)
-        await fresh_context.storage_state(path=str(self._storage_state_path))
+        logged_in_in_context = await self._login(fresh_context)
+        if logged_in_in_context:
+            await fresh_context.storage_state(path=str(self._storage_state_path))
+            logger.info("linkedin_session_saved", extra={"path": str(self._storage_state_path)})
+            return fresh_context
+
+        await fresh_context.close()
+        replayed_context = await browser.new_context(storage_state=str(self._storage_state_path))
+        if not await self._is_authenticated(replayed_context):
+            await replayed_context.close()
+            msg = "Playwright MCP login finished, but the exported LinkedIn session is not valid."
+            raise LinkedInAuthError(msg)
         logger.info("linkedin_session_saved", extra={"path": str(self._storage_state_path)})
-        return fresh_context
+        return replayed_context
 
     def clear_saved_state(self) -> None:
         """Delete the saved storage-state file after an expired session."""
@@ -108,8 +125,12 @@ class LinkedInSessionManager:
         finally:
             await page.close()
 
-    async def _login(self, context: BrowserContext) -> None:
-        """Run the LinkedIn login flow and allow manual intervention when needed."""
+    async def _login(self, context: BrowserContext) -> bool:
+        """Run the LinkedIn login flow and report whether the direct context is authenticated."""
+
+        if self._playwright_mcp_url:
+            await self._login_via_mcp()
+            return False
 
         page = await context.new_page()
         try:
@@ -135,8 +156,49 @@ class LinkedInSessionManager:
                 timeout_seconds=self._login_timeout_seconds,
             )
             await self._wait_until_authenticated(page)
+            return True
         finally:
             await page.close()
+
+    async def _login_via_mcp(self) -> None:
+        """Authenticate through the external Playwright MCP server and export storage state."""
+
+        ai_api_key = self._resolve_ai_api_key()
+        if ai_api_key is None:
+            msg = (
+                "OpenAI API key is required for the LinkedIn browser agent login flow. "
+                "Configure it in the panel or set JOB_APPLIER_OPENAI_API_KEY."
+            )
+            raise LinkedInAuthError(msg)
+        if self._playwright_mcp_url is None:
+            msg = "Playwright MCP URL is required for MCP-backed LinkedIn login."
+            raise LinkedInAuthError(msg)
+
+        client = PlaywrightMcpHttpClient(
+            base_url=self._playwright_mcp_url,
+            timeout_seconds=self._login_timeout_seconds,
+        )
+        agent = OpenAIResponsesPlaywrightMcpAgent(
+            api_key=ai_api_key,
+            model=self._ai_model,
+        )
+        try:
+            await client.navigate("https://www.linkedin.com/login")
+            await agent.complete_linkedin_login(
+                client=client,
+                credentials={
+                    "linkedin_email": self._credentials.email,
+                    "linkedin_password": self._credentials.password.get_secret_value(),
+                },
+                timeout_seconds=self._login_timeout_seconds,
+            )
+            self._storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+            await client.save_storage_state(self._storage_state_path)
+        except PlaywrightMcpError as exc:
+            raise LinkedInAuthError(str(exc)) from exc
+        finally:
+            await client.close_browser()
+            await client.shutdown()
 
     async def _wait_until_authenticated(self, page: Page) -> None:
         """Wait for the login flow to complete, including manual captcha handling."""

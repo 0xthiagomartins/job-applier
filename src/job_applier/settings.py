@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from functools import lru_cache
 from pathlib import Path
+from urllib import parse
 
 from alembic import command
 from alembic.config import Config
@@ -22,7 +23,7 @@ class RuntimeSettings(BaseSettings):
     backend_port: int = 8000
     panel_port: int = 3000
     playwright_mcp_url: AnyUrl | None = None
-    playwright_mcp_host: str = "127.0.0.1"
+    playwright_mcp_host: str = "localhost"
     playwright_mcp_port: int = 8931
     scheduler_poll_interval_seconds: int = 30
     playwright_headless: bool = False
@@ -77,9 +78,26 @@ class RuntimeSettings(BaseSettings):
     def resolved_playwright_mcp_url(self) -> str:
         """Return the external Playwright MCP URL or the default local sidecar address."""
 
-        if self.playwright_mcp_url is not None:
-            return str(self.playwright_mcp_url)
-        return f"http://{self.playwright_mcp_host}:{self.playwright_mcp_port}"
+        raw_url = (
+            str(self.playwright_mcp_url)
+            if self.playwright_mcp_url is not None
+            else f"http://{self.playwright_mcp_host}:{self.playwright_mcp_port}"
+        )
+        parsed = parse.urlparse(raw_url)
+        hostname = parsed.hostname or ""
+        if hostname in {"127.0.0.1", "0.0.0.0"}:
+            host = "localhost"
+            if parsed.port is not None:
+                netloc = f"{host}:{parsed.port}"
+            else:
+                netloc = host
+            parsed = parsed._replace(netloc=netloc)
+        path = parsed.path.rstrip("/")
+        if not path:
+            path = "/mcp"
+        elif path not in {"/mcp", "/sse"}:
+            path = f"{path}/mcp"
+        return parse.urlunparse(parsed._replace(path=path, params="", query="", fragment=""))
 
     @property
     def resolved_linkedin_storage_state_path(self) -> Path:

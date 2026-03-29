@@ -309,6 +309,11 @@ class PlaywrightLinkedInJobsClient:
                 else self._runtime_settings.openai_api_key
             ),
             ai_model=criteria.ai_model if criteria is not None else "o3-mini",
+            playwright_mcp_url=(
+                self._runtime_settings.resolved_playwright_mcp_url
+                if self._runtime_settings.playwright_mcp_url is not None
+                else None
+            ),
         )
         return self._session_manager
 

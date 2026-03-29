@@ -34,7 +34,7 @@ docker run --rm -it \
   job-applier
 ```
 
-If `JOB_APPLIER_PLAYWRIGHT_MCP_URL` is empty, the container starts its own Playwright MCP sidecar.
+If `JOB_APPLIER_PLAYWRIGHT_MCP_URL` is empty, the container starts its own Playwright MCP sidecar at `http://localhost:8931/mcp`.
 If `JOB_APPLIER_PLAYWRIGHT_MCP_URL` is set, the container skips the local MCP and assumes you already have one running elsewhere.
 
 ## Run with a visible browser on Linux
@@ -70,7 +70,7 @@ The container persists the reusable LinkedIn session at `/data/linkedin/storage-
 docker run --rm -it \
   -p 3000:3000 \
   -p 8000:8000 \
-  -e JOB_APPLIER_PLAYWRIGHT_MCP_URL="http://your-mcp-host:8931" \
+  -e JOB_APPLIER_PLAYWRIGHT_MCP_URL="http://your-mcp-host:8931/mcp" \
   -v job-applier-data:/data \
   job-applier
 ```
