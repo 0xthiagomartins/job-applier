@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import random
@@ -54,6 +55,7 @@ from job_applier.infrastructure.linkedin.auth import (
 from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserAgentAction,
     BrowserAutomationError,
+    BrowserDomSnapshotter,
     BrowserTaskAssessment,
     OpenAIResponsesBrowserAgent,
 )
@@ -286,8 +288,16 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     )
 
                 max_steps = 10
-                for fallback_step_index in range(max_steps):
-                    step = await self._extract_step(page, fallback_step_index=fallback_step_index)
+                last_known_step_index = 0
+                last_known_total_steps = 1
+                for _ in range(max_steps):
+                    step = await self._extract_step(
+                        page,
+                        last_known_step_index=last_known_step_index,
+                        last_known_total_steps=last_known_total_steps,
+                    )
+                    last_known_step_index = step.step_index
+                    last_known_total_steps = step.total_steps
                     self._record_event(
                         execution_events,
                         execution_id=execution_id,
@@ -732,6 +742,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 locator = await self._find_control_locator(root, field)
                 if locator is None:
                     return None
+                current_value = await locator.input_value()
+                if normalize_text(current_value) == normalize_text(resolution.value):
+                    return resolution.value
                 await locator.fill(resolution.value)
                 return resolution.value
             case "select":
@@ -742,6 +755,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 if option_index is None:
                     return None
                 option = field.options[option_index]
+                if await self._select_field_already_matches(
+                    locator,
+                    field,
+                    option_index=option_index,
+                ):
+                    return option
                 await self._select_field_option(locator, field, option_index=option_index)
                 return option
             case "checkbox":
@@ -749,6 +768,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 if locator is None:
                     return None
                 should_check = normalize_text(resolution.value) in {"yes", "true", "1"}
+                if (await locator.is_checked()) == should_check:
+                    return "Yes" if should_check else "No"
                 if should_check:
                     await locator.check()
                     return "Yes"
@@ -830,7 +851,46 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 return
         await locator.select_option(index=option_index)
 
-    async def _extract_step(self, page: Page, *, fallback_step_index: int) -> EasyApplyStep:
+    async def _select_field_already_matches(
+        self,
+        locator: Locator,
+        field: EasyApplyField,
+        *,
+        option_index: int,
+    ) -> bool:
+        option_ref = (
+            field.option_refs[option_index] if len(field.option_refs) > option_index else None
+        )
+        option = field.options[option_index]
+        if option_ref is not None:
+            if option_ref.startswith("value:"):
+                return (await locator.input_value()) == option_ref.removeprefix("value:")
+            if option_ref.startswith("index:"):
+                selected_index = await locator.evaluate(
+                    "(node) => node instanceof HTMLSelectElement ? node.selectedIndex : -1"
+                )
+                return isinstance(selected_index, int) and selected_index == int(
+                    option_ref.removeprefix("index:")
+                )
+        selected_text = await locator.evaluate(
+            """
+            (node) => {
+              if (!(node instanceof HTMLSelectElement)) {
+                return "";
+              }
+              return (node.selectedOptions[0]?.textContent || "").trim();
+            }
+            """
+        )
+        return normalize_text(str(selected_text or "")) == normalize_text(option)
+
+    async def _extract_step(
+        self,
+        page: Page,
+        *,
+        last_known_step_index: int,
+        last_known_total_steps: int,
+    ) -> EasyApplyStep:
         root = await self._easy_apply_root(page)
         payload = await root.evaluate(
             """
@@ -1044,11 +1104,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
         if isinstance(current_step, int) and current_step >= 1:
             step_index = int(current_step) - 1
         else:
-            step_index = fallback_step_index
+            step_index = max(0, last_known_step_index)
         if isinstance(total_steps, int) and total_steps >= 1:
             total = int(total_steps)
         else:
-            total = max(step_index + 1, 1)
+            total = max(last_known_total_steps, step_index + 1, 1)
         raw_fields = payload.get("fields", [])
         fields = tuple(
             self._question_extractor.build_field(item)
@@ -1090,11 +1150,15 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             "Easy Apply flow, choose fail."
                         ),
                         (
+                            "If the start-application control is not visible yet and the page "
+                            "can reveal more content, use scroll before giving up."
+                        ),
+                        (
                             "When clicking the control that starts the application flow, "
                             "set action_intent to open_easy_apply."
                         ),
                     ),
-                    allowed_action_types=("click", "wait", "done", "fail"),
+                    allowed_action_types=("click", "scroll", "wait", "done", "fail"),
                     recent_actions=recent_actions[-4:],
                     step_index=step_index,
                 )
@@ -1142,54 +1206,112 @@ class PlaywrightLinkedInEasyApplyExecutor:
         execution_events: list[ExecutionEvent],
     ) -> BrowserAgentAction:
         browser_agent = self._create_browser_agent(settings)
+        recent_actions: list[dict[str, object]] = []
+        last_action: BrowserAgentAction | None = None
         try:
-            action = await browser_agent.perform_single_task_action(
-                page=page,
-                available_values={},
-                goal=(
-                    "Advance the current LinkedIn Easy Apply step. "
-                    "If this is the final step, submit the application. "
-                    "Do not click dismiss, close, save, or unrelated controls."
-                ),
-                task_name="linkedin_easy_apply_primary_action",
-                extra_rules=(
-                    (
-                        "Do not fill any field in this task. "
-                        "The form fields are already handled elsewhere."
+            for action_round in range(4):
+                root = await self._easy_apply_root(page)
+                action = await browser_agent.perform_single_task_action(
+                    page=page,
+                    available_values={},
+                    goal=(
+                        "Advance the current LinkedIn Easy Apply step. "
+                        "If this is the final step, submit the application. "
+                        "Do not click dismiss, close, save, or unrelated controls."
                     ),
-                    (
-                        "If the current step is complete and a primary button "
-                        "advances the flow, click it."
+                    task_name="linkedin_easy_apply_primary_action",
+                    extra_rules=(
+                        (
+                            "Do not fill any field in this task. "
+                            "The form fields are already handled elsewhere."
+                        ),
+                        (
+                            "Keep working toward the macro goal until you either click the visible "
+                            "primary advance or submit control, or no safe next move exists."
+                        ),
+                        (
+                            "If the current step is complete and a primary button "
+                            "advances the flow, click it."
+                        ),
+                        (
+                            "If the current step shows the final application send action, "
+                            "click it and set action_intent to submit_application."
+                        ),
+                        (
+                            "If the current step shows a review or next action, click it and set "
+                            "action_intent to advance_step."
+                        ),
+                        (
+                            "If the active surface can scroll and the primary advance control "
+                            "is not visible yet, scroll the active surface downward instead "
+                            "of the page."
+                        ),
+                        (
+                            "After a successful scroll, re-evaluate the visible controls and "
+                            "click the primary CTA if it is now present instead of "
+                            "scrolling again."
+                        ),
+                        (
+                            "If the current screen is unchanged after filling fields, do not "
+                            "keep guessing hidden CTAs. Scroll first when more modal content "
+                            "is available."
+                        ),
+                        "If the page is still updating, choose wait.",
                     ),
-                    (
-                        "If the current step shows the final application send action, click it and "
-                        "set action_intent to submit_application."
-                    ),
-                    (
-                        "If the current step shows a review or next action, click it and set "
-                        "action_intent to advance_step."
-                    ),
-                    "If the page is still updating, choose wait.",
-                ),
-                allowed_action_types=("click", "wait", "done", "fail"),
-                step_index=step.step_index,
-            )
+                    allowed_action_types=("click", "scroll", "wait", "done", "fail"),
+                    recent_actions=recent_actions[-6:],
+                    step_index=step.step_index,
+                    focus_locator=root,
+                )
+                last_action = action
+                recent_actions.append(
+                    {
+                        "action_round": action_round,
+                        "action_type": action.action_type,
+                        "action_intent": action.action_intent,
+                        "reasoning": action.reasoning,
+                    }
+                )
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.STEP_REACHED,
+                    payload={
+                        "stage": "easy_apply_primary_action",
+                        "step_index": step.step_index,
+                        "action_round": action_round,
+                        "action_type": action.action_type,
+                        "action_intent": action.action_intent,
+                        "reasoning": action.reasoning,
+                    },
+                )
+                if action.action_type == "click" and action.action_intent in {
+                    "advance_step",
+                    "submit_application",
+                }:
+                    if action.action_intent == "advance_step":
+                        await self._wait_for_easy_apply_surface(page)
+                    return action
+                if action.action_type in {"done", "fail"}:
+                    return action
         except BrowserAutomationError as exc:
             raise LinkedInEasyApplyError(str(exc)) from exc
-        self._record_event(
-            execution_events,
-            execution_id=execution_id,
-            submission_id=submission_id,
-            event_type=ExecutionEventType.STEP_REACHED,
-            payload={
-                "stage": "easy_apply_primary_action",
-                "step_index": step.step_index,
-                "action_type": action.action_type,
-                "action_intent": action.action_intent,
-                "reasoning": action.reasoning,
-            },
-        )
-        return action
+        if last_action is not None:
+            return last_action
+        msg = "Browser agent could not determine how to advance the Easy Apply step."
+        raise LinkedInEasyApplyError(msg)
+
+    async def _wait_for_easy_apply_surface(self, page: Page, *, timeout_ms: int = 6_000) -> None:
+        deadline = asyncio.get_running_loop().time() + max(1, timeout_ms) / 1_000
+        while True:
+            if await self._easy_apply_modal_visible(page):
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await page.wait_for_timeout(350)
+        msg = "LinkedIn Easy Apply dialog is not visible after the last step action."
+        raise LinkedInEasyApplyError(msg)
 
     async def _await_submission_outcome(
         self,
@@ -1256,6 +1378,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         step: EasyApplyStep,
         recent_actions: tuple[dict[str, object], ...] = (),
     ) -> tuple[str, str | None]:
+        root = await self._easy_apply_root(page)
         assessment = await self._assess_browser_state_with_agent(
             page,
             settings=settings,
@@ -1274,6 +1397,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
             ),
             recent_actions=recent_actions,
             step_index=step.step_index,
+            focus_locator=root,
         )
         self._record_event(
             execution_events,
@@ -1303,6 +1427,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         extra_rules: tuple[str, ...] = (),
         recent_actions: tuple[dict[str, object], ...] = (),
         step_index: int = 0,
+        focus_locator: Locator | None = None,
     ) -> BrowserTaskAssessment:
         browser_agent = self._create_browser_agent(settings)
         try:
@@ -1313,6 +1438,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 extra_rules=extra_rules,
                 recent_actions=recent_actions,
                 step_index=step_index,
+                focus_locator=focus_locator,
             )
         except BrowserAutomationError as exc:
             raise LinkedInEasyApplyError(str(exc)) from exc
@@ -1324,8 +1450,19 @@ class PlaywrightLinkedInEasyApplyExecutor:
             "[role='dialog']",
         ):
             locator = page.locator(selector)
-            if await locator.count():
-                return locator.first
+            count = await locator.count()
+            for index in range(count):
+                candidate = locator.nth(index)
+                if await candidate.is_visible():
+                    return candidate
+        active_surface = page.locator('[data-job-applier-active-surface="true"]')
+        if await active_surface.count() and await active_surface.first.is_visible():
+            return active_surface.first
+        snapshot = await BrowserDomSnapshotter().capture(page)
+        if snapshot.active_surface:
+            active_surface = page.locator('[data-job-applier-active-surface="true"]')
+            if await active_surface.count() and await active_surface.first.is_visible():
+                return active_surface.first
         msg = "LinkedIn Easy Apply dialog is not visible."
         raise LinkedInEasyApplyError(msg)
 

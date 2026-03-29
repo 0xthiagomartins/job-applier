@@ -17,8 +17,10 @@ from pydantic import SecretStr
 
 logger = logging.getLogger(__name__)
 
-BrowserActionType = Literal["click", "fill", "wait", "done", "fail"]
+BrowserActionType = Literal["click", "fill", "scroll", "wait", "done", "fail"]
 BrowserValueSource = str
+BrowserScrollTarget = Literal["active_surface", "page"]
+BrowserScrollDirection = Literal["down", "up"]
 PageRequiresLogin = Callable[[Page], Awaitable[bool]]
 PageTaskComplete = Callable[[Page], Awaitable[bool]]
 BrowserAssessmentStatus = Literal[
@@ -35,7 +37,7 @@ STRUCTURED_OUTPUT_SCHEMA = {
     "properties": {
         "action_type": {
             "type": "string",
-            "enum": ["click", "fill", "wait", "done", "fail"],
+            "enum": ["click", "fill", "scroll", "wait", "done", "fail"],
         },
         "element_id": {
             "type": ["string", "null"],
@@ -56,6 +58,25 @@ STRUCTURED_OUTPUT_SCHEMA = {
             "type": ["string", "null"],
             "description": "Short machine-readable intent for the action, when relevant.",
         },
+        "scroll_target": {
+            "type": ["string", "null"],
+            "enum": ["active_surface", "page", None],
+            "description": (
+                "Use active_surface for modal/dialog scrolling and page for background page "
+                "scrolling."
+            ),
+        },
+        "scroll_direction": {
+            "type": ["string", "null"],
+            "enum": ["down", "up", None],
+            "description": "Direction for scroll actions.",
+        },
+        "scroll_amount": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 1600,
+            "description": "Approximate scroll delta in pixels for scroll actions.",
+        },
         "wait_seconds": {
             "type": "integer",
             "minimum": 0,
@@ -72,6 +93,9 @@ STRUCTURED_OUTPUT_SCHEMA = {
         "value_source",
         "value",
         "action_intent",
+        "scroll_target",
+        "scroll_direction",
+        "scroll_amount",
         "wait_seconds",
         "reasoning",
     ],
@@ -165,6 +189,11 @@ class BrowserAgentSnapshot:
     visible_text: str
     elements: tuple[BrowserAgentElement, ...]
     active_surface: str | None = None
+    active_surface_scrollable: bool = False
+    active_surface_can_scroll_down: bool = False
+    active_surface_can_scroll_up: bool = False
+    page_can_scroll_down: bool = False
+    page_can_scroll_up: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +205,9 @@ class BrowserAgentAction:
     value_source: BrowserValueSource | None
     value: str | None
     action_intent: str | None
+    scroll_target: BrowserScrollTarget | None
+    scroll_direction: BrowserScrollDirection | None
+    scroll_amount: int
     wait_seconds: int
     reasoning: str
 
@@ -215,21 +247,321 @@ def has_manual_intervention_cues(snapshot: BrowserAgentSnapshot) -> bool:
 class BrowserDomSnapshotter:
     """Capture a compact, selector-free snapshot of visible interactive controls."""
 
-    def __init__(self, *, max_elements: int = 24, max_visible_text: int = 1_600) -> None:
+    def __init__(self, *, max_elements: int = 32, max_visible_text: int = 1_600) -> None:
         self._max_elements = max_elements
         self._max_visible_text = max_visible_text
 
-    async def capture(self, page: Page) -> BrowserAgentSnapshot:
+    async def capture(
+        self,
+        page: Page,
+        *,
+        focus_locator: Locator | None = None,
+    ) -> BrowserAgentSnapshot:
         """Return the cleaned page snapshot used by the planner."""
 
         title = await page.title()
-        payload = await page.evaluate(
-            """
+        focus_handle = None
+        if focus_locator is not None:
+            try:
+                focus_handle = await focus_locator.first.element_handle()
+            except Exception:  # noqa: BLE001
+                focus_handle = None
+        try:
+            if focus_handle is not None:
+                payload = await focus_handle.evaluate(
+                    """
+                    (focusedNode, { interactiveSelectors, maxElements }) => {
+                      const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                      const isVisible = (node) => {
+                        const style = window.getComputedStyle(node);
+                        const rect = node.getBoundingClientRect();
+                        if (
+                          rect.bottom <= 0 ||
+                          rect.right <= 0 ||
+                          rect.top >= window.innerHeight ||
+                          rect.left >= window.innerWidth
+                        ) {
+                          return false;
+                        }
+                        let ancestor = node.parentElement;
+                        while (ancestor) {
+                          const ancestorStyle = window.getComputedStyle(ancestor);
+                          const overflowY = ancestorStyle.overflowY || ancestorStyle.overflow;
+                          const overflowX = ancestorStyle.overflowX || ancestorStyle.overflow;
+                          const clipsOverflow =
+                            ["auto", "scroll", "hidden", "clip", "overlay"].includes(overflowY)
+                            || ["auto", "scroll", "hidden", "clip", "overlay"].includes(overflowX);
+                          if (clipsOverflow) {
+                            const ancestorRect = ancestor.getBoundingClientRect();
+                            if (
+                              rect.bottom < ancestorRect.top + 1 ||
+                              rect.top > ancestorRect.bottom - 1 ||
+                              rect.right < ancestorRect.left + 1 ||
+                              rect.left > ancestorRect.right - 1
+                            ) {
+                              return false;
+                            }
+                          }
+                          ancestor = ancestor.parentElement;
+                        }
+                        return (
+                          style.visibility !== "hidden" &&
+                          style.display !== "none" &&
+                          rect.width > 0 &&
+                          rect.height > 0
+                        );
+                      };
+                      const labelFor = (node) => {
+                        const labels = Array.from(node.labels || []);
+                        const joined = labels
+                          .map((item) => collapse(item.innerText || item.textContent || ""))
+                          .filter(Boolean)
+                          .join(" ");
+                        if (joined) {
+                          return joined;
+                        }
+                        const id = node.getAttribute("id");
+                        if (!id) {
+                          return "";
+                        }
+                        const label = document.querySelector(`label[for="${id}"]`);
+                        return collapse(label?.innerText || label?.textContent || "");
+                      };
+                      const describeSurface = (node) => {
+                        if (!node) {
+                          return "";
+                        }
+                        const labelledBy = collapse(node.getAttribute("aria-labelledby"));
+                        if (labelledBy) {
+                          const heading = labelledBy
+                            .split(/\\s+/)
+                            .map((id) => document.getElementById(id))
+                            .find(
+                              (item) =>
+                                item && collapse(item.innerText || item.textContent || ""),
+                            );
+                          if (heading) {
+                            return collapse(heading.innerText || heading.textContent || "");
+                          }
+                        }
+                        const ariaLabel = collapse(node.getAttribute("aria-label"));
+                        if (ariaLabel) {
+                          return ariaLabel;
+                        }
+                        const heading = node.querySelector("h1, h2, h3, [role='heading']");
+                        if (heading && collapse(heading.innerText || heading.textContent || "")) {
+                          return collapse(heading.innerText || heading.textContent || "");
+                        }
+                        return collapse(node.innerText || node.textContent || "").slice(0, 120);
+                      };
+                      const isScrollable = (node) => {
+                        const style = window.getComputedStyle(node);
+                        const overflowY = style.overflowY || style.overflow;
+                        return (
+                          ["auto", "scroll", "overlay"].includes(overflowY) &&
+                          node.scrollHeight - node.clientHeight > 24
+                        );
+                      };
+                      const summarizeNode = (node) => {
+                        if (!node || node.nodeType !== 1) {
+                          return "";
+                        }
+                        const tag = (node.tagName || "").toLowerCase();
+                        const pieces = [];
+                        const label = collapse(node.getAttribute("aria-label")) || labelFor(node);
+                        const placeholder = collapse(node.getAttribute("placeholder"));
+                        const role = collapse(node.getAttribute("role"));
+                        const nodeText = collapse(node.innerText || node.textContent || "");
+                        const currentValue = collapse(node.value);
+                        if (tag === "button" || role === "button") {
+                          pieces.push(label || nodeText);
+                        } else if (tag === "select") {
+                          pieces.push(label, currentValue || nodeText);
+                        } else if (tag === "input" || tag === "textarea") {
+                          pieces.push(label, currentValue || placeholder);
+                        } else {
+                          pieces.push(label, nodeText || placeholder);
+                        }
+                        return collapse(pieces.filter(Boolean).join(" "));
+                      };
+                      document
+                        .querySelectorAll("[data-job-applier-agent-id]")
+                        .forEach((node) => node.removeAttribute("data-job-applier-agent-id"));
+                      document
+                        .querySelectorAll("[data-job-applier-active-surface-scroll-target]")
+                        .forEach((node) =>
+                          node.removeAttribute("data-job-applier-active-surface-scroll-target"),
+                        );
+                      document
+                        .querySelectorAll("[data-job-applier-active-surface]")
+                        .forEach((node) => node.removeAttribute("data-job-applier-active-surface"));
+                      const activeSurface = focusedNode && focusedNode.nodeType === 1
+                        ? {
+                            node: focusedNode,
+                            label: describeSurface(focusedNode),
+                          }
+                        : null;
+                      if (activeSurface) {
+                        activeSurface.node.setAttribute("data-job-applier-active-surface", "true");
+                      }
+                      const findActiveScrollTarget = (surfaceNode) => {
+                        const candidates = [
+                          surfaceNode,
+                          ...Array.from(surfaceNode.querySelectorAll("*")),
+                        ]
+                          .filter(isVisible)
+                          .filter(isScrollable)
+                          .map((node, index) => {
+                            const rect = node.getBoundingClientRect();
+                            return {
+                              node,
+                              index,
+                              area: rect.width * rect.height,
+                              remainingScroll: Math.max(0, node.scrollHeight - node.clientHeight),
+                            };
+                          })
+                          .sort((left, right) => {
+                            if (left.area !== right.area) {
+                              return right.area - left.area;
+                            }
+                            if (left.remainingScroll !== right.remainingScroll) {
+                              return right.remainingScroll - left.remainingScroll;
+                            }
+                            return left.index - right.index;
+                          });
+                        return candidates[0]?.node || null;
+                      };
+                      const activeScrollTarget = activeSurface
+                        ? findActiveScrollTarget(activeSurface.node)
+                        : null;
+                      if (activeScrollTarget) {
+                        activeScrollTarget.setAttribute(
+                          "data-job-applier-active-surface-scroll-target",
+                          "true",
+                        );
+                      }
+                      const nodes = activeSurface
+                        ? Array.from(activeSurface.node.querySelectorAll(interactiveSelectors))
+                            .filter((node) => node && node.nodeType === 1)
+                            .filter(isVisible)
+                            .filter((node, index, collection) => collection.indexOf(node) === index)
+                            .sort((left, right) => {
+                              const leftRect = left.getBoundingClientRect();
+                              const rightRect = right.getBoundingClientRect();
+                              if (Math.abs(leftRect.top - rightRect.top) > 4) {
+                                return leftRect.top - rightRect.top;
+                              }
+                              return leftRect.left - rightRect.left;
+                            })
+                        : [];
+                      const items = [];
+                      let counter = 1;
+
+                      for (const node of nodes) {
+                        const elementId = `agent-${counter}`;
+                        counter += 1;
+                        node.setAttribute("data-job-applier-agent-id", elementId);
+                        items.push({
+                          element_id: elementId,
+                          tag: node.tagName.toLowerCase(),
+                          role: collapse(node.getAttribute("role")),
+                          label: collapse(node.getAttribute("aria-label")) || labelFor(node),
+                          text: collapse(node.innerText || node.textContent || ""),
+                          placeholder: collapse(node.getAttribute("placeholder")),
+                          name: collapse(node.getAttribute("name")),
+                          input_type: collapse(node.getAttribute("type")),
+                          href: collapse(node.getAttribute("href")),
+                          current_value: collapse(node.value),
+                          disabled: Boolean(
+                            node.disabled || node.getAttribute("aria-disabled") === "true",
+                          ),
+                        });
+                        if (items.length >= maxElements) {
+                          break;
+                        }
+                      }
+
+                      const visibleText = collapse(
+                        activeSurface
+                          ? [
+                              describeSurface(activeSurface.node),
+                              ...nodes.map(summarizeNode).filter(Boolean),
+                            ].join(" ")
+                          : (document.body?.innerText || ""),
+                      );
+                      const pageScrollTop =
+                        window.scrollY
+                        || document.documentElement.scrollTop
+                        || document.body.scrollTop
+                        || 0;
+                      const pageScrollHeight = Math.max(
+                        document.documentElement.scrollHeight || 0,
+                        document.body?.scrollHeight || 0,
+                      );
+                      const pageClientHeight =
+                        window.innerHeight || document.documentElement.clientHeight || 0;
+                      return {
+                        visible_text: visibleText,
+                        elements: items,
+                        active_surface: activeSurface ? activeSurface.label : "",
+                        active_surface_scrollable: Boolean(activeScrollTarget),
+                        active_surface_can_scroll_down: activeScrollTarget
+                          ? (
+                            activeScrollTarget.scrollTop + activeScrollTarget.clientHeight
+                            < activeScrollTarget.scrollHeight - 8
+                          )
+                          : false,
+                        active_surface_can_scroll_up: activeScrollTarget
+                          ? activeScrollTarget.scrollTop > 8
+                          : false,
+                        page_can_scroll_down:
+                          pageScrollTop + pageClientHeight < pageScrollHeight - 8,
+                        page_can_scroll_up: pageScrollTop > 8,
+                      };
+                    }
+                    """,
+                    {
+                        "interactiveSelectors": INTERACTIVE_SELECTORS,
+                        "maxElements": self._max_elements,
+                    },
+                )
+            else:
+                payload = await page.evaluate(
+                    """
             ({ interactiveSelectors, maxElements }) => {
               const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
               const isVisible = (node) => {
                 const style = window.getComputedStyle(node);
                 const rect = node.getBoundingClientRect();
+                if (
+                  rect.bottom <= 0 ||
+                  rect.right <= 0 ||
+                  rect.top >= window.innerHeight ||
+                  rect.left >= window.innerWidth
+                ) {
+                  return false;
+                }
+                let ancestor = node.parentElement;
+                while (ancestor) {
+                  const ancestorStyle = window.getComputedStyle(ancestor);
+                  const overflowY = ancestorStyle.overflowY || ancestorStyle.overflow;
+                  const overflowX = ancestorStyle.overflowX || ancestorStyle.overflow;
+                  const clipsOverflow =
+                    ["auto", "scroll", "hidden", "clip", "overlay"].includes(overflowY)
+                    || ["auto", "scroll", "hidden", "clip", "overlay"].includes(overflowX);
+                  if (clipsOverflow) {
+                    const ancestorRect = ancestor.getBoundingClientRect();
+                    if (
+                      rect.bottom < ancestorRect.top + 1 ||
+                      rect.top > ancestorRect.bottom - 1 ||
+                      rect.right < ancestorRect.left + 1 ||
+                      rect.left > ancestorRect.right - 1
+                    ) {
+                      return false;
+                    }
+                  }
+                  ancestor = ancestor.parentElement;
+                }
                 return (
                   style.visibility !== "hidden" &&
                   style.display !== "none" &&
@@ -277,12 +609,38 @@ class BrowserDomSnapshotter:
                 }
                 return collapse(node.innerText || node.textContent || "").slice(0, 120);
               };
+              const isScrollable = (node) => {
+                const style = window.getComputedStyle(node);
+                const overflowY = style.overflowY || style.overflow;
+                return (
+                  ["auto", "scroll", "overlay"].includes(overflowY) &&
+                  node.scrollHeight - node.clientHeight > 24
+                );
+              };
+              document
+                .querySelectorAll("[data-job-applier-agent-id]")
+                .forEach((node) => node.removeAttribute("data-job-applier-agent-id"));
+              document
+                .querySelectorAll("[data-job-applier-active-surface-scroll-target]")
+                .forEach((node) =>
+                  node.removeAttribute("data-job-applier-active-surface-scroll-target"),
+                );
+              document
+                .querySelectorAll("[data-job-applier-active-surface]")
+                .forEach((node) => node.removeAttribute("data-job-applier-active-surface"));
               const surfaceSelectors = [
                 "dialog[open]",
                 "[role='dialog'][open]",
                 "[role='dialog']",
                 "[aria-modal='true']",
                 "[data-testid='dialog']",
+              ].join(", ");
+              const mainSelectors = [
+                "main",
+                "[role='main']",
+                "#main",
+                "[data-testid='main']",
+                "article",
               ].join(", ");
               const visibleSurfaces = Array.from(document.querySelectorAll(surfaceSelectors))
                 .filter(isVisible)
@@ -307,8 +665,60 @@ class BrowserDomSnapshotter:
                   }
                   return right.index - left.index;
                 });
-              const activeSurface = visibleSurfaces[0] || null;
-              const scopeRoot = activeSurface ? activeSurface.node : document;
+              const focusedSurfaceNode =
+                null;
+              const focusedSurfaceRect = focusedSurfaceNode
+                ? focusedSurfaceNode.getBoundingClientRect()
+                : null;
+              const activeSurface = focusedSurfaceNode && isVisible(focusedSurfaceNode)
+                ? {
+                    node: focusedSurfaceNode,
+                    index: -1,
+                    area: focusedSurfaceRect
+                      ? focusedSurfaceRect.width * focusedSurfaceRect.height
+                      : 0,
+                    zIndex: Number.MAX_SAFE_INTEGER,
+                    label: describeSurface(focusedSurfaceNode),
+                  }
+                : (visibleSurfaces[0] || null);
+              if (activeSurface) {
+                activeSurface.node.setAttribute("data-job-applier-active-surface", "true");
+              }
+              const findActiveScrollTarget = (surfaceNode) => {
+                const candidates = [surfaceNode, ...Array.from(surfaceNode.querySelectorAll("*"))]
+                  .filter(isVisible)
+                  .filter(isScrollable)
+                  .map((node, index) => {
+                    const rect = node.getBoundingClientRect();
+                    return {
+                      node,
+                      index,
+                      area: rect.width * rect.height,
+                      remainingScroll: Math.max(0, node.scrollHeight - node.clientHeight),
+                    };
+                  })
+                  .sort((left, right) => {
+                    if (left.area !== right.area) {
+                      return right.area - left.area;
+                    }
+                    if (left.remainingScroll !== right.remainingScroll) {
+                      return right.remainingScroll - left.remainingScroll;
+                    }
+                    return left.index - right.index;
+                  });
+                return candidates[0]?.node || null;
+              };
+              const activeScrollTarget = activeSurface
+                ? findActiveScrollTarget(activeSurface.node)
+                : null;
+              if (activeScrollTarget) {
+                activeScrollTarget.setAttribute(
+                  "data-job-applier-active-surface-scroll-target",
+                  "true",
+                );
+              }
+              const mainRoot = document.querySelector(mainSelectors);
+              const scopeRoot = activeSurface ? activeSurface.node : (mainRoot || document);
               const nodes = Array.from(scopeRoot.querySelectorAll(interactiveSelectors));
               const items = [];
               let counter = 1;
@@ -341,18 +751,44 @@ class BrowserDomSnapshotter:
               const visibleText = collapse(
                 activeSurface ? activeSurface.node.innerText : (document.body?.innerText || ""),
               );
+              const pageScrollTop =
+                window.scrollY
+                || document.documentElement.scrollTop
+                || document.body.scrollTop
+                || 0;
+              const pageScrollHeight = Math.max(
+                document.documentElement.scrollHeight || 0,
+                document.body?.scrollHeight || 0,
+              );
+              const pageClientHeight =
+                window.innerHeight || document.documentElement.clientHeight || 0;
               return {
                 visible_text: visibleText,
                 elements: items,
                 active_surface: activeSurface ? activeSurface.label : "",
+                active_surface_scrollable: Boolean(activeScrollTarget),
+                active_surface_can_scroll_down: activeScrollTarget
+                  ? (
+                    activeScrollTarget.scrollTop + activeScrollTarget.clientHeight
+                    < activeScrollTarget.scrollHeight - 8
+                  )
+                  : false,
+                active_surface_can_scroll_up: activeScrollTarget
+                  ? activeScrollTarget.scrollTop > 8
+                  : false,
+                page_can_scroll_down: pageScrollTop + pageClientHeight < pageScrollHeight - 8,
+                page_can_scroll_up: pageScrollTop > 8,
               };
             }
             """,
-            {
-                "interactiveSelectors": INTERACTIVE_SELECTORS,
-                "maxElements": self._max_elements,
-            },
-        )
+                    {
+                        "interactiveSelectors": INTERACTIVE_SELECTORS,
+                        "maxElements": self._max_elements,
+                    },
+                )
+        finally:
+            if focus_handle is not None:
+                await focus_handle.dispose()
         raw_payload = cast(dict[str, object], payload)
         raw_elements_payload = raw_payload.get("elements", ())
         raw_elements = raw_elements_payload if isinstance(raw_elements_payload, list) else []
@@ -382,6 +818,11 @@ class BrowserDomSnapshotter:
             ),
             elements=elements,
             active_surface=_optional_text(raw_payload.get("active_surface")),
+            active_surface_scrollable=bool(raw_payload.get("active_surface_scrollable")),
+            active_surface_can_scroll_down=bool(raw_payload.get("active_surface_can_scroll_down")),
+            active_surface_can_scroll_up=bool(raw_payload.get("active_surface_can_scroll_up")),
+            page_can_scroll_down=bool(raw_payload.get("page_can_scroll_down")),
+            page_can_scroll_up=bool(raw_payload.get("page_can_scroll_up")),
         )
 
 
@@ -560,10 +1001,11 @@ class OpenAIResponsesBrowserAgent:
         extra_rules: Sequence[str] = (),
         recent_actions: Sequence[dict[str, object]] = (),
         step_index: int = 0,
+        focus_locator: Locator | None = None,
     ) -> BrowserTaskAssessment:
         """Return a structured assessment of the current browser state."""
 
-        snapshot = await self._snapshotter.capture(page)
+        snapshot = await self._snapshotter.capture(page, focus_locator=focus_locator)
         if has_manual_intervention_cues(snapshot):
             return BrowserTaskAssessment(
                 status="manual_intervention",
@@ -608,13 +1050,14 @@ class OpenAIResponsesBrowserAgent:
         allowed_action_types: Sequence[BrowserActionType] | None = None,
         recent_actions: Sequence[dict[str, object]] = (),
         step_index: int = 0,
+        focus_locator: Locator | None = None,
     ) -> BrowserAgentAction:
         """Plan and execute one browser action for the current page state."""
 
         feedback_history: list[dict[str, object]] = []
         history = list(recent_actions)
         for attempt_index in range(3):
-            snapshot = await self._snapshotter.capture(page)
+            snapshot = await self._snapshotter.capture(page, focus_locator=focus_locator)
             action = await self._plan_action(
                 snapshot=snapshot,
                 goal=goal,
@@ -759,6 +1202,11 @@ class OpenAIResponsesBrowserAgent:
                 "url": snapshot.url,
                 "title": snapshot.title,
                 "active_surface": snapshot.active_surface,
+                "active_surface_scrollable": snapshot.active_surface_scrollable,
+                "active_surface_can_scroll_down": snapshot.active_surface_can_scroll_down,
+                "active_surface_can_scroll_up": snapshot.active_surface_can_scroll_up,
+                "page_can_scroll_down": snapshot.page_can_scroll_down,
+                "page_can_scroll_up": snapshot.page_can_scroll_up,
                 "visible_text": snapshot.visible_text,
                 "elements": elements_payload,
             },
@@ -773,8 +1221,28 @@ class OpenAIResponsesBrowserAgent:
                 "Return exactly one next action.",
                 "Only reference element ids that exist in the page snapshot.",
                 (
+                    "The element list is already ordered by visible position inside the active "
+                    "surface or page. Prefer that list over guessing from broad page text."
+                ),
+                (
                     "If page.active_surface is present, treat it as the current blocking "
                     "surface and prioritize actions inside it over the dimmed background."
+                ),
+                (
+                    "Use scroll when the needed control is likely outside the visible portion "
+                    "of the current page or active surface."
+                ),
+                (
+                    "If page.active_surface_scrollable is true, prefer scroll_target "
+                    "active_surface before scrolling the full page."
+                ),
+                (
+                    "If a visible control already appears to advance, continue, review, or "
+                    "submit the current goal, click it instead of scrolling again."
+                ),
+                (
+                    "Do not repeat the same failed click on an unchanged screen when scrolling "
+                    "could reveal more content."
                 ),
                 "Use literal for plain text that is not sensitive.",
                 (
@@ -887,6 +1355,11 @@ class OpenAIResponsesBrowserAgent:
                 "url": snapshot.url,
                 "title": snapshot.title,
                 "active_surface": snapshot.active_surface,
+                "active_surface_scrollable": snapshot.active_surface_scrollable,
+                "active_surface_can_scroll_down": snapshot.active_surface_can_scroll_down,
+                "active_surface_can_scroll_up": snapshot.active_surface_can_scroll_up,
+                "page_can_scroll_down": snapshot.page_can_scroll_down,
+                "page_can_scroll_up": snapshot.page_can_scroll_up,
                 "visible_text": snapshot.visible_text,
                 "elements": elements_payload,
             },
@@ -1013,6 +1486,11 @@ class OpenAIResponsesBrowserAgent:
         if action.action_type == "fail":
             msg = action.reasoning or "Browser agent reported that no safe action was available."
             raise BrowserAutomationError(msg)
+        if action.action_type == "scroll":
+            await self._pause_before_click(page)
+            await self._execute_scroll(page, action)
+            await page.wait_for_timeout(350)
+            return
 
         locator = self._locator_for_action(page, action)
         try:
@@ -1030,6 +1508,36 @@ class OpenAIResponsesBrowserAgent:
                 await locator.fill(value)
                 await page.wait_for_timeout(350)
                 return
+        except Exception as exc:  # noqa: BLE001
+            msg = summarize_browser_action_error(exc)
+            raise BrowserAutomationError(msg) from exc
+
+    async def _execute_scroll(self, page: Page, action: BrowserAgentAction) -> None:
+        direction = action.scroll_direction or "down"
+        amount = max(100, min(1_600, action.scroll_amount or 550))
+        delta = amount if direction == "down" else -amount
+        try:
+            if action.scroll_target == "active_surface":
+                locator = page.locator(
+                    '[data-job-applier-active-surface-scroll-target="true"]'
+                ).first
+                if await locator.count() == 0:
+                    msg = "No scrollable active surface is available for the requested action."
+                    raise BrowserAutomationError(msg)
+                await locator.evaluate(
+                    """
+                    (node, scrollDelta) => {
+                      if (node && node.nodeType === 1 && typeof node.scrollBy === "function") {
+                        node.scrollBy({ top: scrollDelta, behavior: "instant" });
+                      }
+                    }
+                    """,
+                    delta,
+                )
+                return
+            await page.mouse.wheel(0, delta)
+        except BrowserAutomationError:
+            raise
         except Exception as exc:  # noqa: BLE001
             msg = summarize_browser_action_error(exc)
             raise BrowserAutomationError(msg) from exc
@@ -1084,6 +1592,44 @@ class OpenAIResponsesBrowserAgent:
         if action.action_type in {"click", "fill"} and action.element_id not in valid_element_ids:
             msg = "Browser agent referenced an element that does not exist in the snapshot."
             raise BrowserAutomationError(msg)
+        if action.action_type == "scroll":
+            if action.scroll_target not in {"active_surface", "page"}:
+                msg = "Browser agent returned scroll without a valid scroll_target."
+                raise BrowserAutomationError(msg)
+            if action.scroll_direction not in {"down", "up"}:
+                msg = "Browser agent returned scroll without a valid scroll_direction."
+                raise BrowserAutomationError(msg)
+            if action.scroll_target == "active_surface" and not snapshot.active_surface_scrollable:
+                msg = "Browser agent tried to scroll an active surface that is not scrollable."
+                raise BrowserAutomationError(msg)
+            if (
+                action.scroll_target == "active_surface"
+                and action.scroll_direction == "down"
+                and not snapshot.active_surface_can_scroll_down
+            ):
+                msg = "Browser agent tried to scroll down an active surface with no room below."
+                raise BrowserAutomationError(msg)
+            if (
+                action.scroll_target == "active_surface"
+                and action.scroll_direction == "up"
+                and not snapshot.active_surface_can_scroll_up
+            ):
+                msg = "Browser agent tried to scroll up an active surface with no room above."
+                raise BrowserAutomationError(msg)
+            if (
+                action.scroll_target == "page"
+                and action.scroll_direction == "down"
+                and not snapshot.page_can_scroll_down
+            ):
+                msg = "Browser agent tried to scroll down the page with no room below."
+                raise BrowserAutomationError(msg)
+            if (
+                action.scroll_target == "page"
+                and action.scroll_direction == "up"
+                and not snapshot.page_can_scroll_up
+            ):
+                msg = "Browser agent tried to scroll up the page with no room above."
+                raise BrowserAutomationError(msg)
         if action.action_type == "fill" and action.value_source is None:
             msg = "Browser agent returned fill without a value_source."
             raise BrowserAutomationError(msg)
@@ -1099,7 +1645,7 @@ def parse_browser_action(payload: dict[str, object]) -> BrowserAgentAction:
     """Validate the structured action returned by the browser planner."""
 
     action_type = payload.get("action_type")
-    if action_type not in {"click", "fill", "wait", "done", "fail"}:
+    if action_type not in {"click", "fill", "scroll", "wait", "done", "fail"}:
         msg = "Browser agent returned an unsupported action_type."
         raise BrowserAutomationError(msg)
 
@@ -1107,6 +1653,26 @@ def parse_browser_action(payload: dict[str, object]) -> BrowserAgentAction:
     if value_source is not None and not isinstance(value_source, str):
         msg = "Browser agent returned an unsupported value_source."
         raise BrowserAutomationError(msg)
+
+    scroll_target = payload.get("scroll_target")
+    if scroll_target is not None and scroll_target not in {"active_surface", "page"}:
+        msg = "Browser agent returned an unsupported scroll_target."
+        raise BrowserAutomationError(msg)
+
+    scroll_direction = payload.get("scroll_direction")
+    if scroll_direction is not None and scroll_direction not in {"down", "up"}:
+        msg = "Browser agent returned an unsupported scroll_direction."
+        raise BrowserAutomationError(msg)
+
+    scroll_amount_raw = payload.get("scroll_amount", 550)
+    if not isinstance(scroll_amount_raw, (int, float, str)):
+        msg = "Browser agent returned an invalid scroll_amount value."
+        raise BrowserAutomationError(msg)
+    try:
+        scroll_amount = int(scroll_amount_raw)
+    except (TypeError, ValueError) as exc:
+        msg = "Browser agent returned an invalid scroll_amount value."
+        raise BrowserAutomationError(msg) from exc
 
     wait_seconds_raw = payload.get("wait_seconds", 0)
     if not isinstance(wait_seconds_raw, (int, float, str)):
@@ -1124,6 +1690,9 @@ def parse_browser_action(payload: dict[str, object]) -> BrowserAgentAction:
         value_source=_optional_text(value_source),
         value=_optional_text(payload.get("value")),
         action_intent=_optional_text(payload.get("action_intent")),
+        scroll_target=cast(BrowserScrollTarget | None, _optional_text(scroll_target)),
+        scroll_direction=cast(BrowserScrollDirection | None, _optional_text(scroll_direction)),
+        scroll_amount=max(100, min(1_600, scroll_amount)),
         wait_seconds=max(0, wait_seconds),
         reasoning=str(payload.get("reasoning") or "").strip(),
     )

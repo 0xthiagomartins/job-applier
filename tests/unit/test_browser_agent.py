@@ -1,5 +1,10 @@
+import asyncio
+
+from playwright.async_api import async_playwright
+
 from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserAgentSnapshot,
+    BrowserDomSnapshotter,
     has_manual_intervention_cues,
     parse_browser_action,
     parse_browser_task_assessment,
@@ -44,6 +49,28 @@ def test_parse_browser_action_accepts_task_specific_value_source() -> None:
     assert action.value_source == "search_keywords"
 
 
+def test_parse_browser_action_accepts_surface_scroll_payload() -> None:
+    action = parse_browser_action(
+        {
+            "action_type": "scroll",
+            "element_id": None,
+            "value_source": None,
+            "value": None,
+            "action_intent": "reveal_primary_cta",
+            "scroll_target": "active_surface",
+            "scroll_direction": "down",
+            "scroll_amount": 640,
+            "wait_seconds": 0,
+            "reasoning": "The modal can scroll down and the primary next action is likely below.",
+        }
+    )
+
+    assert action.action_type == "scroll"
+    assert action.scroll_target == "active_surface"
+    assert action.scroll_direction == "down"
+    assert action.scroll_amount == 640
+
+
 def test_manual_intervention_detection_flags_captcha_and_otp_pages() -> None:
     snapshot = BrowserAgentSnapshot(
         url="https://www.linkedin.com/checkpoint/challenge/",
@@ -77,3 +104,67 @@ def test_summarize_browser_action_error_normalizes_overlay_interception() -> Non
     )
 
     assert message == "The chosen target is blocked by an open dialog or overlay."
+
+
+def test_browser_dom_snapshotter_focus_locator_prioritizes_visible_modal_controls() -> None:
+    async def scenario() -> None:
+        snapshotter = BrowserDomSnapshotter(max_elements=12, max_visible_text=600)
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                await page.set_content(
+                    """
+                    <style>
+                      body { margin: 0; font-family: sans-serif; }
+                      .background { height: 1600px; padding: 24px; }
+                      .dialog {
+                        position: fixed;
+                        inset: 80px auto auto 120px;
+                        width: 520px;
+                        background: white;
+                        border: 1px solid #ddd;
+                        z-index: 20;
+                      }
+                      .modal-body {
+                        height: 220px;
+                        overflow-y: auto;
+                        padding: 16px;
+                      }
+                    </style>
+                    <div class="background">
+                      <button aria-label="Background action">Background action</button>
+                    </div>
+                    <div class="dialog" role="dialog" aria-label="Apply to Example Corp">
+                      <div class="modal-body">
+                        <label for="phone">Phone number</label>
+                        <input id="phone" aria-label="Phone number" value="" />
+                        <div style="height: 520px;"></div>
+                        <button aria-label="Continue to next step">Next</button>
+                      </div>
+                    </div>
+                    """
+                )
+                root = page.locator('[role="dialog"]')
+                before = await snapshotter.capture(page, focus_locator=root)
+                assert before.active_surface == "Apply to Example Corp"
+                assert before.active_surface_scrollable is True
+                assert before.active_surface_can_scroll_down is True
+                assert all(element.label != "Background action" for element in before.elements)
+
+                await page.locator(
+                    '[data-job-applier-active-surface-scroll-target="true"]'
+                ).evaluate(
+                    "(node) => node.scrollTo({ top: node.scrollHeight, behavior: 'instant' })"
+                )
+
+                after = await snapshotter.capture(page, focus_locator=root)
+                assert any(
+                    element.label == "Continue to next step" or element.text == "Next"
+                    for element in after.elements
+                )
+                assert "Continue to next step" in after.visible_text or "Next" in after.visible_text
+            finally:
+                await browser.close()
+
+    asyncio.run(scenario())
