@@ -15,9 +15,12 @@ from pydantic import SecretStr
 from job_applier.infrastructure.linkedin.browser_agent import OpenAIResponsesBrowserAgent
 from job_applier.infrastructure.linkedin.playwright_mcp import (
     OpenAIResponsesPlaywrightMcpAgent,
+    PlaywrightMcpClient,
     PlaywrightMcpError,
     PlaywrightMcpHttpClient,
     PlaywrightMcpSessionNotFoundError,
+    PlaywrightMcpStdioClient,
+    is_local_playwright_mcp_url,
 )
 from job_applier.observability import append_output_jsonl
 
@@ -48,6 +51,8 @@ class LinkedInSessionManager:
         ai_api_key: SecretStr | None = None,
         ai_model: str = "o3-mini",
         playwright_mcp_url: str | None = None,
+        playwright_mcp_prefer_stdio_for_local: bool = True,
+        playwright_mcp_stdio_command: tuple[str, ...] | None = None,
     ) -> None:
         self._credentials = credentials
         self._storage_state_path = storage_state_path
@@ -55,6 +60,8 @@ class LinkedInSessionManager:
         self._ai_api_key = ai_api_key
         self._ai_model = ai_model
         self._playwright_mcp_url = playwright_mcp_url
+        self._playwright_mcp_prefer_stdio_for_local = playwright_mcp_prefer_stdio_for_local
+        self._playwright_mcp_stdio_command = playwright_mcp_stdio_command
 
     async def create_authenticated_context(self, browser: Browser) -> BrowserContext:
         """Return an authenticated context, reusing saved session state when valid."""
@@ -181,12 +188,17 @@ class LinkedInSessionManager:
             model=self._ai_model,
         )
 
+        if self._should_use_playwright_mcp_stdio():
+            await self._login_via_mcp_client(
+                self._create_playwright_mcp_client(force_stdio=True),
+                agent=agent,
+                mode="stdio",
+            )
+            return
+
         last_error: PlaywrightMcpError | None = None
         for attempt in range(3):
-            client = PlaywrightMcpHttpClient(
-                base_url=self._playwright_mcp_url,
-                timeout_seconds=self._login_timeout_seconds,
-            )
+            client = self._create_playwright_mcp_client(force_stdio=False)
             append_output_jsonl(
                 "mcp/login-attempts.jsonl",
                 {
@@ -194,26 +206,18 @@ class LinkedInSessionManager:
                     "event": "attempt_started",
                     "base_url": self._playwright_mcp_url,
                     "model": self._ai_model,
+                    "mode": "http",
                 },
             )
             try:
-                await client.navigate("https://www.linkedin.com/login")
-                await agent.complete_linkedin_login(
-                    client=client,
-                    credentials={
-                        "linkedin_email": self._credentials.email,
-                        "linkedin_password": self._credentials.password.get_secret_value(),
-                    },
-                    timeout_seconds=self._login_timeout_seconds,
-                )
-                self._storage_state_path.parent.mkdir(parents=True, exist_ok=True)
-                await client.save_storage_state(self._storage_state_path)
+                await self._run_playwright_mcp_login_attempt(client=client, agent=agent)
                 append_output_jsonl(
                     "mcp/login-attempts.jsonl",
                     {
                         "attempt": attempt + 1,
                         "event": "attempt_completed",
                         "storage_state_path": str(self._storage_state_path),
+                        "mode": "http",
                     },
                 )
                 return
@@ -229,6 +233,7 @@ class LinkedInSessionManager:
                         "attempt": attempt + 1,
                         "event": "session_not_found",
                         "message": str(exc),
+                        "mode": "http",
                     },
                 )
                 if attempt == 2:
@@ -240,6 +245,7 @@ class LinkedInSessionManager:
                         "attempt": attempt + 1,
                         "event": "attempt_failed",
                         "message": str(exc),
+                        "mode": "http",
                     },
                 )
                 raise LinkedInAuthError(str(exc)) from exc
@@ -247,9 +253,104 @@ class LinkedInSessionManager:
                 await client.close_browser()
                 await client.shutdown()
 
+        if (
+            last_error is not None
+            and self._playwright_mcp_url is not None
+            and is_local_playwright_mcp_url(self._playwright_mcp_url)
+            and self._playwright_mcp_stdio_command
+        ):
+            append_output_jsonl(
+                "mcp/login-attempts.jsonl",
+                {
+                    "event": "fallback_to_stdio",
+                    "message": str(last_error),
+                    "command": list(self._playwright_mcp_stdio_command),
+                },
+            )
+            await self._login_via_mcp_client(
+                self._create_playwright_mcp_client(force_stdio=True),
+                agent=agent,
+                mode="stdio",
+            )
+            return
+
         if last_error is not None:
             raise LinkedInAuthError(str(last_error)) from last_error
         raise LinkedInAuthError("Playwright MCP login failed unexpectedly.")
+
+    async def _login_via_mcp_client(
+        self,
+        client: PlaywrightMcpClient,
+        *,
+        agent: OpenAIResponsesPlaywrightMcpAgent,
+        mode: str,
+    ) -> None:
+        append_output_jsonl(
+            "mcp/login-attempts.jsonl",
+            {
+                "attempt": 1,
+                "event": "attempt_started",
+                "base_url": self._playwright_mcp_url,
+                "model": self._ai_model,
+                "mode": mode,
+            },
+        )
+        try:
+            await self._run_playwright_mcp_login_attempt(client=client, agent=agent)
+            append_output_jsonl(
+                "mcp/login-attempts.jsonl",
+                {
+                    "attempt": 1,
+                    "event": "attempt_completed",
+                    "storage_state_path": str(self._storage_state_path),
+                    "mode": mode,
+                },
+            )
+            return
+        finally:
+            await client.close_browser()
+            await client.shutdown()
+
+    async def _run_playwright_mcp_login_attempt(
+        self,
+        *,
+        client: PlaywrightMcpClient,
+        agent: OpenAIResponsesPlaywrightMcpAgent,
+    ) -> None:
+        await client.navigate("https://www.linkedin.com/login")
+        await agent.complete_linkedin_login(
+            client=client,
+            credentials={
+                "linkedin_email": self._credentials.email,
+                "linkedin_password": self._credentials.password.get_secret_value(),
+            },
+            timeout_seconds=self._login_timeout_seconds,
+        )
+        self._storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+        await client.save_storage_state(self._storage_state_path)
+
+    def _create_playwright_mcp_client(self, *, force_stdio: bool) -> PlaywrightMcpClient:
+        if force_stdio:
+            command = self._playwright_mcp_stdio_command
+            if not command:
+                msg = "Playwright MCP stdio command is not configured."
+                raise LinkedInAuthError(msg)
+            return PlaywrightMcpStdioClient(
+                command=command,
+                timeout_seconds=self._login_timeout_seconds,
+            )
+        assert self._playwright_mcp_url is not None
+        return PlaywrightMcpHttpClient(
+            base_url=self._playwright_mcp_url,
+            timeout_seconds=self._login_timeout_seconds,
+        )
+
+    def _should_use_playwright_mcp_stdio(self) -> bool:
+        if not self._playwright_mcp_prefer_stdio_for_local:
+            return False
+        if self._playwright_mcp_url is None or not self._playwright_mcp_stdio_command:
+            return False
+        return is_local_playwright_mcp_url(self._playwright_mcp_url)
 
     async def _wait_until_authenticated(self, page: Page) -> None:
         """Wait for the login flow to complete, including manual captcha handling."""

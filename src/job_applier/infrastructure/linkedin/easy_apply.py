@@ -1094,6 +1094,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 if self._runtime_settings.playwright_mcp_url is not None
                 else None
             ),
+            playwright_mcp_prefer_stdio_for_local=(
+                self._runtime_settings.playwright_mcp_prefer_stdio_for_local
+            ),
+            playwright_mcp_stdio_command=(
+                self._runtime_settings.resolved_playwright_mcp_stdio_command
+            ),
         )
         return self._session_manager
 

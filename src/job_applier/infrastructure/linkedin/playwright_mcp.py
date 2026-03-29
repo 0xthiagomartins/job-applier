@@ -6,10 +6,10 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, Protocol, cast
 from urllib import error, parse, request
 
 from pydantic import SecretStr
@@ -99,6 +99,44 @@ class PlaywrightMcpAction:
     reasoning: str
 
 
+class PlaywrightMcpClient(Protocol):
+    """Minimal browser control contract shared by HTTP and stdio transports."""
+
+    async def initialize(self) -> None:
+        """Prepare the transport session."""
+
+    async def shutdown(self) -> None:
+        """Tear down the transport session."""
+
+    async def navigate(self, url: str) -> None:
+        """Navigate the browser to one URL."""
+
+    async def snapshot(self) -> str:
+        """Return the current accessibility snapshot."""
+
+    async def click(self, *, ref: str, element: str | None = None) -> None:
+        """Click one snapshot ref."""
+
+    async def type(
+        self,
+        *,
+        ref: str,
+        text: str,
+        element: str | None = None,
+        submit: bool = False,
+    ) -> None:
+        """Type text into one snapshot ref."""
+
+    async def wait(self, *, seconds: int) -> None:
+        """Wait in the remote browser."""
+
+    async def save_storage_state(self, path: Path) -> None:
+        """Export storage state."""
+
+    async def close_browser(self) -> None:
+        """Close the remote browser."""
+
+
 def normalize_playwright_mcp_url(url: str) -> str:
     """Normalize root URLs so the Python client always talks to `/mcp`."""
 
@@ -125,6 +163,13 @@ def normalize_playwright_mcp_url(url: str) -> str:
         path = f"{path}/mcp"
     rebuilt = parsed._replace(path=path, params="", query="", fragment="")
     return parse.urlunparse(rebuilt)
+
+
+def is_local_playwright_mcp_url(url: str) -> bool:
+    """Return whether the configured MCP endpoint points to the local machine."""
+
+    parsed = parse.urlparse(normalize_playwright_mcp_url(url))
+    return (parsed.hostname or "").lower() in {"localhost", "127.0.0.1", "0.0.0.0"}
 
 
 def collapse_text(value: str | None) -> str:
@@ -441,6 +486,274 @@ class PlaywrightMcpHttpClient:
         return self._request_id
 
 
+class PlaywrightMcpStdioClient:
+    """Subprocess-backed MCP client that avoids the flaky local HTTP session transport."""
+
+    def __init__(
+        self,
+        *,
+        command: Sequence[str],
+        timeout_seconds: int = 30,
+    ) -> None:
+        if not command:
+            msg = "Playwright MCP stdio command cannot be empty."
+            raise ValueError(msg)
+        self._command = tuple(command)
+        self._timeout_seconds = timeout_seconds
+        self._process: asyncio.subprocess.Process | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
+        self._initialized = False
+        self._request_id = 0
+
+    async def initialize(self) -> None:
+        """Launch the subprocess and complete the MCP initialize handshake."""
+
+        if self._initialized:
+            return
+        await self._ensure_process()
+        response = await self._send_jsonrpc(
+            {
+                "jsonrpc": "2.0",
+                "id": self._next_request_id(),
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "job-applier",
+                        "version": "0.1.0",
+                    },
+                },
+            },
+            expect_response=True,
+        )
+        if not isinstance(response, dict):
+            msg = "Playwright MCP stdio initialize returned an invalid payload."
+            raise PlaywrightMcpError(msg)
+        await self._send_jsonrpc(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {},
+            },
+            expect_response=False,
+        )
+        self._initialized = True
+
+    async def shutdown(self) -> None:
+        """Terminate the subprocess session."""
+
+        process = self._process
+        if process is None:
+            return
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+        if self._stderr_task is not None:
+            await self._stderr_task
+        self._process = None
+        self._stderr_task = None
+        self._initialized = False
+
+    async def navigate(self, url: str) -> None:
+        await self.call_tool("browser_navigate", {"url": url})
+
+    async def snapshot(self) -> str:
+        result = await self.call_tool("browser_snapshot", {})
+        return extract_mcp_text_content(result)
+
+    async def click(self, *, ref: str, element: str | None = None) -> None:
+        arguments: dict[str, object] = {"ref": ref}
+        if element:
+            arguments["element"] = element
+        await self.call_tool("browser_click", arguments)
+
+    async def type(
+        self,
+        *,
+        ref: str,
+        text: str,
+        element: str | None = None,
+        submit: bool = False,
+    ) -> None:
+        arguments: dict[str, object] = {"ref": ref, "text": text}
+        if element:
+            arguments["element"] = element
+        if submit:
+            arguments["submit"] = True
+        await self.call_tool("browser_type", arguments)
+
+    async def wait(self, *, seconds: int) -> None:
+        await self.call_tool("browser_wait_for", {"time": seconds})
+
+    async def save_storage_state(self, path: Path) -> None:
+        target_path = str(path.resolve())
+        code = (
+            "async (page) => {"
+            f" await page.context().storageState({{ path: {json.dumps(target_path)} }});"
+            " return 'storage_state_saved';"
+            " }"
+        )
+        await self.call_tool("browser_run_code", {"code": code})
+
+    async def close_browser(self) -> None:
+        if not self._initialized:
+            return
+        try:
+            await self.call_tool("browser_close", {})
+        except PlaywrightMcpError:
+            logger.exception("playwright_mcp_stdio_browser_close_failed")
+
+    async def call_tool(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
+        await self.initialize()
+        response = await self._send_jsonrpc(
+            {
+                "jsonrpc": "2.0",
+                "id": self._next_request_id(),
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments,
+                },
+            },
+            expect_response=True,
+        )
+        if not isinstance(response, dict):
+            msg = f"Playwright MCP stdio tool {name!r} returned an invalid response."
+            raise PlaywrightMcpError(msg)
+        result = response.get("result")
+        if not isinstance(result, dict):
+            msg = f"Playwright MCP stdio tool {name!r} returned an unexpected response."
+            raise PlaywrightMcpError(msg)
+        return cast(dict[str, object], result)
+
+    async def _ensure_process(self) -> None:
+        if self._process is not None and self._process.returncode is None:
+            return
+        logger.info("playwright_mcp_stdio_start", extra={"command": self._command})
+        append_output_jsonl(
+            "mcp/stdio.jsonl",
+            {
+                "event": "process_start",
+                "command": list(self._command),
+            },
+        )
+        self._process = await asyncio.create_subprocess_exec(
+            *self._command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        self._stderr_task = asyncio.create_task(self._pump_stderr(), name="playwright-mcp-stderr")
+
+    async def _pump_stderr(self) -> None:
+        process = self._process
+        if process is None or process.stderr is None:
+            return
+        while True:
+            line = await process.stderr.readline()
+            if not line:
+                return
+            text = line.decode("utf-8", errors="replace").rstrip()
+            if not text:
+                continue
+            logger.info("playwright_mcp_stdio_stderr", extra={"line": text})
+            append_output_jsonl(
+                "mcp/stdio.jsonl",
+                {
+                    "event": "stderr",
+                    "line": text,
+                },
+            )
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "playwright_mcp_stdio",
+                    "kind": "stderr",
+                    "line": text,
+                },
+            )
+
+    async def _send_jsonrpc(
+        self,
+        body: dict[str, object],
+        *,
+        expect_response: bool,
+    ) -> dict[str, object] | None:
+        process = self._process
+        if process is None or process.stdin is None or process.stdout is None:
+            msg = "Playwright MCP stdio process is not available."
+            raise PlaywrightMcpError(msg)
+        sanitized_request = _sanitize_mcp_transport_payload(body)
+        append_output_jsonl(
+            "mcp/stdio.jsonl",
+            {
+                "event": "request",
+                "body": sanitized_request,
+            },
+        )
+        append_output_jsonl(
+            "run.log",
+            {
+                "source": "playwright_mcp_stdio",
+                "kind": "request",
+                "body": sanitized_request,
+            },
+        )
+        process.stdin.write(f"{json.dumps(body, ensure_ascii=True)}\n".encode())
+        await process.stdin.drain()
+        if not expect_response:
+            return None
+        expected_id = body.get("id")
+        while True:
+            try:
+                line = await asyncio.wait_for(
+                    process.stdout.readline(),
+                    timeout=self._timeout_seconds,
+                )
+            except TimeoutError as exc:
+                msg = "Timed out waiting for Playwright MCP stdio response."
+                raise PlaywrightMcpError(msg) from exc
+            if not line:
+                msg = "Playwright MCP stdio process closed unexpectedly."
+                raise PlaywrightMcpError(msg)
+            payload = json.loads(line.decode("utf-8"))
+            if not isinstance(payload, dict):
+                msg = "Playwright MCP stdio returned a non-object JSON payload."
+                raise PlaywrightMcpError(msg)
+            append_output_jsonl(
+                "mcp/stdio.jsonl",
+                {
+                    "event": "response",
+                    "body": payload,
+                },
+            )
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "playwright_mcp_stdio",
+                    "kind": "response",
+                    "body": payload,
+                },
+            )
+            payload_id = payload.get("id")
+            if expected_id is not None and payload_id != expected_id:
+                continue
+            error_payload = payload.get("error")
+            if isinstance(error_payload, dict):
+                msg = f"Playwright MCP stdio returned an error: {json.dumps(error_payload)}"
+                raise PlaywrightMcpError(msg)
+            return cast(dict[str, object], payload)
+
+    def _next_request_id(self) -> int:
+        self._request_id += 1
+        return self._request_id
+
+
 class OpenAIResponsesPlaywrightMcpAgent:
     """Plan login actions from Playwright MCP snapshots using the Responses API."""
 
@@ -454,7 +767,7 @@ class OpenAIResponsesPlaywrightMcpAgent:
     async def complete_linkedin_login(
         self,
         *,
-        client: PlaywrightMcpHttpClient,
+        client: PlaywrightMcpClient,
         credentials: dict[McpValueSource, str],
         timeout_seconds: int,
     ) -> None:

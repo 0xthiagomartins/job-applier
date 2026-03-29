@@ -16,6 +16,11 @@ def test_runtime_settings_fall_back_to_local_sqlite(tmp_path: Path) -> None:
     assert settings.resolved_panel_storage_dir == tmp_path / "runtime" / "panel"
     assert settings.resolved_database_url == expected_database_url
     assert settings.resolved_playwright_mcp_url == "http://localhost:8931/mcp"
+    assert settings.resolved_playwright_mcp_stdio_command == (
+        "npx",
+        "-y",
+        "@playwright/mcp@latest",
+    )
 
 
 def test_runtime_settings_normalize_playwright_mcp_root_url() -> None:
@@ -25,6 +30,19 @@ def test_runtime_settings_normalize_playwright_mcp_root_url() -> None:
     )
 
     assert settings.resolved_playwright_mcp_url == "http://localhost:8931/mcp"
+
+
+def test_runtime_settings_parse_custom_playwright_mcp_stdio_command() -> None:
+    settings = RuntimeSettings(
+        playwright_mcp_stdio_command="npx @playwright/mcp@latest --browser chrome"
+    )
+
+    assert settings.resolved_playwright_mcp_stdio_command == (
+        "npx",
+        "@playwright/mcp@latest",
+        "--browser",
+        "chrome",
+    )
 
 
 def test_initialize_runtime_environment_creates_panel_dir_and_sqlite_file(tmp_path: Path) -> None:

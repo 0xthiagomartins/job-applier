@@ -7,7 +7,9 @@ from job_applier.infrastructure.linkedin.auth import LinkedInCredentials, Linked
 from job_applier.infrastructure.linkedin.playwright_mcp import (
     PlaywrightMcpHttpClient,
     PlaywrightMcpSessionNotFoundError,
+    PlaywrightMcpStdioClient,
     extract_mcp_text_content,
+    is_local_playwright_mcp_url,
     normalize_playwright_mcp_url,
     parse_mcp_response_body,
     parse_playwright_mcp_action,
@@ -51,6 +53,12 @@ def test_parse_playwright_mcp_action_accepts_type_with_secret_value_source() -> 
     assert action.action_type == "type"
     assert action.ref == "e17"
     assert action.value_source == "linkedin_email"
+
+
+def test_is_local_playwright_mcp_url_detects_local_hosts() -> None:
+    assert is_local_playwright_mcp_url("http://localhost:8931/mcp") is True
+    assert is_local_playwright_mcp_url("http://127.0.0.1:8931") is True
+    assert is_local_playwright_mcp_url("https://example.com/mcp") is False
 
 
 def test_extract_mcp_text_content_joins_text_entries() -> None:
@@ -219,4 +227,79 @@ def test_linkedin_session_manager_retries_when_playwright_mcp_loses_session(
         "save:2:storage-state.json",
         "close_browser:2",
         "shutdown:2",
+    ]
+
+
+def test_linkedin_session_manager_prefers_stdio_for_local_playwright_mcp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class FakeStdioClient:
+        def __init__(self, *, command: tuple[str, ...], timeout_seconds: int) -> None:
+            assert command == ("npx", "-y", "@playwright/mcp@latest")
+            assert timeout_seconds == 90
+
+        async def navigate(self, url: str) -> None:
+            events.append(f"navigate:{url}")
+
+        async def save_storage_state(self, path: Path) -> None:
+            events.append(f"save:{path.name}")
+            path.write_text("{}", encoding="utf-8")
+
+        async def close_browser(self) -> None:
+            events.append("close_browser")
+
+        async def shutdown(self) -> None:
+            events.append("shutdown")
+
+    class FakeAgent:
+        def __init__(self, *, api_key: SecretStr, model: str) -> None:
+            assert api_key.get_secret_value() == "sk-test"
+            assert model == "o3-mini"
+
+        async def complete_linkedin_login(
+            self,
+            *,
+            client: PlaywrightMcpStdioClient,
+            credentials: dict[str, str],
+            timeout_seconds: int,
+        ) -> None:
+            del client, credentials, timeout_seconds
+            events.append("agent_login")
+
+    monkeypatch.setattr(
+        "job_applier.infrastructure.linkedin.auth.PlaywrightMcpStdioClient",
+        FakeStdioClient,
+    )
+    monkeypatch.setattr(
+        "job_applier.infrastructure.linkedin.auth.OpenAIResponsesPlaywrightMcpAgent",
+        FakeAgent,
+    )
+
+    manager = LinkedInSessionManager(
+        credentials=LinkedInCredentials(
+            email="thiago@example.com",
+            password=SecretStr("linkedin-secret"),
+        ),
+        storage_state_path=tmp_path / "storage-state.json",
+        login_timeout_seconds=90,
+        ai_api_key=SecretStr("sk-test"),
+        ai_model="o3-mini",
+        playwright_mcp_url="http://localhost:8931/mcp",
+        playwright_mcp_prefer_stdio_for_local=True,
+        playwright_mcp_stdio_command=("npx", "-y", "@playwright/mcp@latest"),
+    )
+
+    import asyncio
+
+    asyncio.run(manager._login_via_mcp())
+
+    assert events == [
+        "navigate:https://www.linkedin.com/login",
+        "agent_login",
+        "save:storage-state.json",
+        "close_browser",
+        "shutdown",
     ]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 import sqlite3
 from functools import lru_cache
 from pathlib import Path
@@ -26,6 +27,8 @@ class RuntimeSettings(BaseSettings):
     playwright_mcp_url: AnyUrl | None = None
     playwright_mcp_host: str = "localhost"
     playwright_mcp_port: int = 8931
+    playwright_mcp_prefer_stdio_for_local: bool = True
+    playwright_mcp_stdio_command: str | None = None
     scheduler_poll_interval_seconds: int = 30
     playwright_headless: bool = False
     playwright_trace_enabled: bool = True
@@ -99,6 +102,13 @@ class RuntimeSettings(BaseSettings):
         elif path not in {"/mcp", "/sse"}:
             path = f"{path}/mcp"
         return parse.urlunparse(parsed._replace(path=path, params="", query="", fragment=""))
+
+    @property
+    def resolved_playwright_mcp_stdio_command(self) -> tuple[str, ...]:
+        """Return the local stdio command used for Playwright MCP subprocess mode."""
+
+        raw_value = self.playwright_mcp_stdio_command or "npx -y @playwright/mcp@latest"
+        return tuple(part for part in shlex.split(raw_value) if part)
 
     @property
     def resolved_linkedin_storage_state_path(self) -> Path:
