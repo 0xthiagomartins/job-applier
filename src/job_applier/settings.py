@@ -45,6 +45,8 @@ class RuntimeSettings(BaseSettings):
     linkedin_min_navigation_delay_ms: int = 800
     linkedin_max_navigation_delay_ms: int = 1_800
     openai_api_key: SecretStr | None = None
+    openai_responses_max_retries: int = 2
+    openai_responses_retry_max_delay_seconds: float = 20.0
     bootstrap_panel_on_empty_state: bool = True
     bootstrap_profile_name: str | None = None
     bootstrap_profile_email: str | None = None

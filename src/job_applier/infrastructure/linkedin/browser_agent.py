@@ -7,6 +7,7 @@ import json
 import logging
 import random
 import re
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -14,6 +15,8 @@ from urllib import error, request
 
 from playwright.async_api import Locator, Page
 from pydantic import SecretStr
+
+from job_applier.observability import append_output_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -1064,6 +1067,8 @@ class OpenAIResponsesBrowserAgent:
         snapshotter: BrowserDomSnapshotter | None = None,
         min_action_delay_ms: int = 350,
         max_action_delay_ms: int = 950,
+        openai_max_retries: int = 2,
+        openai_retry_max_delay_seconds: float = 20.0,
     ) -> None:
         self._api_key = api_key
         self._model = model
@@ -1071,6 +1076,8 @@ class OpenAIResponsesBrowserAgent:
         self._snapshotter = snapshotter or BrowserDomSnapshotter()
         self._min_action_delay_ms = max(0, min_action_delay_ms)
         self._max_action_delay_ms = max(self._min_action_delay_ms, max_action_delay_ms)
+        self._openai_max_retries = max(0, openai_max_retries)
+        self._openai_retry_max_delay_seconds = max(1.0, openai_retry_max_delay_seconds)
 
     async def complete_linkedin_login(
         self,
@@ -1551,24 +1558,12 @@ class OpenAIResponsesBrowserAgent:
             },
         }
         payload_bytes = json.dumps(body, ensure_ascii=True).encode("utf-8")
-        http_request = request.Request(
-            self.endpoint,
-            data=payload_bytes,
-            headers={
-                "Authorization": f"Bearer {self._api_key.get_secret_value()}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
+        return self._post_openai_response(
+            payload_bytes=payload_bytes,
+            task_name=task_name,
+            mode="planning",
+            log_event_name="openai_browser_agent_http_error",
         )
-        try:
-            with request.urlopen(http_request, timeout=30) as response:  # noqa: S310
-                return cast(dict[str, object], json.loads(response.read().decode("utf-8")))
-        except error.HTTPError as exc:
-            logger.warning(
-                "openai_browser_agent_http_error",
-                extra={"status": exc.code, "body": exc.read().decode("utf-8", errors="replace")},
-            )
-            raise
 
     def _create_assessment_response(
         self,
@@ -1681,24 +1676,85 @@ class OpenAIResponsesBrowserAgent:
             },
         }
         payload_bytes = json.dumps(body, ensure_ascii=True).encode("utf-8")
-        http_request = request.Request(
-            self.endpoint,
-            data=payload_bytes,
-            headers={
-                "Authorization": f"Bearer {self._api_key.get_secret_value()}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
+        return self._post_openai_response(
+            payload_bytes=payload_bytes,
+            task_name=task_name,
+            mode="assessment",
+            log_event_name="openai_browser_agent_assessment_http_error",
         )
-        try:
-            with request.urlopen(http_request, timeout=30) as response:  # noqa: S310
-                return cast(dict[str, object], json.loads(response.read().decode("utf-8")))
-        except error.HTTPError as exc:
-            logger.warning(
-                "openai_browser_agent_assessment_http_error",
-                extra={"status": exc.code, "body": exc.read().decode("utf-8", errors="replace")},
+
+    def _post_openai_response(
+        self,
+        *,
+        payload_bytes: bytes,
+        task_name: str,
+        mode: Literal["planning", "assessment"],
+        log_event_name: str,
+    ) -> dict[str, object]:
+        for attempt in range(self._openai_max_retries + 1):
+            http_request = request.Request(
+                self.endpoint,
+                data=payload_bytes,
+                headers={
+                    "Authorization": f"Bearer {self._api_key.get_secret_value()}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
             )
-            raise
+            try:
+                with request.urlopen(http_request, timeout=30) as response:  # noqa: S310
+                    return cast(dict[str, object], json.loads(response.read().decode("utf-8")))
+            except error.HTTPError as exc:
+                error_body = exc.read().decode("utf-8", errors="replace")
+                retry_delay_seconds = estimate_openai_retry_delay_seconds(
+                    status=exc.code,
+                    body=error_body,
+                    retry_after_header=exc.headers.get("Retry-After"),
+                    max_delay_seconds=self._openai_retry_max_delay_seconds,
+                )
+                logger.warning(
+                    log_event_name,
+                    extra={
+                        "status": exc.code,
+                        "body": error_body,
+                        "attempt": attempt + 1,
+                        "max_attempts": self._openai_max_retries + 1,
+                        "retry_delay_seconds": retry_delay_seconds,
+                    },
+                )
+                append_output_jsonl(
+                    "run.log",
+                    {
+                        "source": "browser_agent",
+                        "kind": "openai_http_error",
+                        "mode": mode,
+                        "task_name": task_name,
+                        "status": exc.code,
+                        "attempt": attempt + 1,
+                        "max_attempts": self._openai_max_retries + 1,
+                        "retry_delay_seconds": retry_delay_seconds,
+                        "body_excerpt": truncate_text(error_body, limit=320),
+                    },
+                )
+                if exc.code == 429 and attempt < self._openai_max_retries:
+                    time.sleep(retry_delay_seconds)
+                    continue
+                raise BrowserAutomationError(
+                    summarize_openai_responses_error(
+                        status=exc.code,
+                        body=error_body,
+                        task_name=task_name,
+                        mode=mode,
+                    )
+                ) from exc
+            except error.URLError as exc:
+                msg = (
+                    "Could not reach the OpenAI Responses API for the LinkedIn browser "
+                    f"{'agent' if mode == 'planning' else 'assessor'}. Reason: {exc.reason}"
+                )
+                raise BrowserAutomationError(msg) from exc
+        msg = "OpenAI Responses API request loop exited unexpectedly."
+        raise BrowserAutomationError(msg)
 
     def _extract_output_text(self, response_data: dict[str, object]) -> str:
         direct_output = response_data.get("output_text")
@@ -1918,6 +1974,58 @@ class OpenAIResponsesBrowserAgent:
         }:
             msg = "Browser agent returned a value_source that does not belong to the current task."
             raise BrowserAutomationError(msg)
+
+
+def summarize_openai_responses_error(
+    *,
+    status: int,
+    body: str,
+    task_name: str,
+    mode: Literal["planning", "assessment"],
+) -> str:
+    """Return a clearer OpenAI Responses API error for browser-agent failures."""
+
+    task_label = task_name.replace("_", " ")
+    if status == 429:
+        return (
+            "OpenAI Responses API rate limit while the LinkedIn browser agent was "
+            f"{mode} {task_label}. This is not a LinkedIn page-rate-limit signal."
+        )
+    if status >= 500:
+        return (
+            "OpenAI Responses API failed while the LinkedIn browser agent was "
+            f"{mode} {task_label}. Status: {status}."
+        )
+    excerpt = truncate_text(body, limit=220)
+    return (
+        "OpenAI Responses API returned an error while the LinkedIn browser agent was "
+        f"{mode} {task_label}. Status: {status}. Details: {excerpt}"
+    )
+
+
+def estimate_openai_retry_delay_seconds(
+    *,
+    status: int,
+    body: str,
+    retry_after_header: str | None,
+    max_delay_seconds: float,
+) -> float:
+    """Estimate a safe retry delay for OpenAI Responses API throttling."""
+
+    if status != 429:
+        return 1.0
+    retry_candidates: list[float] = []
+    if retry_after_header:
+        try:
+            retry_candidates.append(float(retry_after_header.strip()))
+        except ValueError:
+            pass
+    retry_match = re.search(r"try again in\s+([0-9]+(?:\.[0-9]+)?)s", body, re.I)
+    if retry_match:
+        retry_candidates.append(float(retry_match.group(1)))
+    base_delay = max(retry_candidates, default=8.0)
+    jitter = random.uniform(0.25, 1.25)
+    return max(1.0, min(max_delay_seconds, base_delay + jitter))
 
 
 def parse_browser_action(payload: dict[str, object]) -> BrowserAgentAction:

@@ -13,6 +13,7 @@ from job_applier.infrastructure.linkedin.playwright_mcp import (
     normalize_playwright_mcp_url,
     parse_mcp_response_body,
     parse_playwright_mcp_action,
+    summarize_openai_login_agent_error,
 )
 
 
@@ -70,6 +71,16 @@ def test_extract_mcp_text_content_joins_text_entries() -> None:
     }
 
     assert extract_mcp_text_content(result) == "Title Body"
+
+
+def test_summarize_openai_login_agent_error_marks_openai_rate_limit_clearly() -> None:
+    message = summarize_openai_login_agent_error(
+        status=429,
+        body='{"error":"rate_limited"}',
+    )
+
+    assert "OpenAI Responses API rate limit" in message
+    assert "not a LinkedIn page-rate-limit signal" in message
 
 
 def test_linkedin_session_manager_can_bootstrap_login_through_playwright_mcp(

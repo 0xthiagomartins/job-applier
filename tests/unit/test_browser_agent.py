@@ -5,10 +5,12 @@ from playwright.async_api import async_playwright
 from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserAgentSnapshot,
     BrowserDomSnapshotter,
+    estimate_openai_retry_delay_seconds,
     has_manual_intervention_cues,
     parse_browser_action,
     parse_browser_task_assessment,
     summarize_browser_action_error,
+    summarize_openai_responses_error,
 )
 
 
@@ -123,6 +125,29 @@ def test_summarize_browser_action_error_normalizes_overlay_interception() -> Non
     )
 
     assert message == "The chosen target is blocked by an open dialog or overlay."
+
+
+def test_summarize_openai_responses_error_marks_openai_rate_limit_clearly() -> None:
+    message = summarize_openai_responses_error(
+        status=429,
+        body='{"error":"rate_limited"}',
+        task_name="linkedin_job_search_state",
+        mode="assessment",
+    )
+
+    assert "OpenAI Responses API rate limit" in message
+    assert "not a LinkedIn page-rate-limit signal" in message
+
+
+def test_estimate_openai_retry_delay_seconds_prefers_api_hint() -> None:
+    delay = estimate_openai_retry_delay_seconds(
+        status=429,
+        body='{"error":{"message":"Rate limited. Please try again in 12.5s."}}',
+        retry_after_header="3",
+        max_delay_seconds=20.0,
+    )
+
+    assert 12.5 <= delay <= 13.75
 
 
 def test_browser_dom_snapshotter_focus_locator_prioritizes_visible_modal_controls() -> None:

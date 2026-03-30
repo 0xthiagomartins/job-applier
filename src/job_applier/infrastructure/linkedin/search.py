@@ -29,6 +29,7 @@ from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserTaskAssessment,
     OpenAIResponsesBrowserAgent,
 )
+from job_applier.observability import append_output_jsonl
 from job_applier.settings import RuntimeSettings
 
 logger = logging.getLogger(__name__)
@@ -341,6 +342,10 @@ class PlaywrightLinkedInJobsClient:
             playwright_mcp_stdio_command=(
                 self._runtime_settings.resolved_playwright_mcp_stdio_command
             ),
+            openai_responses_max_retries=self._runtime_settings.openai_responses_max_retries,
+            openai_responses_retry_max_delay_seconds=(
+                self._runtime_settings.openai_responses_retry_max_delay_seconds
+            ),
         )
         return self._session_manager
 
@@ -398,22 +403,63 @@ class PlaywrightLinkedInJobsClient:
         run_dir: Path,
     ) -> None:
         direct_results_url = build_search_results_url(criteria)
+        append_output_jsonl(
+            "run.log",
+            {
+                "source": "linkedin_search",
+                "kind": "search_entry_started",
+                "direct_results_url": direct_results_url,
+            },
+        )
         await self._pause_before_navigation(page, reason="search_results_entry")
         await page.goto(direct_results_url, wait_until="domcontentloaded")
         await self._ensure_authenticated_page(page)
-        await self._wait_for_search_surface(page, criteria=criteria)
-        await self._capture_screenshot(page, run_dir / "jobs-search-entry.png")
-        if await self._search_results_ready(page, criteria=criteria):
+        if await self._wait_for_extractable_search_cards(page):
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "linkedin_search",
+                    "kind": "search_entry_ready_via_cards",
+                    "url": page.url,
+                },
+            )
+            await self._capture_screenshot(page, run_dir / "jobs-search-entry.png")
             return
+        try:
+            await self._wait_for_search_surface(page, criteria=criteria)
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "linkedin_search",
+                    "kind": "search_entry_ready_via_assessment",
+                    "url": page.url,
+                },
+            )
+            await self._capture_screenshot(page, run_dir / "jobs-search-entry.png")
+            return
+        except LinkedInSearchError:
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "linkedin_search",
+                    "kind": "search_entry_fallback_to_browser_agent",
+                    "url": page.url,
+                },
+            )
+            pass
 
         await self._complete_search_with_browser_agent(page, criteria=criteria)
         await self._wait_for_search_surface(page, criteria=criteria)
+        append_output_jsonl(
+            "run.log",
+            {
+                "source": "linkedin_search",
+                "kind": "search_results_ready_after_browser_agent",
+                "url": page.url,
+            },
+        )
         await self._capture_screenshot(page, run_dir / "search-results-ready.png")
-        if await self._search_results_ready(page, criteria=criteria):
-            return
-
-        msg = "Could not reach a LinkedIn job results page after the browser agent search flow."
-        raise LinkedInSearchError(msg)
+        return
 
     async def _complete_search_with_browser_agent(
         self,
@@ -434,6 +480,10 @@ class PlaywrightLinkedInJobsClient:
             model=criteria.ai_model,
             min_action_delay_ms=self._runtime_settings.linkedin_min_action_delay_ms,
             max_action_delay_ms=self._runtime_settings.linkedin_max_action_delay_ms,
+            openai_max_retries=self._runtime_settings.openai_responses_max_retries,
+            openai_retry_max_delay_seconds=(
+                self._runtime_settings.openai_responses_retry_max_delay_seconds
+            ),
         )
 
         async def search_results_ready(candidate_page: Page) -> bool:
@@ -561,15 +611,54 @@ class PlaywrightLinkedInJobsClient:
         page: Page,
         *,
         criteria: LinkedInSearchCriteria,
-    ) -> None:
-        for _ in range(10):
+    ) -> BrowserTaskAssessment:
+        current_url = getattr(page, "url", "")
+        last_assessment: BrowserTaskAssessment | None = None
+        for attempt in range(5):
+            if await self._wait_for_extractable_search_cards(page, attempts=1):
+                append_output_jsonl(
+                    "run.log",
+                    {
+                        "source": "linkedin_search",
+                        "kind": "search_surface_cards_visible",
+                        "attempt": attempt + 1,
+                        "url": current_url,
+                    },
+                )
+                return BrowserTaskAssessment(
+                    status="complete",
+                    confidence=0.99,
+                    summary="LinkedIn job cards are already visible on the results page.",
+                    evidence=("job_cards_visible",),
+                )
             assessment = await self._assess_search_surface(page, criteria=criteria)
+            last_assessment = assessment
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "linkedin_search",
+                    "kind": "search_surface_assessment",
+                    "attempt": attempt + 1,
+                    "status": assessment.status,
+                    "confidence": assessment.confidence,
+                    "summary": assessment.summary,
+                    "evidence": list(assessment.evidence),
+                    "url": current_url,
+                },
+            )
             if assessment.status == "complete":
-                return
+                return assessment
             if assessment.status == "blocked":
                 msg = assessment.summary or "LinkedIn search is blocked on the current screen."
                 raise LinkedInSearchError(msg)
-            await page.wait_for_timeout(500)
+            if attempt < 4:
+                await page.wait_for_timeout(750 + (attempt * 450))
+        msg = (
+            last_assessment.summary
+            if last_assessment is not None and last_assessment.summary
+            else "LinkedIn search did not settle into a results surface."
+        )
+        raise LinkedInSearchError(msg)
 
     async def _search_results_ready(
         self,
@@ -577,8 +666,46 @@ class PlaywrightLinkedInJobsClient:
         *,
         criteria: LinkedInSearchCriteria,
     ) -> bool:
+        if await self._wait_for_extractable_search_cards(page, attempts=1):
+            return True
         assessment = await self._assess_search_surface(page, criteria=criteria)
         return assessment.status == "complete"
+
+    async def _wait_for_extractable_search_cards(
+        self,
+        page: Page,
+        *,
+        attempts: int = 3,
+    ) -> bool:
+        current_url = getattr(page, "url", "")
+        for attempt in range(max(1, attempts)):
+            card_count = await self._count_extractable_search_cards(page)
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "linkedin_search",
+                    "kind": "search_cards_probe",
+                    "attempt": attempt + 1,
+                    "card_count": card_count,
+                    "url": current_url,
+                },
+            )
+            if card_count > 0:
+                return True
+            if attempt == 0:
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5_000)
+                except Exception:  # noqa: BLE001
+                    pass
+            if attempt < attempts - 1:
+                await page.wait_for_timeout(900 + (attempt * 350))
+        return False
+
+    async def _has_extractable_search_cards(self, page: Page) -> bool:
+        return await self._count_extractable_search_cards(page) > 0
+
+    async def _count_extractable_search_cards(self, page: Page) -> int:
+        return await page.locator("a[href*='/jobs/view/']").count()
 
     async def _assess_search_surface(
         self,
@@ -598,6 +725,10 @@ class PlaywrightLinkedInJobsClient:
             model=criteria.ai_model,
             min_action_delay_ms=self._runtime_settings.linkedin_min_action_delay_ms,
             max_action_delay_ms=self._runtime_settings.linkedin_max_action_delay_ms,
+            openai_max_retries=self._runtime_settings.openai_responses_max_retries,
+            openai_retry_max_delay_seconds=(
+                self._runtime_settings.openai_responses_retry_max_delay_seconds
+            ),
         )
         try:
             return await browser_agent.assess_browser_task(

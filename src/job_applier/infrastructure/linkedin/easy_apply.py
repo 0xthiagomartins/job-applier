@@ -1984,6 +1984,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
             playwright_mcp_stdio_command=(
                 self._runtime_settings.resolved_playwright_mcp_stdio_command
             ),
+            openai_responses_max_retries=self._runtime_settings.openai_responses_max_retries,
+            openai_responses_retry_max_delay_seconds=(
+                self._runtime_settings.openai_responses_retry_max_delay_seconds
+            ),
         )
         return self._session_manager
 
@@ -2005,6 +2009,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
             model=settings.ai.model,
             min_action_delay_ms=self._runtime_settings.linkedin_min_action_delay_ms,
             max_action_delay_ms=self._runtime_settings.linkedin_max_action_delay_ms,
+            openai_max_retries=self._runtime_settings.openai_responses_max_retries,
+            openai_retry_max_delay_seconds=(
+                self._runtime_settings.openai_responses_retry_max_delay_seconds
+            ),
         )
 
     async def _pause_before_navigation(self, page: Page, *, reason: str) -> None:

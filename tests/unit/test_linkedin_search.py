@@ -1,8 +1,11 @@
 import asyncio
 from pathlib import Path
+from typing import cast
 
+from alembic import command
+from alembic.config import Config
+from playwright.async_api import Page
 from pydantic import AnyUrl, SecretStr, TypeAdapter
-from tests.integration.sqlite_helpers import upgrade_to_head
 
 from job_applier.application.config import (
     AgentConfig,
@@ -14,11 +17,14 @@ from job_applier.application.config import (
     UserProfileConfig,
 )
 from job_applier.domain import Platform, ScheduleFrequency, SeniorityLevel, WorkplaceType
+from job_applier.infrastructure.linkedin.browser_agent import BrowserTaskAssessment
 from job_applier.infrastructure.linkedin.search import (
     LinkedInCollectedJob,
     LinkedInJobFetcher,
     LinkedInJobParser,
     LinkedInSearchCriteria,
+    LinkedInSearchError,
+    PlaywrightLinkedInJobsClient,
     build_paginated_search_url,
     build_search_criteria,
     build_search_results_url,
@@ -30,6 +36,14 @@ from job_applier.infrastructure.sqlite import (
     create_session_factory,
 )
 from job_applier.settings import RuntimeSettings
+
+
+def upgrade_to_head(database_url: str) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    config = Config(str(project_root / "alembic.ini"))
+    config.set_main_option("script_location", str(project_root / "alembic"))
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, "head")
 
 
 def test_search_criteria_and_parser_normalize_linkedin_jobs(tmp_path: Path) -> None:
@@ -142,6 +156,106 @@ def test_linkedin_job_fetcher_persists_and_deduplicates_by_external_id(tmp_path:
     assert len(stored) == 1
     assert stored[0].external_job_id == "job-001"
     assert stored[0].title == "Automation Engineer Updated"
+
+
+def test_wait_for_search_surface_returns_after_first_complete_assessment(tmp_path: Path) -> None:
+    runtime_settings = RuntimeSettings(data_dir=tmp_path)
+    client = PlaywrightLinkedInJobsClient(runtime_settings)
+    criteria = build_search_criteria(build_user_agent_settings(), runtime_settings)
+    assessments = iter(
+        (
+            BrowserTaskAssessment(status="pending", confidence=0.7, summary="loading"),
+            BrowserTaskAssessment(status="complete", confidence=0.95, summary="results ready"),
+        )
+    )
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.waits: list[int] = []
+
+        async def wait_for_timeout(self, milliseconds: int) -> None:
+            self.waits.append(milliseconds)
+
+    page = FakePage()
+
+    async def scenario() -> None:
+        async def fake_has_cards(page: object, *, attempts: int = 3) -> bool:
+            return False
+
+        async def fake_assess(
+            page: object,
+            criteria: LinkedInSearchCriteria,
+        ) -> BrowserTaskAssessment:
+            return next(assessments)
+
+        client._wait_for_extractable_search_cards = fake_has_cards  # type: ignore[method-assign]
+        client._assess_search_surface = fake_assess  # type: ignore[method-assign]
+        result = await client._wait_for_search_surface(cast(Page, page), criteria=criteria)
+        assert result.status == "complete"
+        assert page.waits == [750]
+
+    asyncio.run(scenario())
+
+
+def test_wait_for_search_surface_raises_when_page_never_settles(tmp_path: Path) -> None:
+    runtime_settings = RuntimeSettings(data_dir=tmp_path)
+    client = PlaywrightLinkedInJobsClient(runtime_settings)
+    criteria = build_search_criteria(build_user_agent_settings(), runtime_settings)
+
+    class FakePage:
+        async def wait_for_timeout(self, milliseconds: int) -> None:
+            return None
+
+    async def scenario() -> None:
+        async def fake_has_cards(page: object, *, attempts: int = 3) -> bool:
+            return False
+
+        async def fake_assess(
+            page: object,
+            criteria: LinkedInSearchCriteria,
+        ) -> BrowserTaskAssessment:
+            return BrowserTaskAssessment(status="pending", confidence=0.4, summary="still loading")
+
+        client._wait_for_extractable_search_cards = fake_has_cards  # type: ignore[method-assign]
+        client._assess_search_surface = fake_assess  # type: ignore[method-assign]
+        try:
+            await client._wait_for_search_surface(cast(Page, FakePage()), criteria=criteria)
+        except LinkedInSearchError as exc:
+            assert "still loading" in str(exc)
+        else:
+            raise AssertionError(
+                "Expected LinkedInSearchError when the search surface never settles."
+            )
+
+    asyncio.run(scenario())
+
+
+def test_wait_for_search_surface_short_circuits_when_job_cards_are_visible(tmp_path: Path) -> None:
+    runtime_settings = RuntimeSettings(data_dir=tmp_path)
+    client = PlaywrightLinkedInJobsClient(runtime_settings)
+    criteria = build_search_criteria(build_user_agent_settings(), runtime_settings)
+
+    class FakePage:
+        async def wait_for_timeout(self, milliseconds: int) -> None:
+            return None
+
+    async def scenario() -> None:
+        async def fake_has_cards(page: object, *, attempts: int = 3) -> bool:
+            return True
+
+        async def fail_assessment(
+            page: object,
+            criteria: LinkedInSearchCriteria,
+        ) -> BrowserTaskAssessment:
+            raise AssertionError("The browser assessor should not run when job cards are visible.")
+
+        client._wait_for_extractable_search_cards = fake_has_cards  # type: ignore[method-assign]
+        client._assess_search_surface = fail_assessment  # type: ignore[method-assign]
+        result = await client._wait_for_search_surface(cast(Page, FakePage()), criteria=criteria)
+        assert result.status == "complete"
+        assert "job cards" in result.summary.lower()
+
+    asyncio.run(scenario())
 
 
 def build_user_agent_settings() -> UserAgentSettings:

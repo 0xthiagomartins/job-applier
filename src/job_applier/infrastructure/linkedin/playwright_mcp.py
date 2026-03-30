@@ -1062,7 +1062,18 @@ class OpenAIResponsesPlaywrightMcpAgent:
                     "body": error_body,
                 },
             )
-            raise
+            raise PlaywrightMcpError(
+                summarize_openai_login_agent_error(
+                    status=exc.code,
+                    body=error_body,
+                )
+            ) from exc
+        except error.URLError as exc:
+            msg = (
+                "Could not reach the OpenAI Responses API for the Playwright MCP login agent. "
+                f"Reason: {exc.reason}"
+            )
+            raise PlaywrightMcpError(msg) from exc
 
     def _resolve_text(
         self,
@@ -1092,6 +1103,26 @@ def extract_mcp_text_content(result: Mapping[str, object]) -> str:
         if isinstance(item, dict) and item.get("type") == "text"
     ]
     return collapse_text("\n".join(text for text in texts if isinstance(text, str)))
+
+
+def summarize_openai_login_agent_error(*, status: int, body: str) -> str:
+    """Return a clearer OpenAI error for the Playwright MCP login planner."""
+
+    if status == 429:
+        return (
+            "OpenAI Responses API rate limit while the Playwright MCP login agent was "
+            "planning LinkedIn login. This is not a LinkedIn page-rate-limit signal."
+        )
+    if status >= 500:
+        return (
+            "OpenAI Responses API failed while the Playwright MCP login agent was "
+            f"planning LinkedIn login. Status: {status}."
+        )
+    excerpt = truncate_text(body, limit=220)
+    return (
+        "OpenAI Responses API returned an error while the Playwright MCP login agent was "
+        f"planning LinkedIn login. Status: {status}. Details: {excerpt}"
+    )
 
 
 def extract_output_text(response_data: dict[str, object]) -> str:

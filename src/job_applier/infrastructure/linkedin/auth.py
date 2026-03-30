@@ -53,6 +53,8 @@ class LinkedInSessionManager:
         playwright_mcp_url: str | None = None,
         playwright_mcp_prefer_stdio_for_local: bool = True,
         playwright_mcp_stdio_command: tuple[str, ...] | None = None,
+        openai_responses_max_retries: int = 2,
+        openai_responses_retry_max_delay_seconds: float = 20.0,
     ) -> None:
         self._credentials = credentials
         self._storage_state_path = storage_state_path
@@ -62,6 +64,11 @@ class LinkedInSessionManager:
         self._playwright_mcp_url = playwright_mcp_url
         self._playwright_mcp_prefer_stdio_for_local = playwright_mcp_prefer_stdio_for_local
         self._playwright_mcp_stdio_command = playwright_mcp_stdio_command
+        self._openai_responses_max_retries = max(0, openai_responses_max_retries)
+        self._openai_responses_retry_max_delay_seconds = max(
+            1.0,
+            openai_responses_retry_max_delay_seconds,
+        )
 
     async def create_authenticated_context(self, browser: Browser) -> BrowserContext:
         """Return an authenticated context, reusing saved session state when valid."""
@@ -156,6 +163,8 @@ class LinkedInSessionManager:
                 model=self._ai_model,
                 min_action_delay_ms=350,
                 max_action_delay_ms=950,
+                openai_max_retries=self._openai_responses_max_retries,
+                openai_retry_max_delay_seconds=self._openai_responses_retry_max_delay_seconds,
             )
             await browser_agent.complete_linkedin_login(
                 page=page,
