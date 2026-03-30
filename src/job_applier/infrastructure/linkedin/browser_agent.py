@@ -433,9 +433,15 @@ class BrowserDomSnapshotter:
                           seenNodes.add(candidate);
                           nodes.push(candidate);
                         };
+                        const popupSelectors = [
+                          interactiveSelectors,
+                          "[aria-selected]",
+                          "li",
+                          "[data-value]",
+                        ].join(", ");
                         for (const root of relatedRoots) {
                           pushNode(root);
-                          for (const optionNode of root.querySelectorAll(interactiveSelectors)) {
+                          for (const optionNode of root.querySelectorAll(popupSelectors)) {
                             if (optionNode === fieldNode) {
                               continue;
                             }
@@ -443,7 +449,9 @@ class BrowserDomSnapshotter:
                           }
                         }
                         if (nodes.length === 0) {
-                          for (const optionNode of document.querySelectorAll("[role='option']")) {
+                          for (const optionNode of document.querySelectorAll(
+                            "[role='option'], [aria-selected], [data-value]"
+                          )) {
                             if (optionNode === fieldNode) {
                               continue;
                             }
@@ -1324,6 +1332,11 @@ class OpenAIResponsesBrowserAgent:
                 (
                     "Use press for keyboard confirmation when a combobox, autocomplete, "
                     "or suggestion list likely needs Enter, Tab, or arrow navigation."
+                ),
+                (
+                    "When choosing among visible suggestions or options, prefer the "
+                    "semantically closest valid match to the goal even if the wording "
+                    "uses abbreviations, regions, or suffixes instead of an exact string match."
                 ),
                 (
                     "Do not repeat the same failed click on an unchanged screen when scrolling "

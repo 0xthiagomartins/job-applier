@@ -29,6 +29,10 @@ from job_applier.infrastructure.linkedin import (
     LinkedInQuestionClassifier,
     LinkedInQuestionExtractor,
 )
+from job_applier.infrastructure.linkedin.easy_apply import (
+    PlaywrightLinkedInEasyApplyExecutor,
+    TextFieldInteractionState,
+)
 
 
 @pytest.mark.parametrize(
@@ -249,6 +253,44 @@ def test_answer_resolver_falls_back_gracefully_when_ai_fails() -> None:
     assert answer.fill_strategy is FillStrategy.BEST_EFFORT
     assert answer.ambiguity_flag is True
     assert answer.reasoning == "heuristic_fallback"
+
+
+def test_text_field_interaction_requires_follow_up_when_field_is_invalid() -> None:
+    executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
+    state = TextFieldInteractionState(
+        current_value="Sao Paulo",
+        focused=True,
+        role="combobox",
+        aria_autocomplete="list",
+        aria_expanded=False,
+        has_popup_binding=False,
+        active_descendant=None,
+        visible_option_count=0,
+        invalid=True,
+        validation_message="Please enter a valid answer",
+    )
+
+    assert state.needs_agentic_follow_up is True
+    assert executor._text_field_interaction_complete(state) is False
+
+
+def test_text_field_interaction_completes_when_value_is_accepted() -> None:
+    executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
+    state = TextFieldInteractionState(
+        current_value="Sao Paulo, Sao Paulo, Brazil",
+        focused=False,
+        role=None,
+        aria_autocomplete=None,
+        aria_expanded=False,
+        has_popup_binding=False,
+        active_descendant=None,
+        visible_option_count=0,
+        invalid=False,
+        validation_message=None,
+    )
+
+    assert state.needs_agentic_follow_up is False
+    assert executor._text_field_interaction_complete(state) is True
 
 
 class SuccessfulGenerator:

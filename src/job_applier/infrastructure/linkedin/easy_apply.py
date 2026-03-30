@@ -127,6 +127,8 @@ class TextFieldInteractionState:
     active_descendant: str | None
     visible_option_count: int
     visible_option_texts: tuple[str, ...] = ()
+    invalid: bool = False
+    validation_message: str | None = None
 
     @property
     def has_value(self) -> bool:
@@ -138,6 +140,7 @@ class TextFieldInteractionState:
             self.visible_option_count
             or self.aria_expanded
             or self.active_descendant
+            or self.invalid
             or (
                 self.focused
                 and (
@@ -570,6 +573,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         submission_id=submission_id,
                         execution_events=execution_events,
                         step=step,
+                        step_answers=tuple(step_answers),
                         recent_actions=(
                             {
                                 "action_type": action.action_type,
@@ -861,10 +865,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
             state = await self._inspect_text_field_interaction(locator)
             if self._text_field_interaction_complete(state):
                 return state.current_value or target_value
+            focus_locator = await self._field_interaction_focus_locator(root, field)
 
             action = await browser_agent.perform_single_task_action(
                 page=page,
-                available_values={},
+                available_values={"intended_field_value": target_value},
                 goal=(
                     "Finish the interaction for the already-filled LinkedIn Easy Apply field "
                     "so the current step accepts the value without advancing or closing the form."
@@ -873,11 +878,36 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 extra_rules=(
                     f"The already-filled field label is {field.question_raw!r}.",
                     f"The intended accepted value is {target_value!r}.",
-                    "Do not clear or overwrite the field value in this task.",
+                    f"The current field value is {state.current_value!r}.",
+                    (
+                        "The field is currently invalid and still rejected by the page."
+                        if state.invalid
+                        else "The field does not currently show a visible validation error."
+                    ),
+                    (
+                        f"Visible field validation feedback: {state.validation_message!r}."
+                        if state.validation_message
+                        else "No explicit validation text is currently visible for this field."
+                    ),
+                    (
+                        f"Visible chooser options: {', '.join(state.visible_option_texts)!r}."
+                        if state.visible_option_texts
+                        else "No explicit chooser options are visible right now."
+                    ),
+                    (
+                        "Do not replace the field with an unrelated value. "
+                        "You may adjust the typed query only when that helps surface or select "
+                        "a valid option semantically matching the intended value."
+                    ),
                     (
                         "If an autocomplete, combobox, suggestion list, or dropdown choice is "
                         "visible for the current field, select the best matching option for the "
                         "intended value."
+                    ),
+                    (
+                        "A visible option may still be correct even when it is not an exact "
+                        "string match. Abbreviations, state or country suffixes, and nearby "
+                        "regional formats can still represent the intended location."
                     ),
                     (
                         "If the current field likely needs keyboard confirmation or blur, use "
@@ -896,10 +926,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "for it still needs attention."
                     ),
                 ),
-                allowed_action_types=("click", "press", "scroll", "wait", "done", "fail"),
+                allowed_action_types=("click", "fill", "press", "scroll", "wait", "done", "fail"),
                 recent_actions=recent_actions[-6:],
                 step_index=attempt_index,
-                focus_locator=root,
+                focus_locator=focus_locator or root,
             )
             recent_actions.append(
                 {
@@ -955,6 +985,39 @@ class PlaywrightLinkedInEasyApplyExecutor:
                   .split(/\\s+/)
                   .map((item) => item.trim())
                   .filter(Boolean);
+              const fieldRect = node.getBoundingClientRect();
+              const overlapsHorizontally = (candidateRect) => {
+                const overlap = Math.min(fieldRect.right, candidateRect.right)
+                  - Math.max(fieldRect.left, candidateRect.left);
+                return overlap > Math.min(fieldRect.width, candidateRect.width) * 0.25;
+              };
+              const nearbyValidationTexts = [];
+              const seenValidationTexts = new Set();
+              const pushValidationText = (candidate) => {
+                if (!candidate || candidate.nodeType !== 1) {
+                  return;
+                }
+                if (!isVisible(candidate)) {
+                  return;
+                }
+                if (candidate === node || candidate.contains(node) || node.contains(candidate)) {
+                  return;
+                }
+                const text = collapse(candidate.innerText || candidate.textContent || "");
+                if (!text || text.length > 180 || seenValidationTexts.has(text)) {
+                  return;
+                }
+                const rect = candidate.getBoundingClientRect();
+                const verticalGap = rect.top - fieldRect.bottom;
+                if (verticalGap < -6 || verticalGap > 96) {
+                  return;
+                }
+                if (!overlapsHorizontally(rect)) {
+                  return;
+                }
+                seenValidationTexts.add(text);
+                nearbyValidationTexts.push({ text, verticalGap });
+              };
               const relatedRoots = [];
               const seenRoots = new Set();
               const pushRoot = (candidate) => {
@@ -969,8 +1032,27 @@ class PlaywrightLinkedInEasyApplyExecutor:
                   pushRoot(document.getElementById(id));
                 }
               }
+              for (const attributeName of ["aria-describedby", "aria-errormessage"]) {
+                for (const id of splitIds(node.getAttribute(attributeName))) {
+                  pushValidationText(document.getElementById(id));
+                }
+              }
               for (const id of splitIds(node.getAttribute("aria-activedescendant"))) {
                 pushRoot(document.getElementById(id));
+              }
+              let ancestor = node.parentElement;
+              let depth = 0;
+              while (ancestor && depth < 4) {
+                for (const candidate of ancestor.querySelectorAll(
+                  "[role='alert'], [aria-live='assertive'], [aria-live='polite']"
+                )) {
+                  pushValidationText(candidate);
+                }
+                ancestor = ancestor.parentElement;
+                depth += 1;
+              }
+              for (const candidate of document.querySelectorAll("div, p, span, small, li")) {
+                pushValidationText(candidate);
               }
               const optionTexts = [];
               const seenOptions = new Set();
@@ -1009,6 +1091,24 @@ class PlaywrightLinkedInEasyApplyExecutor:
                   pushOption(optionNode);
                 }
               }
+              nearbyValidationTexts.sort((left, right) => {
+                if (left.verticalGap !== right.verticalGap) {
+                  return left.verticalGap - right.verticalGap;
+                }
+                return left.text.length - right.text.length;
+              });
+              const nativeValidity = typeof node.checkValidity === "function"
+                ? node.checkValidity()
+                : true;
+              const invalidPseudoClass = typeof node.matches === "function"
+                ? node.matches(":invalid")
+                : false;
+              const validationMessage = collapse(node.validationMessage || "");
+              const ariaInvalid = node.getAttribute("aria-invalid") === "true";
+              const combinedValidationTexts = [
+                validationMessage,
+                ...nearbyValidationTexts.map((item) => item.text),
+              ].filter(Boolean);
               return {
                 current_value: collapse(
                   node.value
@@ -1026,6 +1126,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 active_descendant: collapse(node.getAttribute("aria-activedescendant")),
                 visible_option_count: optionTexts.length,
                 visible_option_texts: optionTexts.slice(0, 6),
+                invalid: ariaInvalid || invalidPseudoClass || !nativeValidity
+                  || combinedValidationTexts.length > 0,
+                validation_message: combinedValidationTexts[0] || "",
               };
             }
             """
@@ -1044,6 +1147,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 for item in (payload.get("visible_option_texts") or ())
                 if str(item).strip()
             ),
+            invalid=bool(payload.get("invalid")),
+            validation_message=str(payload.get("validation_message") or "").strip() or None,
         )
 
     def _text_field_interaction_complete(self, state: TextFieldInteractionState) -> bool:
@@ -1090,6 +1195,24 @@ class PlaywrightLinkedInEasyApplyExecutor:
             if await locator.count():
                 return locator.first
         return None
+
+    async def _field_interaction_focus_locator(
+        self,
+        root: Locator,
+        field: EasyApplyField,
+    ) -> Locator | None:
+        locator = await self._find_control_locator(root, field)
+        if locator is None:
+            return None
+        container = locator.locator(
+            "xpath=ancestor-or-self::*["
+            "@role='group' or @role='listbox' or @role='dialog' "
+            "or self::fieldset or self::section or self::form or self::div"
+            "][1]"
+        )
+        if await container.count():
+            return container.first
+        return locator
 
     async def _select_field_option(
         self,
@@ -1635,8 +1758,18 @@ class PlaywrightLinkedInEasyApplyExecutor:
         submission_id: UUID,
         execution_events: list[ExecutionEvent],
         step: EasyApplyStep,
+        step_answers: tuple[ApplicationAnswer, ...] = (),
         recent_actions: tuple[dict[str, object], ...] = (),
     ) -> tuple[str, str | None]:
+        await self._retry_invalid_fields_after_primary_action(
+            page,
+            settings=settings,
+            execution_id=execution_id,
+            submission_id=submission_id,
+            execution_events=execution_events,
+            previous_step=step,
+            step_answers=step_answers,
+        )
         root = await self._easy_apply_root(page)
         assessment = await self._assess_browser_state_with_agent(
             page,
@@ -1675,6 +1808,79 @@ class PlaywrightLinkedInEasyApplyExecutor:
         if assessment.status == "blocked":
             return "blocked", assessment.summary
         return assessment.status, assessment.summary
+
+    async def _retry_invalid_fields_after_primary_action(
+        self,
+        page: Page,
+        *,
+        settings: UserAgentSettings,
+        execution_id: UUID,
+        submission_id: UUID,
+        execution_events: list[ExecutionEvent],
+        previous_step: EasyApplyStep,
+        step_answers: tuple[ApplicationAnswer, ...],
+    ) -> None:
+        if not await self._easy_apply_modal_visible(page):
+            return
+        current_step = await self._extract_step(
+            page,
+            last_known_step_index=previous_step.step_index,
+            last_known_total_steps=previous_step.total_steps,
+        )
+        if current_step.step_index != previous_step.step_index:
+            return
+
+        answer_by_key = {
+            answer.normalized_key: answer.answer_raw
+            for answer in step_answers
+            if answer.answer_raw.strip()
+        }
+        root = await self._easy_apply_root(page)
+
+        for field in current_step.fields:
+            if field.control_kind not in {"text", "textarea"}:
+                continue
+            locator = await self._find_control_locator(root, field)
+            if locator is None:
+                continue
+            state = await self._inspect_text_field_interaction(locator)
+            if not state.invalid:
+                continue
+
+            target_value = answer_by_key.get(field.normalized_key) or state.current_value
+            self._record_event(
+                execution_events,
+                execution_id=execution_id,
+                submission_id=submission_id,
+                event_type=ExecutionEventType.STEP_REACHED,
+                payload={
+                    "stage": "easy_apply_retry_invalid_field",
+                    "step_index": current_step.step_index,
+                    "normalized_key": field.normalized_key,
+                    "validation_message": state.validation_message,
+                    "target_value": target_value,
+                },
+            )
+            try:
+                await self._complete_text_field_interaction(
+                    page=page,
+                    field=field,
+                    target_value=target_value,
+                    settings=settings,
+                )
+            except LinkedInEasyApplyError as exc:
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.EXECUTION_FAILED,
+                    payload={
+                        "stage": "easy_apply_retry_invalid_field",
+                        "step_index": current_step.step_index,
+                        "normalized_key": field.normalized_key,
+                        "message": str(exc),
+                    },
+                )
 
     async def _assess_browser_state_with_agent(
         self,
