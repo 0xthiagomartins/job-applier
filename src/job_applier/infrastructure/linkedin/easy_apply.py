@@ -583,6 +583,21 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         ),
                     )
                     if assessment_status == "blocked":
+                        (
+                            remediation_status,
+                            remediation_notes,
+                        ) = await self._resolve_easy_apply_bottleneck_with_agent(
+                            page,
+                            settings=settings,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            execution_events=execution_events,
+                            step=step,
+                            blocked_summary=assessment_notes,
+                            step_answers=tuple(step_answers),
+                        )
+                        if remediation_status != "blocked":
+                            continue
                         artifacts.extend(
                             await self._capture_debug_bundle(
                                 page,
@@ -600,14 +615,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                 "job_posting_id": str(posting.id),
                                 "reason": "agentic_step_blocked",
                                 "status": SubmissionStatus.FAILED.value,
-                                "notes": assessment_notes,
+                                "notes": remediation_notes or assessment_notes,
                             },
                         )
                         return EasyApplyExecutionResult(
                             submission_id=submission_id,
                             started_at=started_at,
                             status=SubmissionStatus.FAILED,
-                            notes=assessment_notes,
+                            notes=remediation_notes or assessment_notes,
                         )
 
                 artifacts.extend(
@@ -1813,6 +1828,232 @@ class PlaywrightLinkedInEasyApplyExecutor:
         if assessment.status == "blocked":
             return "blocked", assessment.summary
         return assessment.status, assessment.summary
+
+    async def _resolve_easy_apply_bottleneck_with_agent(
+        self,
+        page: Page,
+        *,
+        settings: UserAgentSettings,
+        execution_id: UUID,
+        submission_id: UUID,
+        execution_events: list[ExecutionEvent],
+        step: EasyApplyStep,
+        blocked_summary: str | None,
+        step_answers: tuple[ApplicationAnswer, ...],
+    ) -> tuple[str, str | None]:
+        browser_agent = self._create_browser_agent(settings)
+        available_values = self._build_easy_apply_remediation_values(
+            settings=settings,
+            step_answers=step_answers,
+        )
+        recent_actions: list[dict[str, object]] = []
+
+        for remediation_round in range(4):
+            if not await self._easy_apply_modal_visible(page):
+                return "blocked", "The Easy Apply modal is no longer visible during remediation."
+
+            current_step = await self._extract_step(
+                page,
+                last_known_step_index=step.step_index,
+                last_known_total_steps=step.total_steps,
+            )
+            if current_step.step_index != step.step_index:
+                return "complete", "The Easy Apply flow advanced after blocker remediation."
+
+            root = await self._easy_apply_root(page)
+            diagnosis = await self._assess_browser_state_with_agent(
+                page,
+                settings=settings,
+                task_name="linkedin_easy_apply_blocker_diagnosis",
+                goal=(
+                    "Assess the current blocker inside the LinkedIn Easy Apply flow and decide "
+                    "whether the step is still blocked, already ready to continue, or still "
+                    "settling after the last action."
+                ),
+                extra_rules=(
+                    (
+                        "Use blocked when a visible validation issue, chooser problem, or "
+                        "blocking surface still prevents progress."
+                    ),
+                    (
+                        "Use complete only when the current step is visibly ready for the "
+                        "next primary action or already advanced."
+                    ),
+                    "Use pending while the current modal or blocker is still changing.",
+                ),
+                recent_actions=tuple(recent_actions[-6:]),
+                step_index=step.step_index,
+                focus_locator=root,
+            )
+            self._record_event(
+                execution_events,
+                execution_id=execution_id,
+                submission_id=submission_id,
+                event_type=ExecutionEventType.STEP_REACHED,
+                payload={
+                    "stage": "easy_apply_blocker_diagnosis",
+                    "step_index": step.step_index,
+                    "remediation_round": remediation_round,
+                    "status": diagnosis.status,
+                    "confidence": diagnosis.confidence,
+                    "summary": diagnosis.summary,
+                    "evidence": list(diagnosis.evidence),
+                },
+            )
+            if diagnosis.status != "blocked":
+                return diagnosis.status, diagnosis.summary
+
+            priority_locator = await self._find_priority_blocker_locator(root, current_step)
+            action = await browser_agent.perform_single_task_action(
+                page=page,
+                available_values=available_values,
+                goal=(
+                    "Resolve the current visible blocker inside the LinkedIn Easy Apply flow "
+                    "so the step becomes ready for the main continue or submit action."
+                ),
+                task_name="linkedin_easy_apply_resolve_blocker",
+                extra_rules=(
+                    (
+                        f"The latest blocker summary is {blocked_summary!r}."
+                        if blocked_summary
+                        else "There is no earlier blocker summary from the caller."
+                    ),
+                    f"The current diagnosis summary is {diagnosis.summary!r}.",
+                    (
+                        "Stay inside the current blocking surface and fix the visible issue. "
+                        "This may include selecting an autocomplete option, confirming a "
+                        "blocking dialog, or repairing an invalid field."
+                    ),
+                    (
+                        "You may use field_value_* sources to re-apply answers that were "
+                        "already computed for this step."
+                    ),
+                    ("Do not close, dismiss, save, or back out of the application."),
+                    (
+                        "Do not click the main Next, Review, or Submit button unless a "
+                        "blocking confirmation surface specifically requires a continue or "
+                        "confirm action to return to the form."
+                    ),
+                    (
+                        "If the visible issue is below the fold inside the modal, scroll the "
+                        "active surface instead of the page."
+                    ),
+                ),
+                allowed_action_types=("click", "fill", "press", "scroll", "wait", "done", "fail"),
+                recent_actions=recent_actions[-6:],
+                step_index=remediation_round,
+                focus_locator=root,
+                priority_locator=priority_locator,
+            )
+            recent_actions.append(
+                {
+                    "remediation_round": remediation_round,
+                    "action_type": action.action_type,
+                    "action_intent": action.action_intent,
+                    "reasoning": action.reasoning,
+                    "diagnosis_summary": diagnosis.summary,
+                }
+            )
+            self._record_event(
+                execution_events,
+                execution_id=execution_id,
+                submission_id=submission_id,
+                event_type=ExecutionEventType.STEP_REACHED,
+                payload={
+                    "stage": "easy_apply_blocker_resolution_action",
+                    "step_index": step.step_index,
+                    "remediation_round": remediation_round,
+                    "action_type": action.action_type,
+                    "action_intent": action.action_intent,
+                    "reasoning": action.reasoning,
+                },
+            )
+
+        final_diagnosis = await self._assess_browser_state_with_agent(
+            page,
+            settings=settings,
+            task_name="linkedin_easy_apply_blocker_diagnosis",
+            goal=(
+                "Assess whether the current LinkedIn Easy Apply blocker was resolved after the "
+                "latest remediation attempts."
+            ),
+            extra_rules=(
+                "Use blocked when the visible issue is still preventing the step from continuing.",
+                (
+                    "Use complete only when the current step is ready for the main "
+                    "primary action or already advanced."
+                ),
+                "Use pending while the UI is still settling after the last remediation.",
+            ),
+            recent_actions=tuple(recent_actions[-6:]),
+            step_index=step.step_index,
+            focus_locator=await self._easy_apply_root(page),
+        )
+        return final_diagnosis.status, final_diagnosis.summary
+
+    def _build_easy_apply_remediation_values(
+        self,
+        *,
+        settings: UserAgentSettings,
+        step_answers: tuple[ApplicationAnswer, ...],
+    ) -> dict[str, str]:
+        values: dict[str, str] = {}
+        seen_keys: dict[str, int] = {}
+        for answer in step_answers:
+            raw_value = answer.answer_raw.strip()
+            if not raw_value:
+                continue
+            slug = re.sub(r"[^a-z0-9]+", "_", normalize_text(answer.normalized_key)).strip("_")
+            slug = slug or "field"
+            base_key = f"field_value_{slug}"
+            suffix = seen_keys.get(base_key, 0)
+            seen_keys[base_key] = suffix + 1
+            key = base_key if suffix == 0 else f"{base_key}_{suffix + 1}"
+            values[key] = raw_value
+        values.setdefault("profile_city", settings.profile.city)
+        values.setdefault("profile_email", settings.profile.email)
+        values.setdefault("profile_phone", settings.profile.phone)
+        return values
+
+    async def _find_priority_blocker_locator(
+        self,
+        root: Locator,
+        step: EasyApplyStep,
+    ) -> Locator | None:
+        for field in step.fields:
+            locator = await self._find_control_locator(root, field)
+            if locator is None:
+                continue
+            if field.control_kind in {"text", "textarea"}:
+                state = await self._inspect_text_field_interaction(locator)
+                if state.needs_agentic_follow_up or state.invalid:
+                    return locator
+                continue
+            if await self._control_has_invalid_state(locator):
+                return locator
+        return None
+
+    async def _control_has_invalid_state(self, locator: Locator) -> bool:
+        try:
+            return bool(
+                await locator.evaluate(
+                    """
+                    (node) => {
+                      if (!node || node.nodeType !== 1) {
+                        return false;
+                      }
+                      const ariaInvalid = node.getAttribute("aria-invalid") === "true";
+                      const invalidPseudoClass =
+                        typeof node.matches === "function" ? node.matches(":invalid") : false;
+                      const nativeValidity =
+                        typeof node.checkValidity === "function" ? node.checkValidity() : true;
+                      return ariaInvalid || invalidPseudoClass || !nativeValidity;
+                    }
+                    """
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return False
 
     async def _retry_invalid_fields_after_primary_action(
         self,

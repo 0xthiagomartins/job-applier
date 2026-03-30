@@ -1,4 +1,5 @@
 import asyncio
+from uuid import uuid4
 
 import pytest
 from pydantic import AnyUrl, SecretStr, TypeAdapter
@@ -14,6 +15,7 @@ from job_applier.application.config import (
 )
 from job_applier.domain import (
     AnswerSource,
+    ApplicationAnswer,
     FillStrategy,
     JobPosting,
     Platform,
@@ -291,6 +293,43 @@ def test_text_field_interaction_completes_when_value_is_accepted() -> None:
 
     assert state.needs_agentic_follow_up is False
     assert executor._text_field_interaction_complete(state) is True
+
+
+def test_build_easy_apply_remediation_values_uses_descriptive_sources() -> None:
+    executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
+    settings = build_user_agent_settings()
+    answers = (
+        ApplicationAnswer(
+            submission_id=uuid4(),
+            step_index=0,
+            question_raw="City",
+            question_type=QuestionType.CITY,
+            normalized_key="city",
+            answer_raw="Sao Paulo",
+            answer_source=AnswerSource.PROFILE_SNAPSHOT,
+            fill_strategy=FillStrategy.DETERMINISTIC,
+        ),
+        ApplicationAnswer(
+            submission_id=uuid4(),
+            step_index=0,
+            question_raw="Email address",
+            question_type=QuestionType.EMAIL,
+            normalized_key="email",
+            answer_raw="thiago@example.com",
+            answer_source=AnswerSource.PROFILE_SNAPSHOT,
+            fill_strategy=FillStrategy.DETERMINISTIC,
+        ),
+    )
+
+    values = executor._build_easy_apply_remediation_values(
+        settings=settings,
+        step_answers=answers,
+    )
+
+    assert values["field_value_city"] == "Sao Paulo"
+    assert values["field_value_email"] == "thiago@example.com"
+    assert values["profile_city"] == "Sao Paulo"
+    assert values["profile_phone"] == "+5511999999999"
 
 
 class SuccessfulGenerator:
