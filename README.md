@@ -90,6 +90,8 @@ JOB_APPLIER_PLAYWRIGHT_HEADLESS=false
 Runtime behavior:
 
 - the first successful login saves a reusable session in `artifacts/runtime/linkedin/storage-state.json`;
+- persistent runtime state lives under `artifacts/runtime/`;
+- the troubleshooting bundle for only the latest execution lives under `artifacts/last-run/`;
 - later runs reuse that storage state automatically;
 - if LinkedIn expires the session, the app clears the saved state and logs in again;
 - when `JOB_APPLIER_PLAYWRIGHT_MCP_URL` is configured, the login bootstrap runs through Playwright MCP and exports the storage state back to the Python app;

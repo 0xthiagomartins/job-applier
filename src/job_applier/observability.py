@@ -128,7 +128,7 @@ def reset_run_output(
     origin: str,
     started_at: datetime,
 ) -> None:
-    """Clear the previous debug bundle and bootstrap the current run metadata."""
+    """Clear the previous last-run bundle before the next execution starts."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
     for child in output_dir.iterdir():
@@ -140,11 +140,19 @@ def reset_run_output(
         child.unlink()
 
     write_output_json(
-        "run.json",
+        "summary.json",
         {
             "execution_id": str(execution_id),
             "origin": origin,
+            "status": "running",
             "started_at": started_at.isoformat(),
+            "finished_at": None,
+            "snapshot_id": None,
+            "jobs_seen": 0,
+            "jobs_selected": 0,
+            "successful_submissions": 0,
+            "error_count": 0,
+            "last_error": None,
         },
         output_dir=output_dir,
     )
@@ -219,7 +227,7 @@ def _resolve_output_path(relative_path: str | Path, *, output_dir: Path | None) 
 
 
 class LastRunDebugHandler(logging.Handler):
-    """Mirror execution-bound logs into the `output/` troubleshooting bundle."""
+    """Mirror execution-bound logs into the `artifacts/last-run` bundle."""
 
     def __init__(self, target_path: Path) -> None:
         super().__init__(level=logging.NOTSET)

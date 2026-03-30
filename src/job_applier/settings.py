@@ -18,7 +18,7 @@ class RuntimeSettings(BaseSettings):
     """Settings that control local paths and on-premise runtime defaults."""
 
     data_dir: Path = Path("artifacts/runtime")
-    output_dir: Path = Path("output")
+    output_dir: Path = Path("artifacts/last-run")
     panel_storage_dir: Path | None = None
     database_url: str | None = None
     backend_host: str = "0.0.0.0"

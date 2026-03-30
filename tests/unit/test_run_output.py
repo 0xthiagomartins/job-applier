@@ -22,7 +22,7 @@ from job_applier.settings import RuntimeSettings
 
 
 def test_run_output_keeps_only_the_latest_execution_bundle(tmp_path: Path) -> None:
-    output_dir = tmp_path / "output"
+    output_dir = tmp_path / "artifacts" / "last-run"
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / ".gitkeep").write_text("", encoding="utf-8")
     (output_dir / "stale.log").write_text("old data", encoding="utf-8")
@@ -40,11 +40,11 @@ def test_run_output_keeps_only_the_latest_execution_bundle(tmp_path: Path) -> No
 
     assert not (output_dir / "stale.log").exists()
     assert (output_dir / ".gitkeep").exists()
-    assert (output_dir / "run.json").exists()
     assert (output_dir / "summary.json").exists()
     assert (output_dir / "settings-summary.json").exists()
-    assert (output_dir / "execution-events.jsonl").exists()
     assert (output_dir / "run.log").exists()
+    assert not (output_dir / "run.json").exists()
+    assert not (output_dir / "execution-events.jsonl").exists()
 
     summary_payload = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary_payload["execution_id"] == str(summary.execution_id)

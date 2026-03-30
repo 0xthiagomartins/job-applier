@@ -40,5 +40,3 @@ test-results/
 # Local artifacts
 artifacts/*
 !artifacts/.gitkeep
-output/*
-!output/.gitkeep

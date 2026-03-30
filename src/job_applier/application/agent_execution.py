@@ -617,20 +617,10 @@ class AgentExecutionOrchestrator:
         self._execution_store.append_event(event)
         if self._output_dir is not None:
             append_output_jsonl(
-                "execution-events.jsonl",
-                {
-                    "id": str(event.id),
-                    "execution_id": str(event.execution_id),
-                    "submission_id": str(event.submission_id) if event.submission_id else None,
-                    "event_type": event.event_type.value,
-                    "timestamp": event.timestamp.isoformat(),
-                    "payload": payload,
-                },
-            )
-            append_output_jsonl(
                 "run.log",
                 {
                     "source": "agent_execution",
+                    "id": str(event.id),
                     "event_type": event.event_type.value,
                     "execution_id": str(event.execution_id),
                     "submission_id": str(event.submission_id) if event.submission_id else None,
