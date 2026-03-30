@@ -853,7 +853,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         browser_agent = self._create_browser_agent(settings)
         recent_actions: list[dict[str, object]] = []
 
-        for attempt_index in range(4):
+        for attempt_index in range(6):
             root = await self._easy_apply_root(page)
             locator = await self._find_control_locator(root, field)
             if locator is None:
@@ -930,6 +930,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 recent_actions=recent_actions[-6:],
                 step_index=attempt_index,
                 focus_locator=focus_locator or root,
+                priority_locator=locator,
             )
             recent_actions.append(
                 {
@@ -938,6 +939,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     "action_intent": action.action_intent,
                     "reasoning": action.reasoning,
                     "field_key": field.normalized_key,
+                    "field_invalid_before_action": state.invalid,
+                    "field_focused_before_action": state.focused,
+                    "visible_option_count_before_action": state.visible_option_count,
+                    "validation_message_before_action": state.validation_message,
                 }
             )
             if action.action_type in {"done", "fail"}:

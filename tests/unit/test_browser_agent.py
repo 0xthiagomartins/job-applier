@@ -228,8 +228,11 @@ def test_browser_dom_snapshotter_focus_locator_includes_popup_options_for_active
                         aria-autocomplete="list"
                         aria-controls="city-options"
                         aria-expanded="true"
+                        aria-invalid="true"
+                        aria-describedby="city-error"
                         value="Sao"
                       />
+                      <div id="city-error" role="alert">Please enter a valid answer</div>
                     </div>
                     <div class="portal" id="city-options" role="listbox">
                       <div class="option" role="option">Sao Paulo, Sao Paulo, Brazil</div>
@@ -242,12 +245,20 @@ def test_browser_dom_snapshotter_focus_locator_includes_popup_options_for_active
                 snapshot = await snapshotter.capture(
                     page,
                     focus_locator=page.locator('[role="dialog"]'),
+                    priority_locator=page.locator("#city"),
                 )
                 labels = {element.label for element in snapshot.elements}
                 texts = {element.text for element in snapshot.elements}
+                city = next(element for element in snapshot.elements if element.label == "City")
 
                 assert any("Sao Paulo" in (text or "") for text in texts)
                 assert "City" in labels
+                assert snapshot.elements[0].label == "City"
+                assert city.focused is True
+                assert city.invalid is True
+                assert city.expanded is True
+                assert city.validation_text == "Please enter a valid answer"
+                assert city.is_priority_target is True
             finally:
                 await browser.close()
 

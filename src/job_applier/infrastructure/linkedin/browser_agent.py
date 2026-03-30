@@ -186,6 +186,12 @@ class BrowserAgentElement:
     href: str | None = None
     current_value: str | None = None
     disabled: bool = False
+    focused: bool = False
+    invalid: bool = False
+    expanded: bool = False
+    selected: bool = False
+    validation_text: str | None = None
+    is_priority_target: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,21 +271,28 @@ class BrowserDomSnapshotter:
         page: Page,
         *,
         focus_locator: Locator | None = None,
+        priority_locator: Locator | None = None,
     ) -> BrowserAgentSnapshot:
         """Return the cleaned page snapshot used by the planner."""
 
         title = await page.title()
         focus_handle = None
+        priority_handle = None
         if focus_locator is not None:
             try:
                 focus_handle = await focus_locator.first.element_handle()
             except Exception:  # noqa: BLE001
                 focus_handle = None
+        if priority_locator is not None:
+            try:
+                priority_handle = await priority_locator.first.element_handle()
+            except Exception:  # noqa: BLE001
+                priority_handle = None
         try:
             if focus_handle is not None:
                 payload = await focus_handle.evaluate(
                     """
-                    (focusedNode, { interactiveSelectors, maxElements }) => {
+                    (focusedNode, { interactiveSelectors, maxElements, priorityNode }) => {
                       const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
                       const isVisible = (node) => {
                         const style = window.getComputedStyle(node);
@@ -398,6 +411,81 @@ class BrowserDomSnapshotter:
                           .split(/\\s+/)
                           .map((item) => item.trim())
                           .filter(Boolean);
+                      const collectValidationTextsForNode = (fieldNode) => {
+                        if (!fieldNode || fieldNode.nodeType !== 1) {
+                          return [];
+                        }
+                        const fieldRect = fieldNode.getBoundingClientRect();
+                        const overlapsHorizontally = (candidateRect) => {
+                          const overlap = Math.min(fieldRect.right, candidateRect.right)
+                            - Math.max(fieldRect.left, candidateRect.left);
+                          return overlap > Math.min(fieldRect.width, candidateRect.width) * 0.25;
+                        };
+                        const validationTexts = [];
+                        const seenTexts = new Set();
+                        const pushText = (candidate) => {
+                          if (!candidate || candidate.nodeType !== 1) {
+                            return;
+                          }
+                          if (!isVisible(candidate)) {
+                            return;
+                          }
+                          if (
+                            candidate === fieldNode
+                            || candidate.contains(fieldNode)
+                            || fieldNode.contains(candidate)
+                          ) {
+                            return;
+                          }
+                          const text = collapse(
+                            candidate.innerText
+                            || candidate.textContent
+                            || candidate.getAttribute("aria-label")
+                            || ""
+                          );
+                          if (!text || text.length > 180 || seenTexts.has(text)) {
+                            return;
+                          }
+                          const rect = candidate.getBoundingClientRect();
+                          const verticalGap = rect.top - fieldRect.bottom;
+                          if (verticalGap < -6 || verticalGap > 96) {
+                            return;
+                          }
+                          if (!overlapsHorizontally(rect)) {
+                            return;
+                          }
+                          seenTexts.add(text);
+                          validationTexts.push({ text, verticalGap });
+                        };
+                        for (const attributeName of ["aria-describedby", "aria-errormessage"]) {
+                          for (const id of splitIds(fieldNode.getAttribute(attributeName))) {
+                            pushText(document.getElementById(id));
+                          }
+                        }
+                        let ancestor = fieldNode.parentElement;
+                        let depth = 0;
+                        while (ancestor && depth < 4) {
+                          for (const candidate of ancestor.querySelectorAll(
+                            "[role='alert'], [aria-live='assertive'], [aria-live='polite']"
+                          )) {
+                            pushText(candidate);
+                          }
+                          ancestor = ancestor.parentElement;
+                          depth += 1;
+                        }
+                        for (const candidate of document.querySelectorAll(
+                          "div, p, span, small, li"
+                        )) {
+                          pushText(candidate);
+                        }
+                        validationTexts.sort((left, right) => {
+                          if (left.verticalGap !== right.verticalGap) {
+                            return left.verticalGap - right.verticalGap;
+                          }
+                          return left.text.length - right.text.length;
+                        });
+                        return validationTexts.map((item) => item.text);
+                      };
                       const collectPopupNodesForField = (fieldNode) => {
                         if (!fieldNode || fieldNode.nodeType !== 1) {
                           return [];
@@ -516,13 +604,21 @@ class BrowserDomSnapshotter:
                           "true",
                         );
                       }
-                      const activeField =
+                      const priorityField =
+                        priorityNode &&
+                        priorityNode.nodeType === 1 &&
+                        activeSurface &&
+                        activeSurface.node.contains(priorityNode)
+                          ? priorityNode
+                          : null;
+                      const activeField = priorityField || (
                         activeSurface &&
                         document.activeElement &&
                         document.activeElement.nodeType === 1 &&
                         activeSurface.node.contains(document.activeElement)
                           ? document.activeElement
-                          : null;
+                          : null
+                      );
                       const relatedPopupNodes = activeField
                         ? collectPopupNodesForField(activeField)
                         : [];
@@ -535,6 +631,14 @@ class BrowserDomSnapshotter:
                             .filter(isVisible)
                             .filter((node, index, collection) => collection.indexOf(node) === index)
                             .sort((left, right) => {
+                              if (priorityField) {
+                                if (left === priorityField && right !== priorityField) {
+                                  return -1;
+                                }
+                                if (right === priorityField && left !== priorityField) {
+                                  return 1;
+                                }
+                              }
                               const leftRect = left.getBoundingClientRect();
                               const rightRect = right.getBoundingClientRect();
                               if (Math.abs(leftRect.top - rightRect.top) > 4) {
@@ -550,6 +654,14 @@ class BrowserDomSnapshotter:
                         const elementId = `agent-${counter}`;
                         counter += 1;
                         node.setAttribute("data-job-applier-agent-id", elementId);
+                        const validationTexts = collectValidationTextsForNode(node);
+                        const nativeValidity = typeof node.checkValidity === "function"
+                          ? node.checkValidity()
+                          : true;
+                        const invalidPseudoClass = typeof node.matches === "function"
+                          ? node.matches(":invalid")
+                          : false;
+                        const ariaInvalid = node.getAttribute("aria-invalid") === "true";
                         items.push({
                           element_id: elementId,
                           tag: node.tagName.toLowerCase(),
@@ -564,6 +676,20 @@ class BrowserDomSnapshotter:
                           disabled: Boolean(
                             node.disabled || node.getAttribute("aria-disabled") === "true",
                           ),
+                          focused: document.activeElement === node,
+                          invalid: (
+                            ariaInvalid
+                            || invalidPseudoClass
+                            || !nativeValidity
+                            || validationTexts.length > 0
+                          ),
+                          expanded: node.getAttribute("aria-expanded") === "true",
+                          selected: (
+                            node.getAttribute("aria-selected") === "true"
+                            || node.getAttribute("aria-checked") === "true"
+                          ),
+                          validation_text: validationTexts[0] || "",
+                          is_priority_target: priorityField === node,
                         });
                         if (items.length >= maxElements) {
                           break;
@@ -612,6 +738,7 @@ class BrowserDomSnapshotter:
                     {
                         "interactiveSelectors": INTERACTIVE_SELECTORS,
                         "maxElements": self._max_elements,
+                        "priorityNode": priority_handle,
                     },
                 )
             else:
@@ -878,6 +1005,8 @@ class BrowserDomSnapshotter:
         finally:
             if focus_handle is not None:
                 await focus_handle.dispose()
+            if priority_handle is not None:
+                await priority_handle.dispose()
         raw_payload = cast(dict[str, object], payload)
         raw_elements_payload = raw_payload.get("elements", ())
         raw_elements = raw_elements_payload if isinstance(raw_elements_payload, list) else []
@@ -894,6 +1023,12 @@ class BrowserDomSnapshotter:
                 href=_optional_text(item.get("href")),
                 current_value=_optional_text(item.get("current_value")),
                 disabled=bool(item.get("disabled")),
+                focused=bool(item.get("focused")),
+                invalid=bool(item.get("invalid")),
+                expanded=bool(item.get("expanded")),
+                selected=bool(item.get("selected")),
+                validation_text=_optional_text(item.get("validation_text")),
+                is_priority_target=bool(item.get("is_priority_target")),
             )
             for item in raw_elements
             if isinstance(item, dict) and str(item.get("element_id") or "").strip()
@@ -1140,13 +1275,18 @@ class OpenAIResponsesBrowserAgent:
         recent_actions: Sequence[dict[str, object]] = (),
         step_index: int = 0,
         focus_locator: Locator | None = None,
+        priority_locator: Locator | None = None,
     ) -> BrowserAgentAction:
         """Plan and execute one browser action for the current page state."""
 
         feedback_history: list[dict[str, object]] = []
         history = list(recent_actions)
         for attempt_index in range(3):
-            snapshot = await self._snapshotter.capture(page, focus_locator=focus_locator)
+            snapshot = await self._snapshotter.capture(
+                page,
+                focus_locator=focus_locator,
+                priority_locator=priority_locator,
+            )
             action = await self._plan_action(
                 snapshot=snapshot,
                 goal=goal,
@@ -1279,6 +1419,12 @@ class OpenAIResponsesBrowserAgent:
                 "href": element.href,
                 "current_value": truncate_text(element.current_value or "", limit=80) or None,
                 "disabled": element.disabled,
+                "focused": element.focused,
+                "invalid": element.invalid,
+                "expanded": element.expanded,
+                "selected": element.selected,
+                "validation_text": truncate_text(element.validation_text or "", limit=120) or None,
+                "is_priority_target": element.is_priority_target,
             }
             for element in snapshot.elements
         ]
@@ -1312,6 +1458,10 @@ class OpenAIResponsesBrowserAgent:
                 (
                     "The element list is already ordered by visible position inside the active "
                     "surface or page. Prefer that list over guessing from broad page text."
+                ),
+                (
+                    "If an element is marked is_priority_target=true, treat it as the main "
+                    "control that this task must resolve before touching unrelated controls."
                 ),
                 (
                     "If page.active_surface is present, treat it as the current blocking "
@@ -1442,6 +1592,12 @@ class OpenAIResponsesBrowserAgent:
                 "href": element.href,
                 "current_value": truncate_text(element.current_value or "", limit=80) or None,
                 "disabled": element.disabled,
+                "focused": element.focused,
+                "invalid": element.invalid,
+                "expanded": element.expanded,
+                "selected": element.selected,
+                "validation_text": truncate_text(element.validation_text or "", limit=120) or None,
+                "is_priority_target": element.is_priority_target,
             }
             for element in snapshot.elements
         ]
