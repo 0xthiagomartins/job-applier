@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
@@ -240,6 +241,31 @@ class BrowserTaskAssessment:
     evidence: tuple[str, ...] = ()
 
 
+def _serialize_action(action: BrowserAgentAction) -> dict[str, object]:
+    return {
+        "action_type": action.action_type,
+        "element_id": action.element_id,
+        "value_source": action.value_source,
+        "value": action.value,
+        "action_intent": action.action_intent,
+        "key_name": action.key_name,
+        "scroll_target": action.scroll_target,
+        "scroll_direction": action.scroll_direction,
+        "scroll_amount": action.scroll_amount,
+        "wait_seconds": action.wait_seconds,
+        "reasoning": action.reasoning,
+    }
+
+
+def _serialize_assessment(assessment: BrowserTaskAssessment) -> dict[str, object]:
+    return {
+        "status": assessment.status,
+        "confidence": assessment.confidence,
+        "summary": assessment.summary,
+        "evidence": list(assessment.evidence),
+    }
+
+
 def collapse_text(value: str | None) -> str:
     """Collapse repeated whitespace and trim empty values."""
 
@@ -253,6 +279,84 @@ def truncate_text(value: str, *, limit: int) -> str:
     if len(collapsed) <= limit:
         return collapsed
     return f"{collapsed[: limit - 1].rstrip()}…"
+
+
+def snapshot_signature(snapshot: BrowserAgentSnapshot) -> str:
+    """Return a stable signature for one planner snapshot."""
+
+    payload = {
+        "url": snapshot.url,
+        "title": snapshot.title,
+        "visible_text": snapshot.visible_text,
+        "active_surface": snapshot.active_surface,
+        "active_surface_scrollable": snapshot.active_surface_scrollable,
+        "active_surface_can_scroll_down": snapshot.active_surface_can_scroll_down,
+        "active_surface_can_scroll_up": snapshot.active_surface_can_scroll_up,
+        "page_can_scroll_down": snapshot.page_can_scroll_down,
+        "page_can_scroll_up": snapshot.page_can_scroll_up,
+        "elements": [
+            {
+                "element_id": element.element_id,
+                "tag": element.tag,
+                "role": element.role,
+                "label": element.label,
+                "text": element.text,
+                "placeholder": element.placeholder,
+                "name": element.name,
+                "input_type": element.input_type,
+                "href": element.href,
+                "current_value": element.current_value,
+                "disabled": element.disabled,
+                "focused": element.focused,
+                "invalid": element.invalid,
+                "expanded": element.expanded,
+                "selected": element.selected,
+                "validation_text": element.validation_text,
+                "is_priority_target": element.is_priority_target,
+            }
+            for element in snapshot.elements
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def serialize_snapshot(snapshot: BrowserAgentSnapshot) -> dict[str, object]:
+    """Return a JSON-serializable planner snapshot payload."""
+
+    return {
+        "url": snapshot.url,
+        "title": snapshot.title,
+        "visible_text": snapshot.visible_text,
+        "active_surface": snapshot.active_surface,
+        "active_surface_scrollable": snapshot.active_surface_scrollable,
+        "active_surface_can_scroll_down": snapshot.active_surface_can_scroll_down,
+        "active_surface_can_scroll_up": snapshot.active_surface_can_scroll_up,
+        "page_can_scroll_down": snapshot.page_can_scroll_down,
+        "page_can_scroll_up": snapshot.page_can_scroll_up,
+        "elements": [
+            {
+                "element_id": element.element_id,
+                "tag": element.tag,
+                "role": element.role,
+                "label": element.label,
+                "text": element.text,
+                "placeholder": element.placeholder,
+                "name": element.name,
+                "input_type": element.input_type,
+                "href": element.href,
+                "current_value": element.current_value,
+                "disabled": element.disabled,
+                "focused": element.focused,
+                "invalid": element.invalid,
+                "expanded": element.expanded,
+                "selected": element.selected,
+                "validation_text": element.validation_text,
+                "is_priority_target": element.is_priority_target,
+            }
+            for element in snapshot.elements
+        ],
+    }
 
 
 def has_manual_intervention_cues(snapshot: BrowserAgentSnapshot) -> bool:
@@ -1079,6 +1183,9 @@ class OpenAIResponsesBrowserAgent:
         self._openai_max_retries = max(0, openai_max_retries)
         self._openai_retry_max_delay_seconds = max(1.0, openai_retry_max_delay_seconds)
 
+    def _append_browser_agent_log(self, relative_path: str, payload: Mapping[str, object]) -> None:
+        append_output_jsonl(relative_path, payload)
+
     async def complete_linkedin_login(
         self,
         *,
@@ -1143,8 +1250,19 @@ class OpenAIResponsesBrowserAgent:
                 return
 
             snapshot = await self._snapshotter.capture(page)
-            snapshot_signature = f"{snapshot.url}|{snapshot.title}|{snapshot.visible_text}"
-            snapshot_changed = snapshot_signature != previous_snapshot_signature
+            current_snapshot_signature = snapshot_signature(snapshot)
+            snapshot_changed = current_snapshot_signature != previous_snapshot_signature
+            self._append_browser_agent_log(
+                "browser-agent/task-trace.jsonl",
+                {
+                    "kind": "task_step_snapshot",
+                    "task_name": task_name,
+                    "step_index": step_index,
+                    "snapshot_signature": current_snapshot_signature,
+                    "snapshot_changed": snapshot_changed,
+                    "snapshot": serialize_snapshot(snapshot),
+                },
+            )
             if has_manual_intervention_cues(snapshot):
                 if asyncio.get_running_loop().time() >= deadline:
                     break
@@ -1152,8 +1270,18 @@ class OpenAIResponsesBrowserAgent:
                     "linkedin_browser_agent_waiting_for_manual_intervention",
                     extra={"step_index": step_index, "task_name": task_name, "url": snapshot.url},
                 )
+                self._append_browser_agent_log(
+                    "browser-agent/task-trace.jsonl",
+                    {
+                        "kind": "manual_intervention_wait",
+                        "task_name": task_name,
+                        "step_index": step_index,
+                        "snapshot_signature": current_snapshot_signature,
+                        "url": snapshot.url,
+                    },
+                )
                 await page.wait_for_timeout(5_000)
-                previous_snapshot_signature = snapshot_signature
+                previous_snapshot_signature = current_snapshot_signature
                 continue
 
             remaining_seconds = max(1.0, deadline - asyncio.get_running_loop().time())
@@ -1198,12 +1326,49 @@ class OpenAIResponsesBrowserAgent:
                     "url": snapshot.url,
                 }
                 execution_feedback.append(feedback)
+                self._append_browser_agent_log(
+                    "browser-agent/task-trace.jsonl",
+                    {
+                        "kind": "task_action_failed",
+                        "task_name": task_name,
+                        "step_index": step_index,
+                        "snapshot_signature": current_snapshot_signature,
+                        "action": _serialize_action(action),
+                        "feedback": feedback,
+                    },
+                )
                 logger.info(
                     "linkedin_browser_agent_action_failed",
                     extra=feedback,
                 )
                 previous_snapshot_signature = ""
                 continue
+            try:
+                post_action_snapshot = await self._snapshotter.capture(page)
+                post_action_signature = snapshot_signature(post_action_snapshot)
+            except Exception:  # noqa: BLE001
+                post_action_signature = None
+                post_action_snapshot = None
+            self._append_browser_agent_log(
+                "browser-agent/task-trace.jsonl",
+                {
+                    "kind": "task_action_succeeded",
+                    "task_name": task_name,
+                    "step_index": step_index,
+                    "before_snapshot_signature": current_snapshot_signature,
+                    "after_snapshot_signature": post_action_signature,
+                    "snapshot_changed_after_action": (
+                        post_action_signature is not None
+                        and post_action_signature != current_snapshot_signature
+                    ),
+                    "action": _serialize_action(action),
+                    "post_action_snapshot": (
+                        serialize_snapshot(post_action_snapshot)
+                        if post_action_snapshot is not None
+                        else None
+                    ),
+                },
+            )
             recent_actions.append(
                 {
                     "step_index": step_index,
@@ -1216,7 +1381,7 @@ class OpenAIResponsesBrowserAgent:
                     "snapshot_changed": snapshot_changed,
                 }
             )
-            previous_snapshot_signature = snapshot_signature
+            previous_snapshot_signature = current_snapshot_signature
 
         if await is_complete(page):
             return
@@ -1237,6 +1402,17 @@ class OpenAIResponsesBrowserAgent:
         """Return a structured assessment of the current browser state."""
 
         snapshot = await self._snapshotter.capture(page, focus_locator=focus_locator)
+        current_snapshot_signature = snapshot_signature(snapshot)
+        self._append_browser_agent_log(
+            "browser-agent/assessment-trace.jsonl",
+            {
+                "kind": "assessment_snapshot",
+                "task_name": task_name,
+                "step_index": step_index,
+                "snapshot_signature": current_snapshot_signature,
+                "snapshot": serialize_snapshot(snapshot),
+            },
+        )
         if has_manual_intervention_cues(snapshot):
             return BrowserTaskAssessment(
                 status="manual_intervention",
@@ -1268,7 +1444,18 @@ class OpenAIResponsesBrowserAgent:
         except json.JSONDecodeError as exc:
             msg = "Browser agent returned invalid JSON for the browser assessment."
             raise BrowserAutomationError(msg) from exc
-        return parse_browser_task_assessment(payload)
+        assessment = parse_browser_task_assessment(payload)
+        self._append_browser_agent_log(
+            "browser-agent/assessment-trace.jsonl",
+            {
+                "kind": "assessment_result",
+                "task_name": task_name,
+                "step_index": step_index,
+                "snapshot_signature": current_snapshot_signature,
+                "assessment": _serialize_assessment(assessment),
+            },
+        )
+        return assessment
 
     async def perform_single_task_action(
         self,
@@ -1293,6 +1480,18 @@ class OpenAIResponsesBrowserAgent:
                 page,
                 focus_locator=focus_locator,
                 priority_locator=priority_locator,
+            )
+            current_snapshot_signature = snapshot_signature(snapshot)
+            self._append_browser_agent_log(
+                "browser-agent/single-action-trace.jsonl",
+                {
+                    "kind": "single_action_snapshot",
+                    "task_name": task_name,
+                    "step_index": step_index,
+                    "attempt_index": attempt_index,
+                    "snapshot_signature": current_snapshot_signature,
+                    "snapshot": serialize_snapshot(snapshot),
+                },
             )
             action = await self._plan_action(
                 snapshot=snapshot,
@@ -1346,9 +1545,52 @@ class OpenAIResponsesBrowserAgent:
                     }
                 )
                 logger.info("linkedin_browser_agent_single_action_failed", extra=feedback)
+                self._append_browser_agent_log(
+                    "browser-agent/single-action-trace.jsonl",
+                    {
+                        "kind": "single_action_failed",
+                        "task_name": task_name,
+                        "step_index": step_index,
+                        "attempt_index": attempt_index,
+                        "snapshot_signature": current_snapshot_signature,
+                        "action": _serialize_action(action),
+                        "feedback": feedback,
+                    },
+                )
                 if attempt_index >= 2:
                     raise
                 continue
+            try:
+                post_action_snapshot = await self._snapshotter.capture(
+                    page,
+                    focus_locator=focus_locator,
+                    priority_locator=priority_locator,
+                )
+                post_action_signature = snapshot_signature(post_action_snapshot)
+            except Exception:  # noqa: BLE001
+                post_action_snapshot = None
+                post_action_signature = None
+            self._append_browser_agent_log(
+                "browser-agent/single-action-trace.jsonl",
+                {
+                    "kind": "single_action_succeeded",
+                    "task_name": task_name,
+                    "step_index": step_index,
+                    "attempt_index": attempt_index,
+                    "before_snapshot_signature": current_snapshot_signature,
+                    "after_snapshot_signature": post_action_signature,
+                    "snapshot_changed_after_action": (
+                        post_action_signature is not None
+                        and post_action_signature != current_snapshot_signature
+                    ),
+                    "action": _serialize_action(action),
+                    "post_action_snapshot": (
+                        serialize_snapshot(post_action_snapshot)
+                        if post_action_snapshot is not None
+                        else None
+                    ),
+                },
+            )
             return action
         msg = f"Browser agent could not complete a safe single action for {task_name}."
         raise BrowserAutomationError(msg)
@@ -1380,6 +1622,18 @@ class OpenAIResponsesBrowserAgent:
             extra_rules,
         )
         raw_output = self._extract_output_text(response_data)
+        self._append_browser_agent_log(
+            "llm/browser-agent.jsonl",
+            {
+                "kind": "planning_response",
+                "task_name": task_name,
+                "step_index": step_index,
+                "snapshot_signature": snapshot_signature(snapshot),
+                "model": self._model,
+                "response_payload": response_data,
+                "response_text": raw_output,
+            },
+        )
         logger.info(
             "linkedin_browser_agent_response",
             extra={"model": self._model, "task_name": task_name, "response_text": raw_output},
@@ -1521,6 +1775,17 @@ class OpenAIResponsesBrowserAgent:
             "linkedin_browser_agent_prompt",
             extra={"model": self._model, "task_name": task_name, "prompt_payload": prompt_payload},
         )
+        self._append_browser_agent_log(
+            "llm/browser-agent.jsonl",
+            {
+                "kind": "planning_request",
+                "task_name": task_name,
+                "step_index": step_index,
+                "snapshot_signature": snapshot_signature(snapshot),
+                "model": self._model,
+                "prompt_payload": prompt_payload,
+            },
+        )
 
         body = {
             "model": self._model,
@@ -1638,6 +1903,17 @@ class OpenAIResponsesBrowserAgent:
             "linkedin_browser_agent_assessment_prompt",
             extra={"model": self._model, "task_name": task_name, "prompt_payload": prompt_payload},
         )
+        self._append_browser_agent_log(
+            "llm/browser-agent.jsonl",
+            {
+                "kind": "assessment_request",
+                "task_name": task_name,
+                "step_index": step_index,
+                "snapshot_signature": snapshot_signature(snapshot),
+                "model": self._model,
+                "prompt_payload": prompt_payload,
+            },
+        )
 
         body = {
             "model": self._model,
@@ -1676,12 +1952,24 @@ class OpenAIResponsesBrowserAgent:
             },
         }
         payload_bytes = json.dumps(body, ensure_ascii=True).encode("utf-8")
-        return self._post_openai_response(
+        response_payload = self._post_openai_response(
             payload_bytes=payload_bytes,
             task_name=task_name,
             mode="assessment",
             log_event_name="openai_browser_agent_assessment_http_error",
         )
+        self._append_browser_agent_log(
+            "llm/browser-agent.jsonl",
+            {
+                "kind": "assessment_response",
+                "task_name": task_name,
+                "step_index": step_index,
+                "snapshot_signature": snapshot_signature(snapshot),
+                "model": self._model,
+                "response_payload": response_payload,
+            },
+        )
+        return response_payload
 
     def _post_openai_response(
         self,
@@ -1726,6 +2014,19 @@ class OpenAIResponsesBrowserAgent:
                     "run.log",
                     {
                         "source": "browser_agent",
+                        "kind": "openai_http_error",
+                        "mode": mode,
+                        "task_name": task_name,
+                        "status": exc.code,
+                        "attempt": attempt + 1,
+                        "max_attempts": self._openai_max_retries + 1,
+                        "retry_delay_seconds": retry_delay_seconds,
+                        "body_excerpt": truncate_text(error_body, limit=320),
+                    },
+                )
+                self._append_browser_agent_log(
+                    "llm/browser-agent.jsonl",
+                    {
                         "kind": "openai_http_error",
                         "mode": mode,
                         "task_name": task_name,

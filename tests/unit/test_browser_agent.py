@@ -9,6 +9,8 @@ from job_applier.infrastructure.linkedin.browser_agent import (
     has_manual_intervention_cues,
     parse_browser_action,
     parse_browser_task_assessment,
+    serialize_snapshot,
+    snapshot_signature,
     summarize_browser_action_error,
     summarize_openai_responses_error,
 )
@@ -101,6 +103,43 @@ def test_manual_intervention_detection_flags_captcha_and_otp_pages() -> None:
     )
 
     assert has_manual_intervention_cues(snapshot) is True
+
+
+def test_snapshot_signature_changes_when_visible_surface_changes() -> None:
+    base = BrowserAgentSnapshot(
+        url="https://www.linkedin.com/jobs/search/",
+        title="Jobs",
+        visible_text="Apply to Example Corp",
+        active_surface="Apply dialog",
+        elements=(),
+    )
+    changed = BrowserAgentSnapshot(
+        url="https://www.linkedin.com/jobs/search/",
+        title="Jobs",
+        visible_text="Review your application",
+        active_surface="Apply dialog",
+        elements=(),
+    )
+
+    assert snapshot_signature(base) != snapshot_signature(changed)
+
+
+def test_serialize_snapshot_keeps_machine_readable_surface_metadata() -> None:
+    snapshot = BrowserAgentSnapshot(
+        url="https://www.linkedin.com/jobs/search/",
+        title="Jobs",
+        visible_text="Continue applying",
+        active_surface="Apply dialog",
+        active_surface_scrollable=True,
+        active_surface_can_scroll_down=True,
+        elements=(),
+    )
+
+    payload = serialize_snapshot(snapshot)
+
+    assert payload["active_surface"] == "Apply dialog"
+    assert payload["active_surface_scrollable"] is True
+    assert payload["active_surface_can_scroll_down"] is True
 
 
 def test_parse_browser_task_assessment_accepts_blocked_state() -> None:

@@ -110,6 +110,12 @@ When you click `Run now`, the app resets `artifacts/last-run/` and keeps only th
 
 The durable evidence for the product itself still lives under `artifacts/runtime/`. The `last-run` bundle exists only to make troubleshooting the latest execution fast and readable.
 
+For deeper agent debugging, the last-run bundle now also keeps machine-oriented traces:
+
+- `llm/browser-agent.jsonl`: structured prompt/response records for planning and assessment calls
+- `browser-agent/task-trace.jsonl`: snapshot -> action -> result trace for multi-step browser tasks
+- `browser-agent/single-action-trace.jsonl`: focused micro-action traces used inside Easy Apply
+
 ## Quality commands
 
 Run lint:
