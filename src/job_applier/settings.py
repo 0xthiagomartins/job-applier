@@ -50,6 +50,7 @@ class RuntimeSettings(BaseSettings):
     openai_responses_max_retries: int = 2
     openai_responses_retry_max_delay_seconds: float = 20.0
     browser_agent_single_action_max_attempts: int = 3
+    browser_agent_stall_threshold: int = 3
     bootstrap_panel_on_empty_state: bool = True
     bootstrap_profile_name: str | None = None
     bootstrap_profile_email: str | None = None
@@ -141,9 +142,13 @@ class RuntimeSettings(BaseSettings):
     def resolved_browser_agent_single_action_max_attempts(self) -> int:
         """Return how many retries one browser micro-action may take."""
 
-        if self.agent_test_mode:
-            return 1
         return max(1, self.browser_agent_single_action_max_attempts)
+
+    @property
+    def resolved_browser_agent_stall_threshold(self) -> int:
+        """Return how many unchanged snapshots trigger a stall diagnosis."""
+
+        return max(2, self.browser_agent_stall_threshold)
 
     @property
     def resolved_linkedin_storage_state_path(self) -> Path:

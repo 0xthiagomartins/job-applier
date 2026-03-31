@@ -529,6 +529,7 @@ class PlaywrightLinkedInJobsClient:
         browser_agent = OpenAIResponsesBrowserAgent(
             api_key=ai_api_key,
             model=criteria.ai_model,
+            stall_threshold=self._runtime_settings.resolved_browser_agent_stall_threshold,
             min_action_delay_ms=self._runtime_settings.linkedin_min_action_delay_ms,
             max_action_delay_ms=self._runtime_settings.linkedin_max_action_delay_ms,
             openai_max_retries=self._runtime_settings.resolved_openai_responses_max_retries,
@@ -774,6 +775,7 @@ class PlaywrightLinkedInJobsClient:
         browser_agent = OpenAIResponsesBrowserAgent(
             api_key=ai_api_key,
             model=criteria.ai_model,
+            stall_threshold=self._runtime_settings.resolved_browser_agent_stall_threshold,
             min_action_delay_ms=self._runtime_settings.linkedin_min_action_delay_ms,
             max_action_delay_ms=self._runtime_settings.linkedin_max_action_delay_ms,
             openai_max_retries=self._runtime_settings.resolved_openai_responses_max_retries,

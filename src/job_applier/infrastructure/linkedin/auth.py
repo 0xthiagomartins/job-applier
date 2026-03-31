@@ -23,6 +23,7 @@ from job_applier.infrastructure.linkedin.playwright_mcp import (
     is_local_playwright_mcp_url,
 )
 from job_applier.observability import append_output_jsonl
+from job_applier.settings import get_runtime_settings
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +162,7 @@ class LinkedInSessionManager:
             browser_agent = OpenAIResponsesBrowserAgent(
                 api_key=ai_api_key,
                 model=self._ai_model,
+                stall_threshold=get_runtime_settings().resolved_browser_agent_stall_threshold,
                 min_action_delay_ms=350,
                 max_action_delay_ms=950,
                 openai_max_retries=self._openai_responses_max_retries,

@@ -35,6 +35,7 @@ BrowserAssessmentStatus = Literal[
     "manual_intervention",
     "unknown",
 ]
+BrowserStallStatus = Literal["recoverable", "manual_intervention", "abort"]
 
 STRUCTURED_OUTPUT_SCHEMA = {
     "type": "object",
@@ -140,6 +141,37 @@ STRUCTURED_ASSESSMENT_SCHEMA = {
     "required": ["status", "confidence", "summary", "evidence"],
 }
 
+STRUCTURED_STALL_DIAGNOSIS_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "status": {
+            "type": "string",
+            "enum": ["recoverable", "manual_intervention", "abort"],
+        },
+        "summary": {
+            "type": "string",
+            "description": "Short explanation of why the task looks stalled.",
+        },
+        "blocker_category": {
+            "type": "string",
+            "description": "Short machine-friendly blocker label.",
+        },
+        "next_plan": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 4,
+            "description": "Short ordered recovery plan for the next actions.",
+        },
+        "evidence": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Visible clues that explain the stall.",
+        },
+    },
+    "required": ["status", "summary", "blocker_category", "next_plan", "evidence"],
+}
+
 INTERACTIVE_SELECTORS = ",".join(
     (
         "input",
@@ -241,6 +273,17 @@ class BrowserTaskAssessment:
     evidence: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class BrowserStallDiagnosis:
+    """Structured diagnosis used when the browser flow stops making progress."""
+
+    status: BrowserStallStatus
+    summary: str
+    blocker_category: str
+    next_plan: tuple[str, ...] = ()
+    evidence: tuple[str, ...] = ()
+
+
 def _serialize_action(action: BrowserAgentAction) -> dict[str, object]:
     return {
         "action_type": action.action_type,
@@ -263,6 +306,16 @@ def _serialize_assessment(assessment: BrowserTaskAssessment) -> dict[str, object
         "confidence": assessment.confidence,
         "summary": assessment.summary,
         "evidence": list(assessment.evidence),
+    }
+
+
+def _serialize_stall_diagnosis(diagnosis: BrowserStallDiagnosis) -> dict[str, object]:
+    return {
+        "status": diagnosis.status,
+        "summary": diagnosis.summary,
+        "blocker_category": diagnosis.blocker_category,
+        "next_plan": list(diagnosis.next_plan),
+        "evidence": list(diagnosis.evidence),
     }
 
 
@@ -1169,6 +1222,7 @@ class OpenAIResponsesBrowserAgent:
         model: str,
         max_steps: int = 18,
         single_action_max_attempts: int = 3,
+        stall_threshold: int = 3,
         snapshotter: BrowserDomSnapshotter | None = None,
         min_action_delay_ms: int = 350,
         max_action_delay_ms: int = 950,
@@ -1179,6 +1233,7 @@ class OpenAIResponsesBrowserAgent:
         self._model = model
         self._max_steps = max_steps
         self._single_action_max_attempts = max(1, single_action_max_attempts)
+        self._stall_threshold = max(2, stall_threshold)
         self._snapshotter = snapshotter or BrowserDomSnapshotter()
         self._min_action_delay_ms = max(0, min_action_delay_ms)
         self._max_action_delay_ms = max(self._min_action_delay_ms, max_action_delay_ms)
@@ -1246,6 +1301,8 @@ class OpenAIResponsesBrowserAgent:
         recent_actions: list[dict[str, object]] = []
         execution_feedback: list[dict[str, object]] = []
         previous_snapshot_signature = ""
+        repeated_snapshot_count = 0
+        stall_diagnosis: BrowserStallDiagnosis | None = None
 
         for step_index in range(self._max_steps):
             if await is_complete(page):
@@ -1254,6 +1311,7 @@ class OpenAIResponsesBrowserAgent:
             snapshot = await self._snapshotter.capture(page)
             current_snapshot_signature = snapshot_signature(snapshot)
             snapshot_changed = current_snapshot_signature != previous_snapshot_signature
+            repeated_snapshot_count = 1 if snapshot_changed else repeated_snapshot_count + 1
             self._append_browser_agent_log(
                 "browser-agent/task-trace.jsonl",
                 {
@@ -1262,6 +1320,7 @@ class OpenAIResponsesBrowserAgent:
                     "step_index": step_index,
                     "snapshot_signature": current_snapshot_signature,
                     "snapshot_changed": snapshot_changed,
+                    "repeated_snapshot_count": repeated_snapshot_count,
                     "snapshot": serialize_snapshot(snapshot),
                 },
             )
@@ -1286,6 +1345,30 @@ class OpenAIResponsesBrowserAgent:
                 previous_snapshot_signature = current_snapshot_signature
                 continue
 
+            if repeated_snapshot_count >= self._stall_threshold:
+                stall_diagnosis = await self._diagnose_stall(
+                    snapshot=snapshot,
+                    goal=goal,
+                    task_name=task_name,
+                    step_index=step_index,
+                    recent_actions=recent_actions[-8:],
+                    execution_feedback=execution_feedback[-6:],
+                    repeated_snapshot_count=repeated_snapshot_count,
+                )
+                self._append_browser_agent_log(
+                    "browser-agent/stall-trace.jsonl",
+                    {
+                        "kind": "task_stall_detected",
+                        "task_name": task_name,
+                        "step_index": step_index,
+                        "snapshot_signature": current_snapshot_signature,
+                        "repeated_snapshot_count": repeated_snapshot_count,
+                        "diagnosis": _serialize_stall_diagnosis(stall_diagnosis),
+                    },
+                )
+                if stall_diagnosis.status in {"manual_intervention", "abort"}:
+                    raise BrowserAutomationError(stall_diagnosis.summary)
+
             remaining_seconds = max(1.0, deadline - asyncio.get_running_loop().time())
             action = await asyncio.wait_for(
                 self._plan_action(
@@ -1299,6 +1382,7 @@ class OpenAIResponsesBrowserAgent:
                     snapshot_changed=snapshot_changed,
                     extra_rules=extra_rules,
                     allowed_action_types=allowed_action_types,
+                    stall_diagnosis=stall_diagnosis,
                 ),
                 timeout=remaining_seconds,
             )
@@ -1384,6 +1468,11 @@ class OpenAIResponsesBrowserAgent:
                 }
             )
             previous_snapshot_signature = current_snapshot_signature
+            if (
+                post_action_signature is not None
+                and post_action_signature != current_snapshot_signature
+            ):
+                stall_diagnosis = None
 
         if await is_complete(page):
             return
@@ -1477,6 +1566,9 @@ class OpenAIResponsesBrowserAgent:
 
         feedback_history: list[dict[str, object]] = []
         history = list(recent_actions)
+        previous_snapshot_signature = ""
+        repeated_snapshot_count = 0
+        stall_diagnosis: BrowserStallDiagnosis | None = None
         for attempt_index in range(self._single_action_max_attempts):
             snapshot = await self._snapshotter.capture(
                 page,
@@ -1484,6 +1576,8 @@ class OpenAIResponsesBrowserAgent:
                 priority_locator=priority_locator,
             )
             current_snapshot_signature = snapshot_signature(snapshot)
+            snapshot_changed = current_snapshot_signature != previous_snapshot_signature
+            repeated_snapshot_count = 1 if snapshot_changed else repeated_snapshot_count + 1
             self._append_browser_agent_log(
                 "browser-agent/single-action-trace.jsonl",
                 {
@@ -1492,9 +1586,35 @@ class OpenAIResponsesBrowserAgent:
                     "step_index": step_index,
                     "attempt_index": attempt_index,
                     "snapshot_signature": current_snapshot_signature,
+                    "snapshot_changed": snapshot_changed,
+                    "repeated_snapshot_count": repeated_snapshot_count,
                     "snapshot": serialize_snapshot(snapshot),
                 },
             )
+            if repeated_snapshot_count >= self._stall_threshold:
+                stall_diagnosis = await self._diagnose_stall(
+                    snapshot=snapshot,
+                    goal=goal,
+                    task_name=task_name,
+                    step_index=step_index,
+                    recent_actions=history[-8:],
+                    execution_feedback=feedback_history[-6:],
+                    repeated_snapshot_count=repeated_snapshot_count,
+                )
+                self._append_browser_agent_log(
+                    "browser-agent/stall-trace.jsonl",
+                    {
+                        "kind": "single_action_stall_detected",
+                        "task_name": task_name,
+                        "step_index": step_index,
+                        "attempt_index": attempt_index,
+                        "snapshot_signature": current_snapshot_signature,
+                        "repeated_snapshot_count": repeated_snapshot_count,
+                        "diagnosis": _serialize_stall_diagnosis(stall_diagnosis),
+                    },
+                )
+                if stall_diagnosis.status in {"manual_intervention", "abort"}:
+                    raise BrowserAutomationError(stall_diagnosis.summary)
             action = await self._plan_action(
                 snapshot=snapshot,
                 goal=goal,
@@ -1503,9 +1623,10 @@ class OpenAIResponsesBrowserAgent:
                 step_index=step_index,
                 recent_actions=history[-6:],
                 execution_feedback=feedback_history[-4:],
-                snapshot_changed=True,
+                snapshot_changed=snapshot_changed,
                 extra_rules=extra_rules,
                 allowed_action_types=allowed_action_types,
+                stall_diagnosis=stall_diagnosis,
             )
             logger.info(
                 "linkedin_browser_agent_single_action_planned",
@@ -1561,6 +1682,7 @@ class OpenAIResponsesBrowserAgent:
                 )
                 if attempt_index >= self._single_action_max_attempts - 1:
                     raise
+                previous_snapshot_signature = ""
                 continue
             try:
                 post_action_snapshot = await self._snapshotter.capture(
@@ -1593,6 +1715,12 @@ class OpenAIResponsesBrowserAgent:
                     ),
                 },
             )
+            previous_snapshot_signature = current_snapshot_signature
+            if (
+                post_action_signature is not None
+                and post_action_signature != current_snapshot_signature
+            ):
+                stall_diagnosis = None
             return action
         msg = f"Browser agent could not complete a safe single action for {task_name}."
         raise BrowserAutomationError(msg)
@@ -1610,6 +1738,7 @@ class OpenAIResponsesBrowserAgent:
         snapshot_changed: bool,
         extra_rules: Sequence[str],
         allowed_action_types: Sequence[BrowserActionType] | None,
+        stall_diagnosis: BrowserStallDiagnosis | None = None,
     ) -> BrowserAgentAction:
         response_data = await asyncio.to_thread(
             self._create_response,
@@ -1622,6 +1751,7 @@ class OpenAIResponsesBrowserAgent:
             execution_feedback,
             snapshot_changed,
             extra_rules,
+            stall_diagnosis,
         )
         raw_output = self._extract_output_text(response_data)
         self._append_browser_agent_log(
@@ -1668,6 +1798,7 @@ class OpenAIResponsesBrowserAgent:
         execution_feedback: Sequence[dict[str, object]],
         snapshot_changed: bool,
         extra_rules: Sequence[str],
+        stall_diagnosis: BrowserStallDiagnosis | None,
     ) -> dict[str, object]:
         elements_payload = [
             {
@@ -1715,6 +1846,9 @@ class OpenAIResponsesBrowserAgent:
             },
             "recent_action_history": list(recent_actions),
             "execution_feedback_history": list(execution_feedback),
+            "stall_diagnosis": (
+                _serialize_stall_diagnosis(stall_diagnosis) if stall_diagnosis is not None else None
+            ),
             "rules": [
                 "Return exactly one next action.",
                 "Only reference element ids that exist in the page snapshot.",
@@ -1763,6 +1897,11 @@ class OpenAIResponsesBrowserAgent:
                 (
                     "Use recent_action_history and execution_feedback_history to avoid "
                     "repeating the same failed move on an unchanged screen."
+                ),
+                (
+                    "When stall_diagnosis is present, treat it as the latest macro diagnosis "
+                    "of why progress stopped and follow its recovery plan unless the page "
+                    "now clearly shows better evidence."
                 ),
                 (
                     "Set action_intent to a short snake_case phrase when it helps "
@@ -1972,6 +2111,136 @@ class OpenAIResponsesBrowserAgent:
             },
         )
         return response_payload
+
+    async def _diagnose_stall(
+        self,
+        *,
+        snapshot: BrowserAgentSnapshot,
+        goal: str,
+        task_name: str,
+        step_index: int,
+        recent_actions: Sequence[dict[str, object]],
+        execution_feedback: Sequence[dict[str, object]],
+        repeated_snapshot_count: int,
+    ) -> BrowserStallDiagnosis:
+        response_data = await asyncio.to_thread(
+            self._create_stall_diagnosis_response,
+            snapshot,
+            goal,
+            task_name,
+            step_index,
+            repeated_snapshot_count,
+            recent_actions,
+            execution_feedback,
+        )
+        raw_output = self._extract_output_text(response_data)
+        self._append_browser_agent_log(
+            "llm/browser-agent.jsonl",
+            {
+                "kind": "stall_diagnosis_response",
+                "task_name": task_name,
+                "step_index": step_index,
+                "snapshot_signature": snapshot_signature(snapshot),
+                "model": self._model,
+                "response_payload": response_data,
+                "response_text": raw_output,
+            },
+        )
+        logger.info(
+            "linkedin_browser_agent_stall_diagnosis_response",
+            extra={"model": self._model, "task_name": task_name, "response_text": raw_output},
+        )
+        if not raw_output:
+            msg = "Browser agent returned an empty stall diagnosis."
+            raise BrowserAutomationError(msg)
+        try:
+            payload = json.loads(raw_output)
+        except json.JSONDecodeError as exc:
+            msg = "Browser agent returned invalid JSON for the stall diagnosis."
+            raise BrowserAutomationError(msg) from exc
+        return parse_browser_stall_diagnosis(payload)
+
+    def _create_stall_diagnosis_response(
+        self,
+        snapshot: BrowserAgentSnapshot,
+        goal: str,
+        task_name: str,
+        step_index: int,
+        repeated_snapshot_count: int,
+        recent_actions: Sequence[dict[str, object]],
+        execution_feedback: Sequence[dict[str, object]],
+    ) -> dict[str, object]:
+        prompt_payload = {
+            "goal": goal,
+            "task_name": task_name,
+            "step_index": step_index,
+            "repeated_snapshot_count": repeated_snapshot_count,
+            "page": serialize_snapshot(snapshot),
+            "recent_action_history": list(recent_actions),
+            "execution_feedback_history": list(execution_feedback),
+            "rules": [
+                "Diagnose why progress appears stalled on the current browser snapshot.",
+                "Use recoverable when the task can still continue with a better plan.",
+                "Use manual_intervention when a human checkpoint is likely required.",
+                "Use abort when no safe next move is available from the current surface.",
+                "Keep blocker_category short and machine-friendly.",
+                "next_plan must be a short ordered recovery plan, not prose.",
+                "Base the diagnosis on the visible page plus the recent failed history.",
+            ],
+        }
+        self._append_browser_agent_log(
+            "llm/browser-agent.jsonl",
+            {
+                "kind": "stall_diagnosis_request",
+                "task_name": task_name,
+                "step_index": step_index,
+                "snapshot_signature": snapshot_signature(snapshot),
+                "model": self._model,
+                "prompt_payload": prompt_payload,
+            },
+        )
+        body = {
+            "model": self._model,
+            "input": [
+                {
+                    "role": "developer",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "You are diagnosing why a LinkedIn browser task is stalled. "
+                                "Return a compact machine-readable diagnosis and a short "
+                                "recovery plan."
+                            ),
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": json.dumps(prompt_payload, ensure_ascii=True),
+                        },
+                    ],
+                },
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "browser_agent_stall_diagnosis",
+                    "schema": STRUCTURED_STALL_DIAGNOSIS_SCHEMA,
+                    "strict": True,
+                },
+            },
+        }
+        payload_bytes = json.dumps(body, ensure_ascii=True).encode("utf-8")
+        return self._post_openai_response(
+            payload_bytes=payload_bytes,
+            task_name=task_name,
+            mode="assessment",
+            log_event_name="openai_browser_agent_stall_diagnosis_http_error",
+        )
 
     def _post_openai_response(
         self,
@@ -2429,6 +2698,39 @@ def parse_browser_task_assessment(payload: dict[str, object]) -> BrowserTaskAsse
         status=cast(BrowserAssessmentStatus, status),
         confidence=max(0.0, min(1.0, confidence)),
         summary=str(payload.get("summary") or "").strip(),
+        evidence=evidence,
+    )
+
+
+def parse_browser_stall_diagnosis(payload: dict[str, object]) -> BrowserStallDiagnosis:
+    """Validate the structured stall diagnosis returned by the browser planner."""
+
+    status = payload.get("status")
+    if status not in {"recoverable", "manual_intervention", "abort"}:
+        msg = "Browser agent returned an unsupported stall diagnosis status."
+        raise BrowserAutomationError(msg)
+
+    blocker_category = collapse_text(str(payload.get("blocker_category") or ""))
+    if not blocker_category:
+        blocker_category = "unknown_blocker"
+
+    next_plan_raw = payload.get("next_plan", ())
+    next_plan_items = next_plan_raw if isinstance(next_plan_raw, list) else ()
+    next_plan = tuple(
+        item.strip() for item in next_plan_items if isinstance(item, str) and item.strip()
+    )
+
+    evidence_raw = payload.get("evidence", ())
+    evidence_items = evidence_raw if isinstance(evidence_raw, list) else ()
+    evidence = tuple(
+        item.strip() for item in evidence_items if isinstance(item, str) and item.strip()
+    )
+
+    return BrowserStallDiagnosis(
+        status=cast(BrowserStallStatus, status),
+        summary=str(payload.get("summary") or "").strip(),
+        blocker_category=blocker_category,
+        next_plan=next_plan,
         evidence=evidence,
     )
 

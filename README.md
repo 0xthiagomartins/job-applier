@@ -116,7 +116,7 @@ For deeper agent debugging, the last-run bundle now also keeps machine-oriented 
 - `browser-agent/task-trace.jsonl`: snapshot -> action -> result trace for multi-step browser tasks
 - `browser-agent/single-action-trace.jsonl`: focused micro-action traces used inside Easy Apply
 
-For low-cost manual debugging, you can enable `JOB_APPLIER_AGENT_TEST_MODE=true`. In this mode the app processes only 1 selected job per run, disables OpenAI HTTP retries, and gives each browser micro-action only 1 attempt.
+For low-cost manual debugging, you can enable `JOB_APPLIER_AGENT_TEST_MODE=true`. In this mode the app processes only 1 selected job per run, disables OpenAI HTTP retries, and keeps the richer browser-agent traces so we can refine prompts without falling back to brittle heuristics.
 
 ## Quality commands
 

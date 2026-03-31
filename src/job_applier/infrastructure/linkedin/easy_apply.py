@@ -2382,6 +2382,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
             single_action_max_attempts=(
                 self._runtime_settings.resolved_browser_agent_single_action_max_attempts
             ),
+            stall_threshold=self._runtime_settings.resolved_browser_agent_stall_threshold,
             min_action_delay_ms=self._runtime_settings.linkedin_min_action_delay_ms,
             max_action_delay_ms=self._runtime_settings.linkedin_max_action_delay_ms,
             openai_max_retries=self._runtime_settings.resolved_openai_responses_max_retries,

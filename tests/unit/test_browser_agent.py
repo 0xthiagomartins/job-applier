@@ -13,6 +13,7 @@ from job_applier.infrastructure.linkedin.browser_agent import (
     estimate_openai_retry_delay_seconds,
     has_manual_intervention_cues,
     parse_browser_action,
+    parse_browser_stall_diagnosis,
     parse_browser_task_assessment,
     serialize_snapshot,
     snapshot_signature,
@@ -226,6 +227,26 @@ def test_parse_browser_task_assessment_accepts_blocked_state() -> None:
     assert assessment.confidence == 0.94
     assert assessment.summary
     assert assessment.evidence == ("required", "phone number", "warning")
+
+
+def test_parse_browser_stall_diagnosis_accepts_recoverable_plan() -> None:
+    diagnosis = parse_browser_stall_diagnosis(
+        {
+            "status": "recoverable",
+            "summary": "The same autocomplete field stayed invalid across repeated snapshots.",
+            "blocker_category": "autocomplete_confirmation",
+            "next_plan": [
+                "Focus the invalid combobox",
+                "Use ArrowDown to inspect suggestions",
+                "Confirm the closest valid option with Enter",
+            ],
+            "evidence": ["aria-invalid", "combobox", "Please enter a valid answer"],
+        }
+    )
+
+    assert diagnosis.status == "recoverable"
+    assert diagnosis.blocker_category == "autocomplete_confirmation"
+    assert diagnosis.next_plan[0] == "Focus the invalid combobox"
 
 
 def test_summarize_browser_action_error_normalizes_overlay_interception() -> None:
