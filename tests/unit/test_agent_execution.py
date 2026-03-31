@@ -235,6 +235,72 @@ def test_orchestrator_only_submits_jobs_that_pass_scoring(tmp_path: Path) -> Non
     )
 
 
+def test_orchestrator_test_limit_stops_after_first_selected_job(tmp_path: Path) -> None:
+    panel_store = build_ready_panel_store(tmp_path / "panel")
+    execution_store = LocalExecutionStore(root_dir=tmp_path / "executions")
+    submission_store = InMemorySuccessfulSubmissionStore()
+
+    postings = [
+        JobPosting(
+            platform=Platform.LINKEDIN,
+            url=f"https://www.linkedin.com/jobs/view/{index}",
+            title=f"Python Automation Engineer {index}",
+            company_name=f"Company {index}",
+            description_raw="Python automation with FastAPI.",
+        )
+        for index in range(1, 4)
+    ]
+
+    class FakeFetcher(JobFetcher):
+        async def fetch(self, settings):
+            del settings
+            return postings
+
+    class FakeScorer(JobScorer):
+        async def score(self, settings, posting):
+            del settings
+            return ScoredJobPosting(posting=posting, selected=True, score=0.91, reason="accepted")
+
+    class FakeSubmitter(JobSubmitter):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def submit(self, settings, posting, *, execution_id, origin):
+            del settings, execution_id
+            self.calls.append(posting.title)
+            return SubmissionAttempt(
+                submission=ApplicationSubmission(
+                    job_posting_id=posting.id,
+                    execution_origin=origin,
+                ),
+            )
+
+    submitter = FakeSubmitter()
+    orchestrator = AgentExecutionOrchestrator(
+        panel_store=panel_store,
+        execution_store=execution_store,
+        successful_submission_store=submission_store,
+        job_fetcher=FakeFetcher(),
+        job_scorer=FakeScorer(),
+        job_submitter=submitter,
+        max_selected_jobs_per_run=1,
+    )
+
+    summary = asyncio.run(orchestrator.run_execution(origin=ExecutionOrigin.MANUAL))
+    events = execution_store.list_events(summary.execution_id)
+
+    assert summary.status is AgentExecutionStatus.COMPLETED
+    assert summary.jobs_seen == 3
+    assert summary.jobs_selected == 1
+    assert summary.successful_submissions == 1
+    assert submitter.calls == ["Python Automation Engineer 1"]
+    assert any(
+        event["event_type"] == ExecutionEventType.STEP_REACHED.value
+        and "selected_job_limit_reached" in event["payload_json"]
+        for event in events
+    )
+
+
 def build_ready_panel_store(root_dir: Path) -> LocalPanelSettingsStore:
     store = LocalPanelSettingsStore(root_dir=root_dir)
     store.save_profile(

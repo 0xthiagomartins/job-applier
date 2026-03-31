@@ -1168,6 +1168,7 @@ class OpenAIResponsesBrowserAgent:
         api_key: SecretStr,
         model: str,
         max_steps: int = 18,
+        single_action_max_attempts: int = 3,
         snapshotter: BrowserDomSnapshotter | None = None,
         min_action_delay_ms: int = 350,
         max_action_delay_ms: int = 950,
@@ -1177,6 +1178,7 @@ class OpenAIResponsesBrowserAgent:
         self._api_key = api_key
         self._model = model
         self._max_steps = max_steps
+        self._single_action_max_attempts = max(1, single_action_max_attempts)
         self._snapshotter = snapshotter or BrowserDomSnapshotter()
         self._min_action_delay_ms = max(0, min_action_delay_ms)
         self._max_action_delay_ms = max(self._min_action_delay_ms, max_action_delay_ms)
@@ -1475,7 +1477,7 @@ class OpenAIResponsesBrowserAgent:
 
         feedback_history: list[dict[str, object]] = []
         history = list(recent_actions)
-        for attempt_index in range(3):
+        for attempt_index in range(self._single_action_max_attempts):
             snapshot = await self._snapshotter.capture(
                 page,
                 focus_locator=focus_locator,
@@ -1557,7 +1559,7 @@ class OpenAIResponsesBrowserAgent:
                         "feedback": feedback,
                     },
                 )
-                if attempt_index >= 2:
+                if attempt_index >= self._single_action_max_attempts - 1:
                     raise
                 continue
             try:

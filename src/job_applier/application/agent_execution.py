@@ -283,6 +283,7 @@ class AgentExecutionOrchestrator:
         job_scorer: JobScorer | None = None,
         job_submitter: JobSubmitter | None = None,
         output_dir: Path | None = None,
+        max_selected_jobs_per_run: int | None = None,
     ) -> None:
         self._panel_store = panel_store
         self._execution_store = execution_store
@@ -291,6 +292,9 @@ class AgentExecutionOrchestrator:
         self._job_scorer = job_scorer or PassThroughJobScorer()
         self._job_submitter = job_submitter or NoOpJobSubmitter()
         self._output_dir = output_dir
+        self._max_selected_jobs_per_run = (
+            max(1, max_selected_jobs_per_run) if max_selected_jobs_per_run is not None else None
+        )
 
     async def run_execution(self, *, origin: ExecutionOrigin) -> ExecutionRunSummary:
         """Run one agent execution from config load to application attempts."""
@@ -575,6 +579,14 @@ class AgentExecutionOrchestrator:
                         "error_count": error_count,
                     },
                 )
+                if self._emit_selected_job_limit_if_needed(
+                    execution_id=execution_id,
+                    jobs=len(jobs),
+                    jobs_selected=jobs_selected,
+                    successful_submissions=successful_submissions,
+                    error_count=error_count,
+                ):
+                    break
                 continue
             submission = attempt.submission
 
@@ -609,6 +621,14 @@ class AgentExecutionOrchestrator:
                         "error_count": error_count,
                     },
                 )
+                if self._emit_selected_job_limit_if_needed(
+                    execution_id=execution_id,
+                    jobs=len(jobs),
+                    jobs_selected=jobs_selected,
+                    successful_submissions=successful_submissions,
+                    error_count=error_count,
+                ):
+                    break
                 continue
 
             if submission.status is SubmissionStatus.FAILED:
@@ -645,6 +665,14 @@ class AgentExecutionOrchestrator:
                         "error_count": error_count,
                     },
                 )
+                if self._emit_selected_job_limit_if_needed(
+                    execution_id=execution_id,
+                    jobs=len(jobs),
+                    jobs_selected=jobs_selected,
+                    successful_submissions=successful_submissions,
+                    error_count=error_count,
+                ):
+                    break
                 continue
 
             record = attempt.successful_record or create_successful_submission_record(
@@ -685,6 +713,15 @@ class AgentExecutionOrchestrator:
                     "error_count": error_count,
                 },
             )
+
+            if self._emit_selected_job_limit_if_needed(
+                execution_id=execution_id,
+                jobs=len(jobs),
+                jobs_selected=jobs_selected,
+                successful_submissions=successful_submissions,
+                error_count=error_count,
+            ):
+                break
 
         final_summary = summary.model_copy(
             update={
@@ -789,6 +826,50 @@ class AgentExecutionOrchestrator:
             extra={"execution_id": str(summary.execution_id), "stage": stage},
         )
         return failed_summary
+
+    def _emit_selected_job_limit_if_needed(
+        self,
+        *,
+        execution_id: UUID,
+        jobs: int,
+        jobs_selected: int,
+        successful_submissions: int,
+        error_count: int,
+    ) -> bool:
+        if (
+            self._max_selected_jobs_per_run is None
+            or jobs_selected < self._max_selected_jobs_per_run
+        ):
+            return False
+        self._emit_event(
+            execution_id=execution_id,
+            event_type=ExecutionEventType.STEP_REACHED,
+            payload={
+                "stage": "selected_job_limit_reached",
+                "jobs_selected": jobs_selected,
+                "max_selected_jobs_per_run": self._max_selected_jobs_per_run,
+            },
+        )
+        update_progress_snapshot(
+            {
+                "status": "running",
+                "current_stage": "selected_job_limit_reached",
+                "jobs_seen": jobs,
+                "jobs_selected": jobs_selected,
+                "successful_submissions": successful_submissions,
+                "error_count": error_count,
+                "current_job": None,
+            },
+        )
+        append_timeline_event(
+            "selected_job_limit_reached",
+            {
+                "execution_id": str(execution_id),
+                "jobs_selected": jobs_selected,
+                "max_selected_jobs_per_run": self._max_selected_jobs_per_run,
+            },
+        )
+        return True
 
     def _emit_event(
         self,

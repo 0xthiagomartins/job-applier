@@ -347,7 +347,9 @@ class PlaywrightLinkedInJobsClient:
             playwright_mcp_stdio_command=(
                 self._runtime_settings.resolved_playwright_mcp_stdio_command
             ),
-            openai_responses_max_retries=self._runtime_settings.openai_responses_max_retries,
+            openai_responses_max_retries=(
+                self._runtime_settings.resolved_openai_responses_max_retries
+            ),
             openai_responses_retry_max_delay_seconds=(
                 self._runtime_settings.openai_responses_retry_max_delay_seconds
             ),
@@ -529,7 +531,7 @@ class PlaywrightLinkedInJobsClient:
             model=criteria.ai_model,
             min_action_delay_ms=self._runtime_settings.linkedin_min_action_delay_ms,
             max_action_delay_ms=self._runtime_settings.linkedin_max_action_delay_ms,
-            openai_max_retries=self._runtime_settings.openai_responses_max_retries,
+            openai_max_retries=self._runtime_settings.resolved_openai_responses_max_retries,
             openai_retry_max_delay_seconds=(
                 self._runtime_settings.openai_responses_retry_max_delay_seconds
             ),
@@ -774,7 +776,7 @@ class PlaywrightLinkedInJobsClient:
             model=criteria.ai_model,
             min_action_delay_ms=self._runtime_settings.linkedin_min_action_delay_ms,
             max_action_delay_ms=self._runtime_settings.linkedin_max_action_delay_ms,
-            openai_max_retries=self._runtime_settings.openai_responses_max_retries,
+            openai_max_retries=self._runtime_settings.resolved_openai_responses_max_retries,
             openai_retry_max_delay_seconds=(
                 self._runtime_settings.openai_responses_retry_max_delay_seconds
             ),

@@ -1,10 +1,15 @@
 import asyncio
+from typing import cast
 
-from playwright.async_api import async_playwright
+from playwright.async_api import Page, async_playwright
+from pydantic import SecretStr
 
 from job_applier.infrastructure.linkedin.browser_agent import (
+    BrowserAgentAction,
     BrowserAgentSnapshot,
+    BrowserAutomationError,
     BrowserDomSnapshotter,
+    OpenAIResponsesBrowserAgent,
     estimate_openai_retry_delay_seconds,
     has_manual_intervention_cues,
     parse_browser_action,
@@ -92,6 +97,71 @@ def test_parse_browser_action_accepts_press_payload() -> None:
     assert action.action_type == "press"
     assert action.key_name == "Enter"
     assert action.action_intent == "confirm_autocomplete_choice"
+
+
+def test_browser_agent_single_action_respects_attempt_limit() -> None:
+    async def scenario() -> None:
+        agent = OpenAIResponsesBrowserAgent(
+            api_key=SecretStr("sk-test"),
+            model="o3-mini",
+            single_action_max_attempts=1,
+        )
+        snapshot = BrowserAgentSnapshot(
+            url="https://www.linkedin.com/jobs/view/123",
+            title="LinkedIn",
+            visible_text="Easy Apply",
+            elements=(),
+        )
+        plan_calls = 0
+        execute_calls = 0
+
+        async def fake_capture(*args, **kwargs):
+            del args, kwargs
+            return snapshot
+
+        async def fake_plan_action(**kwargs):
+            nonlocal plan_calls
+            plan_calls += 1
+            return BrowserAgentAction(
+                action_type="click",
+                element_id="agent-1",
+                value_source=None,
+                value=None,
+                action_intent="open_easy_apply",
+                key_name=None,
+                scroll_target=None,
+                scroll_direction=None,
+                scroll_amount=550,
+                wait_seconds=0,
+                reasoning="Click the only visible apply button.",
+            )
+
+        async def fake_execute_action(**kwargs):
+            nonlocal execute_calls
+            execute_calls += 1
+            del kwargs
+            raise BrowserAutomationError("synthetic failure")
+
+        agent._snapshotter.capture = fake_capture  # type: ignore[method-assign]
+        agent._plan_action = fake_plan_action  # type: ignore[method-assign]
+        agent._execute_action = fake_execute_action  # type: ignore[method-assign]
+
+        try:
+            await agent.perform_single_task_action(
+                page=cast(Page, object()),
+                available_values={},
+                goal="Open Easy Apply",
+                task_name="linkedin_open_easy_apply",
+            )
+        except BrowserAutomationError as exc:
+            assert str(exc) == "synthetic failure"
+        else:
+            raise AssertionError("Expected BrowserAutomationError to be raised.")
+
+        assert plan_calls == 1
+        assert execute_calls == 1
+
+    asyncio.run(scenario())
 
 
 def test_manual_intervention_detection_flags_captcha_and_otp_pages() -> None:

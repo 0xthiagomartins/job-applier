@@ -30,6 +30,8 @@ class RuntimeSettings(BaseSettings):
     playwright_mcp_prefer_stdio_for_local: bool = True
     playwright_mcp_stdio_command: str | None = None
     scheduler_poll_interval_seconds: int = 30
+    agent_test_mode: bool = False
+    agent_max_selected_jobs_per_run: int | None = None
     playwright_headless: bool = False
     playwright_trace_enabled: bool = True
     playwright_display: str | None = Field(default=None, alias="DISPLAY")
@@ -47,6 +49,7 @@ class RuntimeSettings(BaseSettings):
     openai_api_key: SecretStr | None = None
     openai_responses_max_retries: int = 2
     openai_responses_retry_max_delay_seconds: float = 20.0
+    browser_agent_single_action_max_attempts: int = 3
     bootstrap_panel_on_empty_state: bool = True
     bootstrap_profile_name: str | None = None
     bootstrap_profile_email: str | None = None
@@ -115,6 +118,32 @@ class RuntimeSettings(BaseSettings):
 
         raw_value = self.playwright_mcp_stdio_command or "npx -y @playwright/mcp@latest"
         return tuple(part for part in shlex.split(raw_value) if part)
+
+    @property
+    def resolved_agent_max_selected_jobs_per_run(self) -> int | None:
+        """Return the selected-job cap for one run when a test limit is configured."""
+
+        if self.agent_max_selected_jobs_per_run is not None:
+            return max(1, self.agent_max_selected_jobs_per_run)
+        if self.agent_test_mode:
+            return 1
+        return None
+
+    @property
+    def resolved_openai_responses_max_retries(self) -> int:
+        """Return the effective OpenAI retry budget for the current runtime mode."""
+
+        if self.agent_test_mode:
+            return 0
+        return max(0, self.openai_responses_max_retries)
+
+    @property
+    def resolved_browser_agent_single_action_max_attempts(self) -> int:
+        """Return how many retries one browser micro-action may take."""
+
+        if self.agent_test_mode:
+            return 1
+        return max(1, self.browser_agent_single_action_max_attempts)
 
     @property
     def resolved_linkedin_storage_state_path(self) -> Path:

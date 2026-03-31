@@ -2354,7 +2354,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
             playwright_mcp_stdio_command=(
                 self._runtime_settings.resolved_playwright_mcp_stdio_command
             ),
-            openai_responses_max_retries=self._runtime_settings.openai_responses_max_retries,
+            openai_responses_max_retries=(
+                self._runtime_settings.resolved_openai_responses_max_retries
+            ),
             openai_responses_retry_max_delay_seconds=(
                 self._runtime_settings.openai_responses_retry_max_delay_seconds
             ),
@@ -2377,9 +2379,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
         return OpenAIResponsesBrowserAgent(
             api_key=api_key,
             model=settings.ai.model,
+            single_action_max_attempts=(
+                self._runtime_settings.resolved_browser_agent_single_action_max_attempts
+            ),
             min_action_delay_ms=self._runtime_settings.linkedin_min_action_delay_ms,
             max_action_delay_ms=self._runtime_settings.linkedin_max_action_delay_ms,
-            openai_max_retries=self._runtime_settings.openai_responses_max_retries,
+            openai_max_retries=self._runtime_settings.resolved_openai_responses_max_retries,
             openai_retry_max_delay_seconds=(
                 self._runtime_settings.openai_responses_retry_max_delay_seconds
             ),

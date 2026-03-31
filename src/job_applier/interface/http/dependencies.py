@@ -188,6 +188,7 @@ def get_agent_orchestrator() -> AgentExecutionOrchestrator:
         job_scorer=get_job_scorer(),
         job_submitter=get_job_submitter(),
         output_dir=settings.output_dir,
+        max_selected_jobs_per_run=settings.resolved_agent_max_selected_jobs_per_run,
     )
 
 
