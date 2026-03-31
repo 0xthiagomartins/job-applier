@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from job_applier.domain import ApplicationSubmission, ExecutionOrigin
+from job_applier.domain import ApplicationSubmission, ExecutionOrigin, SubmissionStatus
 from job_applier.infrastructure.sqlite import create_session_factory
 from job_applier.infrastructure.sqlite.repositories import (
     SqliteAnswerRepository,
@@ -90,6 +90,9 @@ def test_sqlite_repositories_support_roundtrip_crud(tmp_path: Path) -> None:
         submitted_from=utc_dt(28, 0),
         submitted_to=utc_dt(28, 23),
     ) == [saved_submission]
+    assert (
+        submission_repo.find_latest_successful_for_job_posting(saved_posting.id) == saved_submission
+    )
 
     updated_submission = submission_repo.save(
         replace(saved_submission, notes="updated after recruiter follow-up"),
@@ -153,3 +156,52 @@ def test_sqlite_repositories_enforce_foreign_keys_for_submission_links(tmp_path:
                 timestamp=utc_dt(28, 11),
             ),
         )
+
+
+def test_sqlite_submission_repository_returns_latest_successful_by_job(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'repository-successful-lookup.db').resolve()}"
+    upgrade_to_head(database_url)
+    session_factory = create_session_factory(database_url)
+
+    posting_repo = SqliteJobPostingRepository(session_factory)
+    snapshot_repo = SqliteProfileSnapshotRepository(session_factory)
+    submission_repo = SqliteSubmissionRepository(session_factory)
+
+    posting = posting_repo.save(
+        build_posting(
+            company_name="Acme",
+            title="Senior Backend Engineer",
+            external_job_id="job-success-lookup",
+            captured_at=utc_dt(28, 10),
+        ),
+    )
+    snapshot = snapshot_repo.save(build_snapshot(created_at=utc_dt(28, 10)))
+
+    older_submission = submission_repo.save(
+        build_submission(
+            job_posting_id=posting.id,
+            profile_snapshot_id=snapshot.id,
+            submitted_at=utc_dt(28, 11),
+            note_suffix=" older",
+        ),
+    )
+    failed_submission = submission_repo.save(
+        ApplicationSubmission(
+            job_posting_id=posting.id,
+            execution_origin=ExecutionOrigin.MANUAL,
+            status=SubmissionStatus.FAILED,
+            notes="validation error",
+        )
+    )
+    newer_submission = submission_repo.save(
+        build_submission(
+            job_posting_id=posting.id,
+            profile_snapshot_id=snapshot.id,
+            submitted_at=utc_dt(28, 13),
+            note_suffix=" newer",
+        ),
+    )
+
+    assert older_submission.id != newer_submission.id
+    assert failed_submission is not None
+    assert submission_repo.find_latest_successful_for_job_posting(posting.id) == newer_submission

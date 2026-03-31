@@ -28,6 +28,7 @@ from job_applier.domain import (
     Platform,
     ScheduleFrequency,
     SeniorityLevel,
+    SubmissionStatus,
     WorkplaceType,
 )
 from job_applier.infrastructure import (
@@ -297,6 +298,111 @@ def test_orchestrator_test_limit_stops_after_first_selected_job(tmp_path: Path) 
     assert any(
         event["event_type"] == ExecutionEventType.STEP_REACHED.value
         and "selected_job_limit_reached" in event["payload_json"]
+        for event in events
+    )
+
+
+def test_orchestrator_skips_already_applied_jobs_before_submit(tmp_path: Path) -> None:
+    panel_store = build_ready_panel_store(tmp_path / "panel")
+    execution_store = LocalExecutionStore(root_dir=tmp_path / "executions")
+    submission_store = InMemorySuccessfulSubmissionStore()
+
+    posting = JobPosting(
+        platform=Platform.LINKEDIN,
+        url="https://www.linkedin.com/jobs/view/already-applied",
+        title="Senior Python Automation Engineer",
+        company_name="Acme",
+        description_raw="Python automation with FastAPI.",
+    )
+    existing_submission = ApplicationSubmission(
+        id=uuid4(),
+        job_posting_id=posting.id,
+        status=SubmissionStatus.SUBMITTED,
+        started_at=datetime(2026, 3, 28, 22, 55, tzinfo=UTC),
+        submitted_at=datetime(2026, 3, 28, 23, 0, tzinfo=UTC),
+        profile_snapshot_id=uuid4(),
+        ruleset_version="ruleset-v1",
+        execution_origin=ExecutionOrigin.MANUAL,
+        notes="Already applied successfully.",
+    )
+
+    class FakeFetcher(JobFetcher):
+        async def fetch(self, settings):
+            del settings
+            return [posting]
+
+    class FakeScorer(JobScorer):
+        async def score(self, settings, posting):
+            del settings
+            return ScoredJobPosting(posting=posting, selected=True, score=0.95, reason="accepted")
+
+    class FakeSubmitter(JobSubmitter):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def submit(self, settings, posting, *, execution_id, origin):
+            del settings, posting, execution_id, origin
+            self.calls += 1
+            raise AssertionError("submit should not be called for already-applied jobs")
+
+    class FakeSubmissionRepository:
+        def find_latest_successful_for_job_posting(self, job_posting_id):
+            assert job_posting_id == posting.id
+            return existing_submission
+
+        def save(self, entity):
+            return entity
+
+        def get(self, entity_id):
+            del entity_id
+            return None
+
+        def list(self, *, limit=100, offset=0):
+            del limit, offset
+            return []
+
+        def delete(self, entity_id):
+            del entity_id
+
+        def list_by_submitted_at(
+            self,
+            *,
+            submitted_from=None,
+            submitted_to=None,
+            limit=100,
+            offset=0,
+        ):
+            del submitted_from, submitted_to, limit, offset
+            return []
+
+    submitter = FakeSubmitter()
+    orchestrator = AgentExecutionOrchestrator(
+        panel_store=panel_store,
+        execution_store=execution_store,
+        successful_submission_store=submission_store,
+        submission_repository=FakeSubmissionRepository(),
+        job_fetcher=FakeFetcher(),
+        job_scorer=FakeScorer(),
+        job_submitter=submitter,
+    )
+
+    summary = asyncio.run(orchestrator.run_execution(origin=ExecutionOrigin.MANUAL))
+    events = execution_store.list_events(summary.execution_id)
+
+    assert summary.status is AgentExecutionStatus.COMPLETED
+    assert summary.jobs_seen == 1
+    assert summary.jobs_selected == 1
+    assert summary.successful_submissions == 0
+    assert summary.error_count == 0
+    assert submitter.calls == 0
+    assert any(
+        event["event_type"] == ExecutionEventType.STEP_REACHED.value
+        and '"reason": "already_applied"' in event["payload_json"]
+        for event in events
+    )
+    assert any(
+        event["event_type"] == ExecutionEventType.JOB_PROCESSED.value
+        and '"status": "skipped"' in event["payload_json"]
         for event in events
     )
 

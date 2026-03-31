@@ -55,6 +55,12 @@ class JobPostingRepository(Repository[JobPosting], Protocol):
 class SubmissionRepository(Repository[ApplicationSubmission], Protocol):
     """Persistence contract for submissions."""
 
+    def find_latest_successful_for_job_posting(
+        self,
+        job_posting_id: UUID,
+    ) -> ApplicationSubmission | None:
+        """Return the latest successful submission for one job posting when present."""
+
     def list_by_submitted_at(
         self,
         *,

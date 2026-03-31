@@ -184,6 +184,7 @@ def get_agent_orchestrator() -> AgentExecutionOrchestrator:
         panel_store=get_panel_settings_store(),
         execution_store=get_execution_store(),
         successful_submission_store=get_successful_submission_store(),
+        submission_repository=get_submission_repository(),
         job_fetcher=get_job_fetcher(),
         job_scorer=get_job_scorer(),
         job_submitter=get_job_submitter(),

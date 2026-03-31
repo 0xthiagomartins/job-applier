@@ -22,6 +22,7 @@ from job_applier.application.config import (
     UserProfileConfig,
 )
 from job_applier.application.panel import PanelSettingsDocument
+from job_applier.application.repositories import SubmissionRepository
 from job_applier.application.snapshotting import (
     SuccessfulSubmissionRecord,
     build_profile_snapshot,
@@ -279,6 +280,7 @@ class AgentExecutionOrchestrator:
         panel_store: LocalPanelSettingsStore,
         execution_store: ExecutionStore,
         successful_submission_store: SuccessfulSubmissionStore,
+        submission_repository: SubmissionRepository | None = None,
         job_fetcher: JobFetcher | None = None,
         job_scorer: JobScorer | None = None,
         job_submitter: JobSubmitter | None = None,
@@ -288,6 +290,7 @@ class AgentExecutionOrchestrator:
         self._panel_store = panel_store
         self._execution_store = execution_store
         self._successful_submission_store = successful_submission_store
+        self._submission_repository = submission_repository
         self._job_fetcher = job_fetcher or EmptyJobFetcher()
         self._job_scorer = job_scorer or PassThroughJobScorer()
         self._job_submitter = job_submitter or NoOpJobSubmitter()
@@ -544,6 +547,68 @@ class AgentExecutionOrchestrator:
             )
             append_timeline_event("submit_job_started", {**current_job, "score": scored_job.score})
 
+            existing_submission = self._find_existing_successful_submission(posting)
+            if existing_submission is not None:
+                skip_notes = (
+                    "A successful application for this job posting already exists in the audit "
+                    "history."
+                )
+                self._emit_event(
+                    execution_id=execution_id,
+                    submission_id=existing_submission.id,
+                    event_type=ExecutionEventType.STEP_REACHED,
+                    payload={
+                        "stage": "submit_skipped",
+                        "reason": "already_applied",
+                        "job_posting_id": str(posting.id),
+                        "submission_id": str(existing_submission.id),
+                        "notes": skip_notes,
+                    },
+                )
+                self._emit_event(
+                    execution_id=execution_id,
+                    submission_id=existing_submission.id,
+                    event_type=ExecutionEventType.JOB_PROCESSED,
+                    payload={
+                        "job_posting_id": str(posting.id),
+                        "status": SubmissionStatus.SKIPPED.value,
+                        "submission_id": str(existing_submission.id),
+                        "reason": "already_applied",
+                    },
+                )
+                update_progress_snapshot(
+                    {
+                        "status": "running",
+                        "current_stage": "submit_skipped",
+                        "current_job": {
+                            **current_job,
+                            "submission_id": str(existing_submission.id),
+                            "skip_reason": "already_applied",
+                        },
+                        "jobs_seen": len(jobs),
+                        "jobs_selected": jobs_selected,
+                        "successful_submissions": successful_submissions,
+                        "error_count": error_count,
+                    },
+                )
+                append_timeline_event(
+                    "submit_skipped",
+                    {
+                        **current_job,
+                        "submission_id": str(existing_submission.id),
+                        "reason": "already_applied",
+                    },
+                )
+                if self._emit_selected_job_limit_if_needed(
+                    execution_id=execution_id,
+                    jobs=len(jobs),
+                    jobs_selected=jobs_selected,
+                    successful_submissions=successful_submissions,
+                    error_count=error_count,
+                ):
+                    break
+                continue
+
             try:
                 attempt = await self._job_submitter.submit(
                     settings,
@@ -769,6 +834,14 @@ class AgentExecutionOrchestrator:
             },
         )
         return final_summary
+
+    def _find_existing_successful_submission(
+        self,
+        posting: JobPosting,
+    ) -> ApplicationSubmission | None:
+        if self._submission_repository is None:
+            return None
+        return self._submission_repository.find_latest_successful_for_job_posting(posting.id)
 
     def list_recent_executions(self, *, limit: int = 10) -> list[ExecutionRunSummary]:
         """Return recent execution summaries."""

@@ -400,6 +400,20 @@ class SqliteSubmissionRepository(
             ApplicationSubmissionModel.id,
         )
 
+    def find_latest_successful_for_job_posting(
+        self,
+        job_posting_id: UUID,
+    ) -> ApplicationSubmission | None:
+        statement = self._apply_ordering(
+            self._base_query().where(
+                ApplicationSubmissionModel.job_posting_id == job_posting_id,
+                ApplicationSubmissionModel.status == SubmissionStatus.SUBMITTED.value,
+            ),
+        ).limit(1)
+        with self._session_provider() as session:
+            model = session.scalar(statement)
+            return None if model is None else self._from_model(model)
+
     def list_by_submitted_at(
         self,
         *,
