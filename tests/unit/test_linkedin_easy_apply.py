@@ -34,6 +34,7 @@ from job_applier.infrastructure.linkedin import (
 from job_applier.infrastructure.linkedin.easy_apply import (
     PlaywrightLinkedInEasyApplyExecutor,
     TextFieldInteractionState,
+    _pick_resume_option_index,
 )
 
 
@@ -73,6 +74,14 @@ from job_applier.infrastructure.linkedin.easy_apply import (
             0.9,
         ),
         ("Resume", "file", "file", (), QuestionType.RESUME_UPLOAD, 0.99),
+        (
+            "Select resume",
+            "radio",
+            "radio",
+            ("Thiago Martins - CV 2026.pdf", "Thiago Martins - CV 2024.pdf"),
+            QuestionType.RESUME_UPLOAD,
+            0.9,
+        ),
         ("Cover letter", "textarea", "textarea", (), QuestionType.COVER_LETTER, 0.99),
         (
             "Are you willing to relocate?",
@@ -332,6 +341,18 @@ def test_build_easy_apply_remediation_values_uses_descriptive_sources() -> None:
     assert values["profile_phone"] == "+5511999999999"
 
 
+def test_pick_resume_option_index_prefers_semantic_match_for_configured_cv() -> None:
+    options = (
+        "Thiago Martins - CV 2024.pdf",
+        "Thiago Martins CV 2026 - Brazil",
+        "Generic Resume",
+    )
+
+    best_index = _pick_resume_option_index(options, "Thiago Martins - CV 2026.pdf")
+
+    assert best_index == 1
+
+
 class SuccessfulGenerator:
     async def generate(
         self,
@@ -390,6 +411,8 @@ def build_user_agent_settings() -> UserAgentSettings:
                 "email": "should-not-win@example.com",
                 "work_authorization": "No",
             },
+            cv_path="/tmp/thiago-martins-cv-2026.pdf",
+            cv_filename="Thiago Martins - CV 2026.pdf",
             positive_filters=("python",),
             blacklist=("internship",),
         ),

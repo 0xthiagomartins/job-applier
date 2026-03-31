@@ -7,6 +7,7 @@ import json
 import logging
 import random
 import re
+import shutil
 import traceback
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -300,6 +301,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     ),
                 )
                 recruiter_candidate = await self._recruiter_candidate_finder.find(page, settings)
+                submission_cv_path = self._prepare_submission_cv_path(
+                    settings=settings,
+                    run_dir=run_dir,
+                    submission_id=submission_id,
+                )
 
                 try:
                     update_progress_snapshot(
@@ -437,6 +443,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         submission_id=submission_id,
                         execution_events=execution_events,
                         uploaded_cv_paths=uploaded_cv_paths,
+                        submission_cv_path=submission_cv_path,
                     )
                     answers.extend(step_answers)
                     artifacts.extend(step_artifacts)
@@ -815,12 +822,36 @@ class PlaywrightLinkedInEasyApplyExecutor:
         submission_id: UUID,
         execution_events: list[ExecutionEvent],
         uploaded_cv_paths: set[str],
+        submission_cv_path: Path | None,
     ) -> tuple[list[ApplicationAnswer], list[ArtifactSnapshot]]:
         root = await self._easy_apply_root(page)
         answers: list[ApplicationAnswer] = []
         artifacts: list[ArtifactSnapshot] = []
+        step_has_file_resume_control = any(
+            field.question_type is QuestionType.RESUME_UPLOAD and field.control_kind == "file"
+            for field in step.fields
+        )
 
         for field in step.fields:
+            if (
+                step_has_file_resume_control
+                and field.question_type is QuestionType.RESUME_UPLOAD
+                and field.control_kind != "file"
+            ):
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.STEP_REACHED,
+                    payload={
+                        "stage": "easy_apply_resume_choice_skipped",
+                        "step_index": step.step_index,
+                        "normalized_key": field.normalized_key,
+                        "control_kind": field.control_kind,
+                        "reason": "resume_upload_control_present_in_same_step",
+                    },
+                )
+                continue
             if field.question_type is QuestionType.UNKNOWN:
                 self._record_event(
                     execution_events,
@@ -845,6 +876,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 field,
                 resolution,
                 settings,
+                submission_cv_path=submission_cv_path,
             )
             if applied_value is None:
                 continue
@@ -906,7 +938,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
             )
 
             if field.question_type is QuestionType.RESUME_UPLOAD and settings.profile.cv_path:
-                cv_path = settings.profile.cv_path
+                cv_path = str(submission_cv_path or Path(settings.profile.cv_path))
                 if cv_path not in uploaded_cv_paths:
                     uploaded_cv_paths.add(cv_path)
                     artifacts.append(
@@ -926,6 +958,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
         field: EasyApplyField,
         resolution: ResolvedFieldValue,
         settings: UserAgentSettings,
+        *,
+        submission_cv_path: Path | None,
     ) -> str | None:
         match field.control_kind:
             case "text" | "textarea":
@@ -944,6 +978,13 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     settings=settings,
                 )
             case "select":
+                if field.question_type is QuestionType.RESUME_UPLOAD:
+                    return await self._apply_resume_choice_field(
+                        root=root,
+                        field=field,
+                        settings=settings,
+                        submission_cv_path=submission_cv_path,
+                    )
                 locator = await self._find_control_locator(root, field)
                 if locator is None:
                     return None
@@ -960,6 +1001,13 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 await self._select_field_option(locator, field, option_index=option_index)
                 return option
             case "checkbox":
+                if field.question_type is QuestionType.RESUME_UPLOAD:
+                    return await self._apply_resume_choice_field(
+                        root=root,
+                        field=field,
+                        settings=settings,
+                        submission_cv_path=submission_cv_path,
+                    )
                 locator = await self._find_control_locator(root, field)
                 if locator is None:
                     return None
@@ -972,6 +1020,13 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 await locator.uncheck()
                 return "No"
             case "radio":
+                if field.question_type is QuestionType.RESUME_UPLOAD:
+                    return await self._apply_resume_choice_field(
+                        root=root,
+                        field=field,
+                        settings=settings,
+                        submission_cv_path=submission_cv_path,
+                    )
                 option_index = _pick_option_index(field.options, preferred=resolution.value)
                 if option_index is None:
                     return None
@@ -981,10 +1036,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 return None
             case "file":
                 locator = await self._find_control_locator(root, field)
-                if locator is None or settings.profile.cv_path is None:
+                resolved_cv_path = submission_cv_path or _existing_path(settings.profile.cv_path)
+                if locator is None or resolved_cv_path is None:
                     return None
-                await locator.set_input_files(settings.profile.cv_path)
-                return settings.profile.cv_filename or Path(settings.profile.cv_path).name
+                await locator.set_input_files(resolved_cv_path)
+                return settings.profile.cv_filename or resolved_cv_path.name
 
     async def _complete_text_field_interaction(
         self,
@@ -1303,6 +1359,39 @@ class PlaywrightLinkedInEasyApplyExecutor:
     def _text_field_interaction_complete(self, state: TextFieldInteractionState) -> bool:
         return state.has_value and not state.needs_agentic_follow_up
 
+    async def _apply_resume_choice_field(
+        self,
+        *,
+        root: Locator,
+        field: EasyApplyField,
+        settings: UserAgentSettings,
+        submission_cv_path: Path | None,
+    ) -> str | None:
+        target_cv_name = settings.profile.cv_filename or (
+            submission_cv_path.name if submission_cv_path is not None else None
+        )
+        if target_cv_name is None:
+            return None
+        option_index = _pick_resume_option_index(field.options, target_cv_name)
+        if option_index is None:
+            return target_cv_name
+
+        match field.control_kind:
+            case "radio":
+                if await self._check_radio_option_by_index(root, field, option_index=option_index):
+                    return target_cv_name
+            case "checkbox":
+                locator = await self._find_control_locator(root, field)
+                if locator is not None:
+                    await locator.check()
+                    return target_cv_name
+            case "select":
+                locator = await self._find_control_locator(root, field)
+                if locator is not None:
+                    await self._select_field_option(locator, field, option_index=option_index)
+                    return target_cv_name
+        return None
+
     async def _check_radio_option(
         self,
         root: Locator,
@@ -1312,23 +1401,76 @@ class PlaywrightLinkedInEasyApplyExecutor:
         option_index = _pick_option_index(field.options, preferred=option)
         if option_index is None:
             return False
+        return await self._check_radio_option_by_index(root, field, option_index=option_index)
+
+    async def _check_radio_option_by_index(
+        self,
+        root: Locator,
+        field: EasyApplyField,
+        *,
+        option_index: int,
+    ) -> bool:
         option_ref = (
             field.option_refs[option_index] if len(field.option_refs) > option_index else None
         )
         if option_ref:
             locator = root.locator(_attribute_selector("data-job-applier-option-ref", option_ref))
             if await locator.count():
-                await locator.first.check()
-                return True
+                option_locator = locator.first
+                if await _radio_option_is_checked(option_locator):
+                    return True
+                if await self._activate_radio_option(root, option_locator):
+                    return True
 
         if field.name:
             group = root.locator(
                 f'input[type="radio"]{_attribute_selector("name", field.name)}',
             )
             if await group.count() > option_index:
-                await group.nth(option_index).check()
-                return True
+                option_locator = group.nth(option_index)
+                if await _radio_option_is_checked(option_locator):
+                    return True
+                if await self._activate_radio_option(root, option_locator):
+                    return True
         return False
+
+    async def _activate_radio_option(self, root: Locator, locator: Locator) -> bool:
+        try:
+            await locator.check(timeout=2_000)
+        except Exception:  # noqa: BLE001
+            pass
+        else:
+            if await _radio_option_is_checked(locator):
+                return True
+
+        input_id = await locator.get_attribute("id")
+        if input_id:
+            label = root.locator(f'label[for="{input_id}"]')
+            if await label.count():
+                try:
+                    await label.first.click(timeout=2_000)
+                except Exception:  # noqa: BLE001
+                    pass
+                if await _radio_option_is_checked(locator):
+                    return True
+
+        try:
+            activated = await locator.evaluate(
+                """
+                (node) => {
+                  if (!(node instanceof HTMLElement)) {
+                    return false;
+                  }
+                  node.click();
+                  return node instanceof HTMLInputElement ? node.checked : true;
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        if bool(activated):
+            await asyncio.sleep(0.15)
+        return await _radio_option_is_checked(locator)
 
     async def _find_control_locator(self, root: Locator, field: EasyApplyField) -> Locator | None:
         if field.dom_ref:
@@ -2543,6 +2685,25 @@ class PlaywrightLinkedInEasyApplyExecutor:
         slug = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
         return run_dir / f"{submission_id.hex}_{slug}_{token}.{extension}"
 
+    def _prepare_submission_cv_path(
+        self,
+        *,
+        settings: UserAgentSettings,
+        run_dir: Path,
+        submission_id: UUID,
+    ) -> Path | None:
+        source_path = _existing_path(settings.profile.cv_path)
+        if source_path is None:
+            return None
+        input_dir = run_dir / "input"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        filename = settings.profile.cv_filename or source_path.name
+        sanitized_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", filename).strip() or source_path.name
+        destination = input_dir / f"{submission_id.hex[:8]}-{sanitized_name}"
+        if not destination.exists():
+            shutil.copy2(source_path, destination)
+        return destination
+
     def _build_run_dir(self, posting: JobPosting, submission_id: UUID) -> Path:
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         external_job_id = posting.external_job_id or posting.id.hex
@@ -2754,6 +2915,15 @@ def _attribute_selector(attribute: str, value: str) -> str:
     return f'[{attribute}="{escaped}"]'
 
 
+def _existing_path(raw_path: str | None) -> Path | None:
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    if path.exists() and path.is_file():
+        return path
+    return None
+
+
 def _pick_option_index(options: tuple[str, ...], *, preferred: str | None) -> int | None:
     if not options:
         return None
@@ -2767,6 +2937,49 @@ def _pick_option_index(options: tuple[str, ...], *, preferred: str | None) -> in
         if normalized_preferred in normalize_text(option):
             return index
     return 0
+
+
+def _pick_resume_option_index(options: tuple[str, ...], filename: str) -> int | None:
+    if not options:
+        return None
+    scored_options = [
+        (_resume_option_match_score(option, filename), index)
+        for index, option in enumerate(options)
+    ]
+    scored_options.sort(reverse=True)
+    best_score, best_index = scored_options[0]
+    if best_score <= 0:
+        return None
+    return best_index
+
+
+def _resume_option_match_score(option_text: str, filename: str) -> int:
+    normalized_option = normalize_text(option_text)
+    normalized_filename = normalize_text(filename)
+    filename_stem = normalize_text(Path(filename).stem)
+    if not normalized_option:
+        return 0
+    score = 0
+    if normalized_option == normalized_filename or normalized_option == filename_stem:
+        score += 100
+    if normalized_filename and normalized_filename in normalized_option:
+        score += 60
+    if filename_stem and filename_stem in normalized_option:
+        score += 50
+    option_tokens = set(re.findall(r"[a-z0-9]+", normalized_option))
+    filename_tokens = set(re.findall(r"[a-z0-9]+", filename_stem or normalized_filename))
+    shared_tokens = option_tokens & filename_tokens
+    score += len(shared_tokens) * 10
+    if "2026" in shared_tokens:
+        score += 15
+    return score
+
+
+async def _radio_option_is_checked(locator: Locator) -> bool:
+    try:
+        return await locator.is_checked()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _build_file_artifact(

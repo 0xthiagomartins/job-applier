@@ -137,13 +137,19 @@ class LinkedInQuestionClassifier:
 
         normalized = normalize_text(question_raw)
         default_key = normalize_key(question_raw)
+        normalized_options = {normalize_text(option) for option in options if option.strip()}
+        options_text = " ".join(option for option in normalized_options if option)
 
-        if control_kind == "file" and self._contains_any(normalized, "resume", "cv"):
+        if self._looks_like_resume_control(
+            question_text=normalized,
+            control_kind=control_kind,
+            options_text=options_text,
+        ):
             return QuestionClassification(
                 question_type=QuestionType.RESUME_UPLOAD,
                 normalized_key="resume_upload",
-                confidence=0.99,
-                matched_rule="file_resume",
+                confidence=0.99 if control_kind == "file" else 0.94,
+                matched_rule="file_resume" if control_kind == "file" else "choice_resume",
             )
         if "cover letter" in normalized:
             return QuestionClassification(
@@ -243,8 +249,6 @@ class LinkedInQuestionClassifier:
                 confidence=0.9,
                 matched_rule="years_experience",
             )
-
-        normalized_options = {normalize_text(option) for option in options if option.strip()}
         if normalized_options and normalized_options.issubset({"yes", "no"}):
             return QuestionClassification(
                 question_type=QuestionType.YES_NO_GENERIC,
@@ -268,6 +272,23 @@ class LinkedInQuestionClassifier:
 
     def _contains_any(self, value: str, *terms: str) -> bool:
         return any(term in value for term in terms)
+
+    def _looks_like_resume_control(
+        self,
+        *,
+        question_text: str,
+        control_kind: ControlKind,
+        options_text: str,
+    ) -> bool:
+        resume_terms = ("resume", "cv", "curriculo", "curriculum")
+        if self._contains_any(question_text, *resume_terms):
+            return True
+        if control_kind in {"radio", "checkbox", "select"} and self._contains_any(
+            options_text,
+            *resume_terms,
+        ):
+            return True
+        return False
 
 
 class LinkedInQuestionExtractor:
