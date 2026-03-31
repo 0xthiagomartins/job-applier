@@ -98,6 +98,18 @@ Runtime behavior:
 - in headful mode, the browser stays visible so the user can solve captcha or checkpoint screens.
 - when the panel state is still empty, the app bootstraps a local profile automatically from `.env` and tries to import a CV from `~/Documents`.
 
+## Last-run troubleshooting
+
+When you click `Run now`, the app resets `artifacts/last-run/` and keeps only the latest execution bundle:
+
+- `summary.json`: final outcome and counters
+- `progress.json`: current stage, current job and current step
+- `timeline.jsonl`: ordered execution timeline across orchestration, search and Easy Apply
+- `artifacts.jsonl`: index of screenshots, HTML dumps and traces created during the run
+- `run.log`: structured logs for deeper debugging
+
+The durable evidence for the product itself still lives under `artifacts/runtime/`. The `last-run` bundle exists only to make troubleshooting the latest execution fast and readable.
+
 ## Quality commands
 
 Run lint:

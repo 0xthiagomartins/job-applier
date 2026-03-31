@@ -41,17 +41,25 @@ def test_run_output_keeps_only_the_latest_execution_bundle(tmp_path: Path) -> No
     assert not (output_dir / "stale.log").exists()
     assert (output_dir / ".gitkeep").exists()
     assert (output_dir / "summary.json").exists()
+    assert (output_dir / "progress.json").exists()
     assert (output_dir / "settings-summary.json").exists()
     assert (output_dir / "run.log").exists()
+    assert (output_dir / "timeline.jsonl").exists()
     assert not (output_dir / "run.json").exists()
     assert not (output_dir / "execution-events.jsonl").exists()
 
     summary_payload = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary_payload["execution_id"] == str(summary.execution_id)
+    progress_payload = json.loads((output_dir / "progress.json").read_text(encoding="utf-8"))
+    assert progress_payload["execution_id"] == str(summary.execution_id)
+    assert progress_payload["current_stage"] == "execution_completed"
 
     run_log = (output_dir / "run.log").read_text(encoding="utf-8")
     assert '"event_type": "execution_started"' in run_log
     assert '"event_type": "execution_completed"' in run_log
+    timeline = (output_dir / "timeline.jsonl").read_text(encoding="utf-8")
+    assert '"event_type": "execution_bundle_reset"' in timeline
+    assert '"event_type": "config_loaded"' in timeline
 
 
 def build_ready_panel_store(root_dir: Path) -> LocalPanelSettingsStore:

@@ -42,9 +42,11 @@ from job_applier.domain.enums import (
 from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
 from job_applier.observability import (
     append_output_jsonl,
+    append_timeline_event,
     bind_execution_context,
     bind_run_output,
     reset_run_output,
+    update_progress_snapshot,
     write_output_json,
 )
 
@@ -320,6 +322,23 @@ class AgentExecutionOrchestrator:
         try:
             settings = build_user_agent_settings(self._panel_store.load())
         except PanelSettingsConfigurationError as exc:
+            update_progress_snapshot(
+                {
+                    "status": AgentExecutionStatus.FAILED.value,
+                    "current_stage": "load_config",
+                    "current_job": None,
+                    "current_step": None,
+                    "last_error": str(exc),
+                    "error_count": 1,
+                },
+            )
+            append_timeline_event(
+                "config_load_failed",
+                {
+                    "execution_id": str(execution_id),
+                    "message": str(exc),
+                },
+            )
             summary = ExecutionRunSummary(
                 execution_id=execution_id,
                 origin=origin,
@@ -342,6 +361,16 @@ class AgentExecutionOrchestrator:
             logger.exception("agent_execution_failed", extra={"execution_id": str(execution_id)})
             return summary
 
+        update_progress_snapshot(
+            {
+                "status": "running",
+                "current_stage": "config_loaded",
+                "current_job": None,
+                "current_step": None,
+            },
+        )
+        append_timeline_event("config_loaded", {"execution_id": str(execution_id)})
+
         snapshot = build_profile_snapshot(settings)
         summary = ExecutionRunSummary(
             execution_id=execution_id,
@@ -363,6 +392,19 @@ class AgentExecutionOrchestrator:
             },
         )
         logger.info("agent_execution_started", extra={"execution_id": str(execution_id)})
+        update_progress_snapshot(
+            {
+                "status": "running",
+                "current_stage": "fetch_jobs",
+                "current_job": None,
+                "current_step": None,
+                "jobs_seen": 0,
+                "jobs_selected": 0,
+                "successful_submissions": 0,
+                "error_count": 0,
+            },
+        )
+        append_timeline_event("fetch_jobs_started")
 
         try:
             jobs = await self._job_fetcher.fetch(settings)
@@ -385,6 +427,24 @@ class AgentExecutionOrchestrator:
                 "jobs_seen": len(jobs),
             },
         )
+        update_progress_snapshot(
+            {
+                "status": "running",
+                "current_stage": "jobs_fetched",
+                "jobs_seen": len(jobs),
+                "jobs_selected": 0,
+                "successful_submissions": 0,
+                "error_count": 0,
+                "current_job": None,
+            },
+        )
+        append_timeline_event(
+            "jobs_fetched",
+            {
+                "execution_id": str(execution_id),
+                "jobs_seen": len(jobs),
+            },
+        )
 
         latest_error: str | None = None
         error_count = 0
@@ -392,6 +452,24 @@ class AgentExecutionOrchestrator:
         successful_submissions = 0
 
         for posting in jobs:
+            current_job = {
+                "job_posting_id": str(posting.id),
+                "company_name": posting.company_name,
+                "title": posting.title,
+                "url": posting.url,
+            }
+            update_progress_snapshot(
+                {
+                    "status": "running",
+                    "current_stage": "score_job",
+                    "current_job": current_job,
+                    "jobs_seen": len(jobs),
+                    "jobs_selected": jobs_selected,
+                    "successful_submissions": successful_submissions,
+                    "error_count": error_count,
+                },
+            )
+            append_timeline_event("score_job_started", current_job)
             try:
                 scored_job = await self._job_scorer.score(settings, posting)
             except Exception as exc:  # noqa: BLE001
@@ -410,6 +488,18 @@ class AgentExecutionOrchestrator:
                     "agent_execution_score_error",
                     extra={"execution_id": str(execution_id), "job_posting_id": str(posting.id)},
                 )
+                update_progress_snapshot(
+                    {
+                        "status": "running",
+                        "current_stage": "score_job_failed",
+                        "current_job": current_job,
+                        "last_error": latest_error,
+                        "jobs_seen": len(jobs),
+                        "jobs_selected": jobs_selected,
+                        "successful_submissions": successful_submissions,
+                        "error_count": error_count,
+                    },
+                )
                 continue
 
             if not scored_job.selected:
@@ -423,9 +513,32 @@ class AgentExecutionOrchestrator:
                         "score": scored_job.score,
                     },
                 )
+                update_progress_snapshot(
+                    {
+                        "status": "running",
+                        "current_stage": "score_rejected",
+                        "current_job": {**current_job, "score": scored_job.score},
+                        "jobs_seen": len(jobs),
+                        "jobs_selected": jobs_selected,
+                        "successful_submissions": successful_submissions,
+                        "error_count": error_count,
+                    },
+                )
                 continue
 
             jobs_selected += 1
+            update_progress_snapshot(
+                {
+                    "status": "running",
+                    "current_stage": "submit_job",
+                    "current_job": {**current_job, "score": scored_job.score},
+                    "jobs_seen": len(jobs),
+                    "jobs_selected": jobs_selected,
+                    "successful_submissions": successful_submissions,
+                    "error_count": error_count,
+                },
+            )
+            append_timeline_event("submit_job_started", {**current_job, "score": scored_job.score})
 
             try:
                 attempt = await self._job_submitter.submit(
@@ -450,6 +563,18 @@ class AgentExecutionOrchestrator:
                     "agent_execution_submit_error",
                     extra={"execution_id": str(execution_id), "job_posting_id": str(posting.id)},
                 )
+                update_progress_snapshot(
+                    {
+                        "status": "running",
+                        "current_stage": "submit_job_failed",
+                        "current_job": current_job,
+                        "last_error": latest_error,
+                        "jobs_seen": len(jobs),
+                        "jobs_selected": jobs_selected,
+                        "successful_submissions": successful_submissions,
+                        "error_count": error_count,
+                    },
+                )
                 continue
             submission = attempt.submission
 
@@ -471,6 +596,17 @@ class AgentExecutionOrchestrator:
                         "job_posting_id": str(posting.id),
                         "status": submission.status.value,
                         "submission_id": str(submission.id),
+                    },
+                )
+                update_progress_snapshot(
+                    {
+                        "status": "running",
+                        "current_stage": "submit_skipped",
+                        "current_job": {**current_job, "submission_id": str(submission.id)},
+                        "jobs_seen": len(jobs),
+                        "jobs_selected": jobs_selected,
+                        "successful_submissions": successful_submissions,
+                        "error_count": error_count,
                     },
                 )
                 continue
@@ -495,6 +631,18 @@ class AgentExecutionOrchestrator:
                         "job_posting_id": str(posting.id),
                         "status": submission.status.value,
                         "submission_id": str(submission.id),
+                    },
+                )
+                update_progress_snapshot(
+                    {
+                        "status": "running",
+                        "current_stage": "submit_failed",
+                        "current_job": {**current_job, "submission_id": str(submission.id)},
+                        "last_error": latest_error,
+                        "jobs_seen": len(jobs),
+                        "jobs_selected": jobs_selected,
+                        "successful_submissions": successful_submissions,
+                        "error_count": error_count,
                     },
                 )
                 continue
@@ -524,6 +672,17 @@ class AgentExecutionOrchestrator:
                     "status": record.submission.status.value,
                     "company_name": posting.company_name,
                     "title": posting.title,
+                },
+            )
+            update_progress_snapshot(
+                {
+                    "status": "running",
+                    "current_stage": "submission_completed",
+                    "current_job": {**current_job, "submission_id": str(record.submission.id)},
+                    "jobs_seen": len(jobs),
+                    "jobs_selected": jobs_selected,
+                    "successful_submissions": successful_submissions,
+                    "error_count": error_count,
                 },
             )
 
@@ -557,6 +716,19 @@ class AgentExecutionOrchestrator:
                 "jobs_selected": final_summary.jobs_selected,
                 "successful_submissions": final_summary.successful_submissions,
                 "error_count": final_summary.error_count,
+            },
+        )
+        update_progress_snapshot(
+            {
+                "status": final_summary.status.value,
+                "current_stage": "execution_completed",
+                "current_job": None,
+                "current_step": None,
+                "jobs_seen": final_summary.jobs_seen,
+                "jobs_selected": final_summary.jobs_selected,
+                "successful_submissions": final_summary.successful_submissions,
+                "error_count": final_summary.error_count,
+                "last_error": final_summary.last_error,
             },
         )
         return final_summary
@@ -594,6 +766,24 @@ class AgentExecutionOrchestrator:
                 "message": message,
             },
         )
+        update_progress_snapshot(
+            {
+                "status": failed_summary.status.value,
+                "current_stage": stage,
+                "current_job": None,
+                "current_step": None,
+                "last_error": message,
+                "error_count": failed_summary.error_count,
+            },
+        )
+        append_timeline_event(
+            "execution_failed",
+            {
+                "execution_id": str(summary.execution_id),
+                "stage": stage,
+                "message": message,
+            },
+        )
         logger.exception(
             "agent_execution_fatal_error",
             extra={"execution_id": str(summary.execution_id), "stage": stage},
@@ -625,6 +815,15 @@ class AgentExecutionOrchestrator:
                     "execution_id": str(event.execution_id),
                     "submission_id": str(event.submission_id) if event.submission_id else None,
                     "timestamp": event.timestamp.isoformat(),
+                    "payload": payload,
+                },
+            )
+            append_timeline_event(
+                event.event_type.value,
+                {
+                    "id": str(event.id),
+                    "execution_id": str(event.execution_id),
+                    "submission_id": str(event.submission_id) if event.submission_id else None,
                     "payload": payload,
                 },
             )

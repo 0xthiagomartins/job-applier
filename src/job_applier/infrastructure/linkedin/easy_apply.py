@@ -70,7 +70,12 @@ from job_applier.infrastructure.linkedin.recruiter_connect import (
     LinkedInRecruiterCandidateFinder,
     PlaywrightRecruiterConnector,
 )
-from job_applier.observability import bind_submission_context
+from job_applier.observability import (
+    append_artifact_reference,
+    append_timeline_event,
+    bind_submission_context,
+    update_progress_snapshot,
+)
 from job_applier.settings import RuntimeSettings
 
 logger = logging.getLogger(__name__)
@@ -269,6 +274,23 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 await self._pause_before_navigation(page, reason="job_detail_open")
                 await page.goto(posting.url, wait_until="domcontentloaded")
                 await self._ensure_authenticated_page(page)
+                update_progress_snapshot(
+                    {
+                        "current_stage": "easy_apply_job_page_loaded",
+                        "current_job": self._build_progress_job(posting, submission_id),
+                        "current_step": None,
+                    },
+                )
+                append_timeline_event(
+                    "easy_apply_job_page_loaded",
+                    {
+                        "job_posting_id": str(posting.id),
+                        "external_job_id": posting.external_job_id,
+                        "title": posting.title,
+                        "company_name": posting.company_name,
+                        "url": posting.url,
+                    },
+                )
                 artifacts.extend(
                     await self._capture_debug_bundle(
                         page,
@@ -280,6 +302,13 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 recruiter_candidate = await self._recruiter_candidate_finder.find(page, settings)
 
                 try:
+                    update_progress_snapshot(
+                        {
+                            "current_stage": "easy_apply_open_modal",
+                            "current_job": self._build_progress_job(posting, submission_id),
+                            "current_step": None,
+                        },
+                    )
                     await self._open_easy_apply_modal_with_agent(
                         page,
                         settings=settings,
@@ -324,6 +353,20 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         status=SubmissionStatus.FAILED,
                         notes=notes,
                     )
+                update_progress_snapshot(
+                    {
+                        "current_stage": "easy_apply_modal_opened",
+                        "current_job": self._build_progress_job(posting, submission_id),
+                        "current_step": 0,
+                    },
+                )
+                append_timeline_event(
+                    "easy_apply_modal_opened",
+                    {
+                        "job_posting_id": str(posting.id),
+                        "submission_id": str(submission_id),
+                    },
+                )
 
                 max_steps = 10
                 last_known_step_index = 0
@@ -333,6 +376,25 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         page,
                         last_known_step_index=last_known_step_index,
                         last_known_total_steps=last_known_total_steps,
+                    )
+                    update_progress_snapshot(
+                        {
+                            "current_stage": "easy_apply_step_extracted",
+                            "current_job": self._build_progress_job(posting, submission_id),
+                            "current_step": step.step_index + 1,
+                            "easy_apply_total_steps": step.total_steps,
+                            "easy_apply_field_count": len(step.fields),
+                        },
+                    )
+                    append_timeline_event(
+                        "easy_apply_step_extracted",
+                        {
+                            "job_posting_id": str(posting.id),
+                            "submission_id": str(submission_id),
+                            "step_index": step.step_index,
+                            "total_steps": step.total_steps,
+                            "field_count": len(step.fields),
+                        },
                     )
                     last_known_step_index = step.step_index
                     last_known_total_steps = step.total_steps
@@ -380,6 +442,13 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     artifacts.extend(step_artifacts)
 
                     try:
+                        update_progress_snapshot(
+                            {
+                                "current_stage": "easy_apply_step_progression",
+                                "current_job": self._build_progress_job(posting, submission_id),
+                                "current_step": step.step_index + 1,
+                            },
+                        )
                         action = await self._progress_easy_apply_step_with_agent(
                             page,
                             settings=settings,
@@ -418,6 +487,13 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         )
 
                     if action.action_intent == "submit_application":
+                        update_progress_snapshot(
+                            {
+                                "current_stage": "easy_apply_submit_triggered",
+                                "current_job": self._build_progress_job(posting, submission_id),
+                                "current_step": step.step_index + 1,
+                            },
+                        )
                         self._record_event(
                             execution_events,
                             execution_id=execution_id,
@@ -452,6 +528,17 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             ),
                         )
                         if success:
+                            update_progress_snapshot(
+                                {
+                                    "current_stage": "easy_apply_submitted",
+                                    "current_job": self._build_progress_job(
+                                        posting,
+                                        submission_id,
+                                        status=SubmissionStatus.SUBMITTED.value,
+                                    ),
+                                    "current_step": None,
+                                },
+                            )
                             if recruiter_candidate is not None:
                                 self._record_event(
                                     execution_events,
@@ -548,6 +635,17 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                 submitted_at=utc_now(),
                                 cv_version=settings.profile.cv_filename,
                             )
+                        update_progress_snapshot(
+                            {
+                                "current_stage": "easy_apply_submit_unconfirmed",
+                                "current_job": self._build_progress_job(
+                                    posting,
+                                    submission_id,
+                                    status=SubmissionStatus.FAILED.value,
+                                ),
+                                "current_step": step.step_index + 1,
+                            },
+                        )
                         self._record_event(
                             execution_events,
                             execution_id=execution_id,
@@ -583,6 +681,13 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         ),
                     )
                     if assessment_status == "blocked":
+                        update_progress_snapshot(
+                            {
+                                "current_stage": "easy_apply_blocked",
+                                "current_job": self._build_progress_job(posting, submission_id),
+                                "current_step": step.step_index + 1,
+                            },
+                        )
                         (
                             remediation_status,
                             remediation_notes,
@@ -651,6 +756,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     notes="LinkedIn Easy Apply exceeded the maximum number of steps.",
                 )
         except Exception as exc:  # noqa: BLE001
+            update_progress_snapshot(
+                {
+                    "current_stage": "easy_apply_exception",
+                    "current_job": self._build_progress_job(posting, submission_id),
+                    "current_step": None,
+                    "last_error": str(exc),
+                },
+            )
             self._record_exception_event(
                 execution_events,
                 execution_id=execution_id,
@@ -760,6 +873,22 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     "normalized_key": field.normalized_key,
                     "question_type": field.question_type.value,
                     "fill_strategy": resolution.fill_strategy.value,
+                },
+            )
+            self._record_event(
+                execution_events,
+                execution_id=execution_id,
+                submission_id=submission_id,
+                event_type=ExecutionEventType.STEP_REACHED,
+                payload={
+                    "stage": "easy_apply_field_applied",
+                    "step_index": step.step_index,
+                    "normalized_key": field.normalized_key,
+                    "question_type": field.question_type.value,
+                    "control_kind": field.control_kind,
+                    "answer_source": resolution.answer_source.value,
+                    "fill_strategy": resolution.fill_strategy.value,
+                    "ambiguity_flag": resolution.ambiguity_flag,
                 },
             )
             answers.append(
@@ -2300,6 +2429,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
             logger.exception("linkedin_playwright_trace_stop_failed")
             return None
 
+        append_artifact_reference(
+            artifact_type=ArtifactType.PLAYWRIGHT_TRACE.value,
+            label="playwright_trace",
+            path=trace_path,
+            sha256=_sha256_file(trace_path),
+        )
         return _build_file_artifact(
             submission_id=submission_id,
             path=trace_path,
@@ -2351,11 +2486,18 @@ class PlaywrightLinkedInEasyApplyExecutor:
     ) -> ArtifactSnapshot:
         path.parent.mkdir(parents=True, exist_ok=True)
         await page.screenshot(path=str(path), full_page=True)
+        digest = _sha256_file(path)
+        append_artifact_reference(
+            artifact_type=ArtifactType.SCREENSHOT.value,
+            label=path.stem,
+            path=path,
+            sha256=digest,
+        )
         return ArtifactSnapshot(
             submission_id=submission_id,
             artifact_type=ArtifactType.SCREENSHOT,
             path=str(path),
-            sha256=_sha256_file(path),
+            sha256=digest,
         )
 
     async def _capture_html_dump(
@@ -2368,11 +2510,18 @@ class PlaywrightLinkedInEasyApplyExecutor:
         path.parent.mkdir(parents=True, exist_ok=True)
         html_content = await page.content()
         path.write_text(html_content, encoding="utf-8")
+        digest = _sha256_file(path)
+        append_artifact_reference(
+            artifact_type=ArtifactType.HTML_DUMP.value,
+            label=path.stem,
+            path=path,
+            sha256=digest,
+        )
         return ArtifactSnapshot(
             submission_id=submission_id,
             artifact_type=ArtifactType.HTML_DUMP,
             path=str(path),
-            sha256=_sha256_file(path),
+            sha256=digest,
         )
 
     def _artifact_path(
@@ -2399,6 +2548,25 @@ class PlaywrightLinkedInEasyApplyExecutor:
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
 
+    def _build_progress_job(
+        self,
+        posting: JobPosting,
+        submission_id: UUID,
+        *,
+        status: str | None = None,
+    ) -> dict[str, str]:
+        payload = {
+            "job_posting_id": str(posting.id),
+            "external_job_id": posting.external_job_id or "",
+            "submission_id": str(submission_id),
+            "company_name": posting.company_name,
+            "title": posting.title,
+            "url": posting.url,
+        }
+        if status is not None:
+            payload["status"] = status
+        return payload
+
     def _record_event(
         self,
         execution_events: list[ExecutionEvent],
@@ -2408,14 +2576,43 @@ class PlaywrightLinkedInEasyApplyExecutor:
         payload: dict[str, object],
         submission_id: UUID | None = None,
     ) -> None:
+        payload_json = json.dumps(payload, sort_keys=True)
         execution_events.append(
             ExecutionEvent(
                 execution_id=execution_id,
                 submission_id=submission_id,
                 event_type=event_type,
-                payload_json=json.dumps(payload, sort_keys=True),
+                payload_json=payload_json,
             ),
         )
+        append_timeline_event(event_type.value, payload)
+        progress_payload: dict[str, object] = {
+            "current_stage": str(payload.get("stage") or event_type.value),
+        }
+        if submission_id is not None:
+            progress_payload["current_submission_id"] = str(submission_id)
+        step_index = payload.get("step_index")
+        if isinstance(step_index, int):
+            progress_payload["current_step"] = step_index + 1
+        current_job: dict[str, object] = {}
+        for key in ("job_posting_id", "company_name", "title", "url", "status"):
+            if key in payload:
+                current_job[key] = payload[key]
+        if current_job and submission_id is not None:
+            current_job["submission_id"] = str(submission_id)
+        if current_job:
+            progress_payload["current_job"] = current_job
+        if event_type in {
+            ExecutionEventType.EXCEPTION_CAPTURED,
+            ExecutionEventType.EXECUTION_FAILED,
+        }:
+            message = payload.get("message")
+            if isinstance(message, str) and message:
+                progress_payload["last_error"] = message
+        notes = payload.get("notes")
+        if isinstance(notes, str) and notes:
+            progress_payload["last_error"] = notes
+        update_progress_snapshot(progress_payload)
 
     def _record_exception_event(
         self,

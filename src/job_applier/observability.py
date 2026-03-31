@@ -156,6 +156,33 @@ def reset_run_output(
         },
         output_dir=output_dir,
     )
+    write_output_json(
+        "progress.json",
+        {
+            "execution_id": str(execution_id),
+            "origin": origin,
+            "status": "running",
+            "current_stage": "execution_started",
+            "current_job": None,
+            "current_step": None,
+            "last_observation": started_at.isoformat(),
+        },
+        output_dir=output_dir,
+    )
+    append_output_jsonl(
+        "timeline.jsonl",
+        {
+            "timestamp": started_at.astimezone(UTC).isoformat(),
+            "event_type": "execution_bundle_reset",
+            "execution_id": str(execution_id),
+            "submission_id": None,
+            "payload": {
+                "origin": origin,
+                "status": "running",
+            },
+        },
+        output_dir=output_dir,
+    )
 
 
 def write_output_json(
@@ -215,6 +242,85 @@ def append_output_jsonl(
     )
     with target.open("a", encoding="utf-8") as handle:
         handle.write(f"{line}\n")
+
+
+def update_progress_snapshot(
+    payload: Mapping[str, object],
+    *,
+    output_dir: Path | None = None,
+) -> None:
+    """Merge the latest execution progress into `progress.json`."""
+
+    target = _resolve_output_path("progress.json", output_dir=output_dir)
+    if target is None:
+        return
+    existing: dict[str, Any] = {}
+    if target.exists():
+        try:
+            existing_payload = json.loads(target.read_text(encoding="utf-8"))
+            if isinstance(existing_payload, dict):
+                existing = existing_payload
+        except json.JSONDecodeError:
+            existing = {}
+    merged = {
+        **existing,
+        **_sanitize_for_logs(dict(payload)),
+        "last_observation": datetime.now(UTC).isoformat(),
+    }
+    existing_job = existing.get("current_job")
+    merged_job = merged.get("current_job")
+    if isinstance(existing_job, dict) and isinstance(merged_job, dict):
+        merged["current_job"] = {
+            **existing_job,
+            **merged_job,
+        }
+    target.write_text(
+        json.dumps(merged, indent=2, ensure_ascii=True, default=_json_default),
+        encoding="utf-8",
+    )
+
+
+def append_timeline_event(
+    event_type: str,
+    payload: Mapping[str, object] | None = None,
+    *,
+    output_dir: Path | None = None,
+) -> None:
+    """Append one structured timeline event for the current execution."""
+
+    record = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "event_type": event_type,
+        "execution_id": _execution_id_var.get(),
+        "submission_id": _submission_id_var.get(),
+        "payload": dict(payload or {}),
+    }
+    append_output_jsonl("timeline.jsonl", record, output_dir=output_dir)
+
+
+def append_artifact_reference(
+    *,
+    artifact_type: str,
+    path: str | Path,
+    label: str,
+    sha256: str | None = None,
+    output_dir: Path | None = None,
+) -> None:
+    """Append a searchable artifact reference for the current run."""
+
+    append_output_jsonl(
+        "artifacts.jsonl",
+        {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "execution_id": _execution_id_var.get(),
+            "submission_id": _submission_id_var.get(),
+            "artifact_type": artifact_type,
+            "label": label,
+            "path": str(path),
+            "sha256": sha256,
+        },
+        output_dir=output_dir,
+    )
 
 
 def _resolve_output_path(relative_path: str | Path, *, output_dir: Path | None) -> Path | None:

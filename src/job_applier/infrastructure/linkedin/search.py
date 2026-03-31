@@ -29,7 +29,12 @@ from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserTaskAssessment,
     OpenAIResponsesBrowserAgent,
 )
-from job_applier.observability import append_output_jsonl
+from job_applier.observability import (
+    append_artifact_reference,
+    append_output_jsonl,
+    append_timeline_event,
+    update_progress_snapshot,
+)
 from job_applier.settings import RuntimeSettings
 
 logger = logging.getLogger(__name__)
@@ -382,6 +387,22 @@ class PlaywrightLinkedInJobsClient:
                 await self._ensure_authenticated_page(page)
                 await self._capture_screenshot(page, run_dir / f"results-page-{page_index + 1}.png")
                 listings = await self._extract_listing_cards(page)
+                append_timeline_event(
+                    "linkedin_search_results_page_loaded",
+                    {
+                        "page_index": page_index + 1,
+                        "listing_count": len(listings),
+                        "url": page.url,
+                    },
+                )
+                update_progress_snapshot(
+                    {
+                        "current_stage": "search_results_loaded",
+                        "current_job": None,
+                        "search_page_index": page_index + 1,
+                        "search_listing_count": len(listings),
+                    },
+                )
                 if not listings:
                     break
 
@@ -389,6 +410,26 @@ class PlaywrightLinkedInJobsClient:
                     if listing.url in seen_job_urls:
                         continue
                     seen_job_urls.add(listing.url)
+                    update_progress_snapshot(
+                        {
+                            "current_stage": "job_detail_loading",
+                            "current_job": {
+                                "external_job_id": listing.external_job_id,
+                                "title": listing.title,
+                                "company_name": listing.company_name,
+                                "url": listing.url,
+                            },
+                        },
+                    )
+                    append_timeline_event(
+                        "linkedin_job_detail_loading",
+                        {
+                            "external_job_id": listing.external_job_id,
+                            "title": listing.title,
+                            "company_name": listing.company_name,
+                            "url": listing.url,
+                        },
+                    )
                     jobs.append(await self._load_job_details(context, listing))
 
             return jobs
@@ -403,6 +444,14 @@ class PlaywrightLinkedInJobsClient:
         run_dir: Path,
     ) -> None:
         direct_results_url = build_search_results_url(criteria)
+        update_progress_snapshot(
+            {
+                "current_stage": "search_results_entry",
+                "current_job": None,
+                "current_step": None,
+                "search_target_url": direct_results_url,
+            },
+        )
         append_output_jsonl(
             "run.log",
             {
@@ -835,6 +884,16 @@ class PlaywrightLinkedInJobsClient:
                 }
                 """,
             )
+            append_timeline_event(
+                "linkedin_job_detail_loaded",
+                {
+                    "external_job_id": listing.external_job_id,
+                    "title": listing.title,
+                    "company_name": listing.company_name,
+                    "url": listing.url,
+                    "description_length": len(str(detail_payload["description_raw"] or "")),
+                },
+            )
         finally:
             await detail_page.close()
 
@@ -861,6 +920,11 @@ class PlaywrightLinkedInJobsClient:
     async def _capture_screenshot(self, page: Page, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         await page.screenshot(path=str(path), full_page=True)
+        append_artifact_reference(
+            artifact_type="screenshot",
+            label=path.stem,
+            path=path,
+        )
 
     def _build_run_dir(self) -> Path:
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
