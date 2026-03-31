@@ -228,6 +228,7 @@ class BrowserAgentElement:
     selected: bool = False
     validation_text: str | None = None
     is_priority_target: bool = False
+    candidate_label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,6 +367,7 @@ def snapshot_signature(snapshot: BrowserAgentSnapshot) -> str:
                 "selected": element.selected,
                 "validation_text": element.validation_text,
                 "is_priority_target": element.is_priority_target,
+                "candidate_label": element.candidate_label,
             }
             for element in snapshot.elements
         ],
@@ -406,6 +408,7 @@ def serialize_snapshot(snapshot: BrowserAgentSnapshot) -> dict[str, object]:
                 "selected": element.selected,
                 "validation_text": element.validation_text,
                 "is_priority_target": element.is_priority_target,
+                "candidate_label": element.candidate_label,
             }
             for element in snapshot.elements
         ],
@@ -617,26 +620,57 @@ class BrowserDomSnapshotter:
                           seenTexts.add(text);
                           validationTexts.push({ text, verticalGap });
                         };
-                        for (const attributeName of ["aria-describedby", "aria-errormessage"]) {
+                        const validationSelectors = [
+                          "[role='alert']",
+                          "[aria-live='assertive']",
+                          "[aria-live='polite']",
+                          ".artdeco-inline-feedback__message",
+                          ".fb-dash-form-element__error-message",
+                          "[data-test-form-element-error-messages]",
+                        ].join(", ");
+                        const validationScopes = [];
+                        const pushValidationScope = (candidate) => {
+                          if (
+                            !candidate
+                            || candidate.nodeType !== 1
+                            || validationScopes.includes(candidate)
+                          ) {
+                            return;
+                          }
+                          validationScopes.push(candidate);
+                        };
+                        for (const attributeName of ["aria-errormessage"]) {
                           for (const id of splitIds(fieldNode.getAttribute(attributeName))) {
                             pushText(document.getElementById(id));
                           }
                         }
+                        pushValidationScope(
+                          fieldNode.closest(
+                            [
+                              ".fb-form-element",
+                              ".jobs-easy-apply-form-section__grouping",
+                              ".jobs-easy-apply-form-element",
+                              "[role='group']",
+                              "fieldset",
+                              "section",
+                              "form",
+                            ].join(", ")
+                          )
+                        );
+                        pushValidationScope(fieldNode.parentElement);
                         let ancestor = fieldNode.parentElement;
                         let depth = 0;
                         while (ancestor && depth < 4) {
-                          for (const candidate of ancestor.querySelectorAll(
-                            "[role='alert'], [aria-live='assertive'], [aria-live='polite']"
-                          )) {
+                          for (const candidate of ancestor.querySelectorAll(validationSelectors)) {
                             pushText(candidate);
                           }
                           ancestor = ancestor.parentElement;
                           depth += 1;
                         }
-                        for (const candidate of document.querySelectorAll(
-                          "div, p, span, small, li"
-                        )) {
-                          pushText(candidate);
+                        for (const scope of validationScopes) {
+                          for (const candidate of scope.querySelectorAll(validationSelectors)) {
+                            pushText(candidate);
+                          }
                         }
                         validationTexts.sort((left, right) => {
                           if (left.verticalGap !== right.verticalGap) {
@@ -719,12 +753,39 @@ class BrowserDomSnapshotter:
                       document
                         .querySelectorAll("[data-job-applier-active-surface]")
                         .forEach((node) => node.removeAttribute("data-job-applier-active-surface"));
-                      const activeSurface = focusedNode && focusedNode.nodeType === 1
+                      const isInteractiveNode = (node) => {
+                        if (!node || node.nodeType !== 1 || typeof node.matches !== "function") {
+                          return false;
+                        }
+                        try {
+                          return node.matches(interactiveSelectors);
+                        } catch {
+                          return false;
+                        }
+                      };
+                      const markedBlockingAction = document.querySelector(
+                        "[data-job-applier-blocking-action='true']"
+                      );
+                      const markedBlockingSurface = document.querySelector(
+                        "[data-job-applier-blocking-surface='true']"
+                      );
+                      const activeSurface = (
+                        markedBlockingSurface
+                        && markedBlockingSurface.nodeType === 1
+                        && isVisible(markedBlockingSurface)
+                      )
                         ? {
-                            node: focusedNode,
-                            label: describeSurface(focusedNode),
+                            node: markedBlockingSurface,
+                            label: describeSurface(markedBlockingSurface),
                           }
-                        : null;
+                        : (
+                          focusedNode && focusedNode.nodeType === 1
+                            ? {
+                                node: focusedNode,
+                                label: describeSurface(focusedNode),
+                              }
+                            : null
+                        );
                       if (activeSurface) {
                         activeSurface.node.setAttribute("data-job-applier-active-surface", "true");
                       }
@@ -782,31 +843,66 @@ class BrowserDomSnapshotter:
                       const relatedPopupNodes = activeField
                         ? collectPopupNodesForField(activeField)
                         : [];
-                      const nodes = activeSurface
-                        ? [
-                            ...Array.from(activeSurface.node.querySelectorAll(interactiveSelectors)),
-                            ...relatedPopupNodes,
-                          ]
-                            .filter((node) => node && node.nodeType === 1)
-                            .filter(isVisible)
-                            .filter((node, index, collection) => collection.indexOf(node) === index)
-                            .sort((left, right) => {
-                              if (priorityField) {
-                                if (left === priorityField && right !== priorityField) {
-                                  return -1;
-                                }
-                                if (right === priorityField && left !== priorityField) {
-                                  return 1;
-                                }
-                              }
-                              const leftRect = left.getBoundingClientRect();
-                              const rightRect = right.getBoundingClientRect();
-                              if (Math.abs(leftRect.top - rightRect.top) > 4) {
-                                return leftRect.top - rightRect.top;
-                              }
-                              return leftRect.left - rightRect.left;
-                            })
-                        : [];
+                      const nodes = [];
+                      if (activeSurface) {
+                        const seenNodes = new Set();
+                        const pushNode = (candidate) => {
+                          if (
+                            !candidate
+                            || candidate.nodeType !== 1
+                            || seenNodes.has(candidate)
+                            || !isVisible(candidate)
+                          ) {
+                            return;
+                          }
+                          seenNodes.add(candidate);
+                          nodes.push(candidate);
+                        };
+                        pushNode(markedBlockingAction);
+                        pushNode(priorityField);
+                        if (activeField && activeField !== priorityField) {
+                          pushNode(activeField);
+                        }
+                        if (
+                          activeSurface.node !== priorityField
+                          && activeSurface.node !== activeField
+                          && isInteractiveNode(activeSurface.node)
+                        ) {
+                          pushNode(activeSurface.node);
+                        }
+                        const activeSurfaceCandidates =
+                          activeSurface.node.querySelectorAll(interactiveSelectors);
+                        for (const candidate of activeSurfaceCandidates) {
+                          pushNode(candidate);
+                        }
+                        for (const candidate of relatedPopupNodes) {
+                          pushNode(candidate);
+                        }
+                        nodes.sort((left, right) => {
+                          if (priorityField) {
+                            if (left === priorityField && right !== priorityField) {
+                              return -1;
+                            }
+                            if (right === priorityField && left !== priorityField) {
+                              return 1;
+                            }
+                          }
+                          if (activeField) {
+                            if (left === activeField && right !== activeField) {
+                              return -1;
+                            }
+                            if (right === activeField && left !== activeField) {
+                              return 1;
+                            }
+                          }
+                          const leftRect = left.getBoundingClientRect();
+                          const rightRect = right.getBoundingClientRect();
+                          if (Math.abs(leftRect.top - rightRect.top) > 4) {
+                            return leftRect.top - rightRect.top;
+                          }
+                          return leftRect.left - rightRect.left;
+                        });
+                      }
                       const items = [];
                       let counter = 1;
 
@@ -850,6 +946,7 @@ class BrowserDomSnapshotter:
                           ),
                           validation_text: validationTexts[0] || "",
                           is_priority_target: priorityField === node,
+                          candidate_label: summarizeNode(node),
                         });
                         if (items.length >= maxElements) {
                           break;
@@ -860,6 +957,10 @@ class BrowserDomSnapshotter:
                         activeSurface
                           ? [
                               describeSurface(activeSurface.node),
+                              priorityField ? summarizeNode(priorityField) : "",
+                              activeField && activeField !== priorityField
+                                ? summarizeNode(activeField)
+                                : "",
                               ...nodes.map(summarizeNode).filter(Boolean),
                             ].join(" ")
                           : (document.body?.innerText || ""),
@@ -904,7 +1005,7 @@ class BrowserDomSnapshotter:
             else:
                 payload = await page.evaluate(
                     """
-            ({ interactiveSelectors, maxElements }) => {
+            ({ interactiveSelectors, maxElements, priorityNode }) => {
               const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
               const isVisible = (node) => {
                 const style = window.getComputedStyle(node);
@@ -961,6 +1062,199 @@ class BrowserDomSnapshotter:
                 const label = document.querySelector(`label[for="${id}"]`);
                 return collapse(label?.innerText || label?.textContent || "");
               };
+              const summarizeNode = (node) => {
+                if (!node || node.nodeType !== 1) {
+                  return "";
+                }
+                const tag = (node.tagName || "").toLowerCase();
+                const pieces = [];
+                const label = collapse(node.getAttribute("aria-label")) || labelFor(node);
+                const placeholder = collapse(node.getAttribute("placeholder"));
+                const role = collapse(node.getAttribute("role"));
+                const nodeText = collapse(node.innerText || node.textContent || "");
+                const currentValue = collapse(node.value);
+                if (tag === "button" || role === "button") {
+                  pieces.push(label || nodeText);
+                } else if (tag === "select") {
+                  pieces.push(label, currentValue || nodeText);
+                } else if (tag === "input" || tag === "textarea") {
+                  pieces.push(label, currentValue || placeholder);
+                } else {
+                  pieces.push(label, nodeText || placeholder);
+                }
+                return collapse(pieces.filter(Boolean).join(" "));
+              };
+              const splitIds = (value) =>
+                collapse(value)
+                  .split(/\\s+/)
+                  .map((item) => item.trim())
+                  .filter(Boolean);
+              const collectValidationTextsForNode = (fieldNode) => {
+                if (!fieldNode || fieldNode.nodeType !== 1) {
+                  return [];
+                }
+                const fieldRect = fieldNode.getBoundingClientRect();
+                const overlapsHorizontally = (candidateRect) => {
+                  const overlap = Math.min(fieldRect.right, candidateRect.right)
+                    - Math.max(fieldRect.left, candidateRect.left);
+                  return overlap > Math.min(fieldRect.width, candidateRect.width) * 0.25;
+                };
+                const validationTexts = [];
+                const seenTexts = new Set();
+                const pushText = (candidate) => {
+                  if (!candidate || candidate.nodeType !== 1) {
+                    return;
+                  }
+                  if (!isVisible(candidate)) {
+                    return;
+                  }
+                  if (
+                    candidate === fieldNode
+                    || candidate.contains(fieldNode)
+                    || fieldNode.contains(candidate)
+                  ) {
+                    return;
+                  }
+                  const text = collapse(
+                    candidate.innerText
+                    || candidate.textContent
+                    || candidate.getAttribute("aria-label")
+                    || ""
+                  );
+                  if (!text || text.length > 180 || seenTexts.has(text)) {
+                    return;
+                  }
+                  const rect = candidate.getBoundingClientRect();
+                  const verticalGap = rect.top - fieldRect.bottom;
+                  if (verticalGap < -6 || verticalGap > 96) {
+                    return;
+                  }
+                  if (!overlapsHorizontally(rect)) {
+                    return;
+                  }
+                  seenTexts.add(text);
+                  validationTexts.push({ text, verticalGap });
+                };
+                const validationSelectors = [
+                  "[role='alert']",
+                  "[aria-live='assertive']",
+                  "[aria-live='polite']",
+                  ".artdeco-inline-feedback__message",
+                  ".fb-dash-form-element__error-message",
+                  "[data-test-form-element-error-messages]",
+                ].join(", ");
+                const validationScopes = [];
+                const pushValidationScope = (candidate) => {
+                  if (
+                    !candidate
+                    || candidate.nodeType !== 1
+                    || validationScopes.includes(candidate)
+                  ) {
+                    return;
+                  }
+                  validationScopes.push(candidate);
+                };
+                for (const attributeName of ["aria-errormessage"]) {
+                  for (const id of splitIds(fieldNode.getAttribute(attributeName))) {
+                    pushText(document.getElementById(id));
+                  }
+                }
+                pushValidationScope(
+                  fieldNode.closest(
+                    [
+                      ".fb-form-element",
+                      ".jobs-easy-apply-form-section__grouping",
+                      ".jobs-easy-apply-form-element",
+                      "[role='group']",
+                      "fieldset",
+                      "section",
+                      "form",
+                    ].join(", ")
+                  )
+                );
+                pushValidationScope(fieldNode.parentElement);
+                let ancestor = fieldNode.parentElement;
+                let depth = 0;
+                while (ancestor && depth < 4) {
+                  for (const candidate of ancestor.querySelectorAll(validationSelectors)) {
+                    pushText(candidate);
+                  }
+                  ancestor = ancestor.parentElement;
+                  depth += 1;
+                }
+                for (const scope of validationScopes) {
+                  for (const candidate of scope.querySelectorAll(validationSelectors)) {
+                    pushText(candidate);
+                  }
+                }
+                validationTexts.sort((left, right) => {
+                  if (left.verticalGap !== right.verticalGap) {
+                    return left.verticalGap - right.verticalGap;
+                  }
+                  return left.text.length - right.text.length;
+                });
+                return validationTexts.map((item) => item.text);
+              };
+              const collectPopupNodesForField = (fieldNode) => {
+                if (!fieldNode || fieldNode.nodeType !== 1) {
+                  return [];
+                }
+                const relatedRoots = [];
+                const seenRoots = new Set();
+                const pushRoot = (candidate) => {
+                  if (!candidate || candidate.nodeType !== 1 || seenRoots.has(candidate)) {
+                    return;
+                  }
+                  seenRoots.add(candidate);
+                  relatedRoots.push(candidate);
+                };
+                for (const attributeName of ["aria-controls", "aria-owns", "list"]) {
+                  for (const id of splitIds(fieldNode.getAttribute(attributeName))) {
+                    pushRoot(document.getElementById(id));
+                  }
+                }
+                for (const id of splitIds(fieldNode.getAttribute("aria-activedescendant"))) {
+                  pushRoot(document.getElementById(id));
+                }
+                const nodes = [];
+                const seenNodes = new Set();
+                const pushNode = (candidate) => {
+                  if (!candidate || candidate.nodeType !== 1 || seenNodes.has(candidate)) {
+                    return;
+                  }
+                  if (!isVisible(candidate)) {
+                    return;
+                  }
+                  seenNodes.add(candidate);
+                  nodes.push(candidate);
+                };
+                const popupSelectors = [
+                  interactiveSelectors,
+                  "[aria-selected]",
+                  "li",
+                  "[data-value]",
+                ].join(", ");
+                for (const root of relatedRoots) {
+                  pushNode(root);
+                  for (const optionNode of root.querySelectorAll(popupSelectors)) {
+                    if (optionNode === fieldNode) {
+                      continue;
+                    }
+                    pushNode(optionNode);
+                  }
+                }
+                if (nodes.length === 0) {
+                  for (const optionNode of document.querySelectorAll(
+                    "[role='option'], [aria-selected], [data-value]"
+                  )) {
+                    if (optionNode === fieldNode) {
+                      continue;
+                    }
+                    pushNode(optionNode);
+                  }
+                }
+                return nodes;
+              };
               const describeSurface = (node) => {
                 if (!node) {
                   return "";
@@ -1004,6 +1298,16 @@ class BrowserDomSnapshotter:
               document
                 .querySelectorAll("[data-job-applier-active-surface]")
                 .forEach((node) => node.removeAttribute("data-job-applier-active-surface"));
+              const isInteractiveNode = (node) => {
+                if (!node || node.nodeType !== 1 || typeof node.matches !== "function") {
+                  return false;
+                }
+                try {
+                  return node.matches(interactiveSelectors);
+                } catch {
+                  return false;
+                }
+              };
               const surfaceSelectors = [
                 "dialog[open]",
                 "[role='dialog'][open]",
@@ -1041,8 +1345,56 @@ class BrowserDomSnapshotter:
                   }
                   return right.index - left.index;
                 });
+              const priorityTarget =
+                priorityNode && priorityNode.nodeType === 1 ? priorityNode : null;
+              const prioritySurfaceNode = priorityTarget
+                ? priorityTarget.closest(
+                    [
+                      "dialog[open]",
+                      "[role='dialog'][open]",
+                      "[role='dialog']",
+                      "[aria-modal='true']",
+                      ".jobs-easy-apply-modal",
+                      ".jobs-easy-apply-content",
+                      ".jobs-easy-apply-form-section__grouping",
+                      ".jobs-easy-apply-form-element",
+                      "[role='group']",
+                      "fieldset",
+                      "section",
+                      "form",
+                    ].join(", ")
+                  )
+                : null;
+              const activeElementNode =
+                document.activeElement && document.activeElement.nodeType === 1
+                  ? document.activeElement
+                  : null;
+              const activeElementSurfaceNode = activeElementNode
+                ? activeElementNode.closest(
+                    [
+                      "dialog[open]",
+                      "[role='dialog'][open]",
+                      "[role='dialog']",
+                      "[aria-modal='true']",
+                      ".jobs-easy-apply-modal",
+                      ".jobs-easy-apply-content",
+                      ".jobs-easy-apply-form-section__grouping",
+                      ".jobs-easy-apply-form-element",
+                      "[role='group']",
+                      "fieldset",
+                      "section",
+                      "form",
+                    ].join(", ")
+                  )
+                : null;
               const focusedSurfaceNode =
-                null;
+                (prioritySurfaceNode && isVisible(prioritySurfaceNode))
+                  ? prioritySurfaceNode
+                  : (
+                    activeElementSurfaceNode && isVisible(activeElementSurfaceNode)
+                      ? activeElementSurfaceNode
+                      : null
+                  );
               const focusedSurfaceRect = focusedSurfaceNode
                 ? focusedSurfaceNode.getBoundingClientRect()
                 : null;
@@ -1057,8 +1409,36 @@ class BrowserDomSnapshotter:
                     label: describeSurface(focusedSurfaceNode),
                   }
                 : (visibleSurfaces[0] || null);
-              if (activeSurface) {
-                activeSurface.node.setAttribute("data-job-applier-active-surface", "true");
+              const markedBlockingAction = document.querySelector(
+                "[data-job-applier-blocking-action='true']"
+              );
+              const markedBlockingSurfaceNode = document.querySelector(
+                "[data-job-applier-blocking-surface='true']"
+              );
+              const markedBlockingSurfaceRect = markedBlockingSurfaceNode
+                ? markedBlockingSurfaceNode.getBoundingClientRect()
+                : null;
+              const blockingSurface = (
+                markedBlockingSurfaceNode
+                && markedBlockingSurfaceNode.nodeType === 1
+                && isVisible(markedBlockingSurfaceNode)
+              )
+                ? {
+                    node: markedBlockingSurfaceNode,
+                    index: -2,
+                    area: markedBlockingSurfaceRect
+                      ? markedBlockingSurfaceRect.width * markedBlockingSurfaceRect.height
+                      : 0,
+                    zIndex: Number.MAX_SAFE_INTEGER,
+                    label: describeSurface(markedBlockingSurfaceNode),
+                  }
+                : null;
+              const prioritizedActiveSurface = blockingSurface || activeSurface;
+              if (prioritizedActiveSurface) {
+                prioritizedActiveSurface.node.setAttribute(
+                  "data-job-applier-active-surface",
+                  "true"
+                );
               }
               const findActiveScrollTarget = (surfaceNode) => {
                 const candidates = [surfaceNode, ...Array.from(surfaceNode.querySelectorAll("*"))]
@@ -1084,8 +1464,8 @@ class BrowserDomSnapshotter:
                   });
                 return candidates[0]?.node || null;
               };
-              const activeScrollTarget = activeSurface
-                ? findActiveScrollTarget(activeSurface.node)
+              const activeScrollTarget = prioritizedActiveSurface
+                ? findActiveScrollTarget(prioritizedActiveSurface.node)
                 : null;
               if (activeScrollTarget) {
                 activeScrollTarget.setAttribute(
@@ -1094,18 +1474,85 @@ class BrowserDomSnapshotter:
                 );
               }
               const mainRoot = document.querySelector(mainSelectors);
-              const scopeRoot = activeSurface ? activeSurface.node : (mainRoot || document);
-              const nodes = Array.from(scopeRoot.querySelectorAll(interactiveSelectors));
+              const scopeRoot = prioritizedActiveSurface
+                ? prioritizedActiveSurface.node
+                : (
+                  priorityTarget?.closest(
+                    [
+                      ".jobs-easy-apply-form-section__grouping",
+                      ".jobs-easy-apply-form-element",
+                      "[role='group']",
+                      "fieldset",
+                      "section",
+                      "form",
+                    ].join(", ")
+                  )
+                  || mainRoot
+                  || document
+                );
+              const relatedPopupNodes = priorityTarget
+                ? collectPopupNodesForField(priorityTarget)
+                : [];
+              const nodes = [];
+              const seenNodes = new Set();
+              const pushNode = (candidate) => {
+                if (
+                  !candidate
+                  || candidate.nodeType !== 1
+                  || seenNodes.has(candidate)
+                  || !isVisible(candidate)
+                ) {
+                  return;
+                }
+                seenNodes.add(candidate);
+                nodes.push(candidate);
+              };
+              pushNode(markedBlockingAction);
+              pushNode(priorityTarget);
+              if (
+                prioritizedActiveSurface
+                && prioritizedActiveSurface.node !== priorityTarget
+                && isInteractiveNode(prioritizedActiveSurface.node)
+              ) {
+                pushNode(prioritizedActiveSurface.node);
+              }
+              for (const candidate of scopeRoot.querySelectorAll(interactiveSelectors)) {
+                pushNode(candidate);
+              }
+              for (const candidate of relatedPopupNodes) {
+                pushNode(candidate);
+              }
+              nodes.sort((left, right) => {
+                if (priorityTarget) {
+                  if (left === priorityTarget && right !== priorityTarget) {
+                    return -1;
+                  }
+                  if (right === priorityTarget && left !== priorityTarget) {
+                    return 1;
+                  }
+                }
+                const leftRect = left.getBoundingClientRect();
+                const rightRect = right.getBoundingClientRect();
+                if (Math.abs(leftRect.top - rightRect.top) > 4) {
+                  return leftRect.top - rightRect.top;
+                }
+                return leftRect.left - rightRect.left;
+              });
               const items = [];
               let counter = 1;
 
               for (const node of nodes) {
-                if (!isVisible(node)) {
-                  continue;
-                }
                 const elementId = `agent-${counter}`;
                 counter += 1;
                 node.setAttribute("data-job-applier-agent-id", elementId);
+                const validationTexts = collectValidationTextsForNode(node);
+                const nativeValidity = typeof node.checkValidity === "function"
+                  ? node.checkValidity()
+                  : true;
+                const invalidPseudoClass = typeof node.matches === "function"
+                  ? node.matches(":invalid")
+                  : false;
+                const ariaInvalid = node.getAttribute("aria-invalid") === "true";
                 items.push({
                   element_id: elementId,
                   tag: node.tagName.toLowerCase(),
@@ -1118,6 +1565,21 @@ class BrowserDomSnapshotter:
                   href: collapse(node.getAttribute("href")),
                   current_value: collapse(node.value),
                   disabled: Boolean(node.disabled || node.getAttribute("aria-disabled") === "true"),
+                  focused: document.activeElement === node,
+                  invalid: (
+                    ariaInvalid
+                    || invalidPseudoClass
+                    || !nativeValidity
+                    || validationTexts.length > 0
+                  ),
+                  expanded: node.getAttribute("aria-expanded") === "true",
+                  selected: (
+                    node.getAttribute("aria-selected") === "true"
+                    || node.getAttribute("aria-checked") === "true"
+                  ),
+                  validation_text: validationTexts[0] || "",
+                  is_priority_target: priorityTarget === node,
+                  candidate_label: summarizeNode(node),
                 });
                 if (items.length >= maxElements) {
                   break;
@@ -1125,7 +1587,24 @@ class BrowserDomSnapshotter:
               }
 
               const visibleText = collapse(
-                activeSurface ? activeSurface.node.innerText : (document.body?.innerText || ""),
+                activeSurface
+                  ? [
+                      describeSurface(
+                        prioritizedActiveSurface
+                          ? prioritizedActiveSurface.node
+                          : activeSurface.node
+                      ),
+                      priorityTarget ? summarizeNode(priorityTarget) : "",
+                      ...nodes.map(summarizeNode).filter(Boolean),
+                    ].join(" ")
+                  : (
+                    priorityTarget
+                      ? [
+                          summarizeNode(priorityTarget),
+                          ...nodes.map(summarizeNode).filter(Boolean),
+                        ].join(" ")
+                      : (document.body?.innerText || "")
+                  ),
               );
               const pageScrollTop =
                 window.scrollY
@@ -1141,7 +1620,7 @@ class BrowserDomSnapshotter:
               return {
                 visible_text: visibleText,
                 elements: items,
-                active_surface: activeSurface ? activeSurface.label : "",
+                active_surface: prioritizedActiveSurface ? prioritizedActiveSurface.label : "",
                 active_surface_scrollable: Boolean(activeScrollTarget),
                 active_surface_can_scroll_down: activeScrollTarget
                   ? (
@@ -1160,6 +1639,7 @@ class BrowserDomSnapshotter:
                     {
                         "interactiveSelectors": INTERACTIVE_SELECTORS,
                         "maxElements": self._max_elements,
+                        "priorityNode": priority_handle,
                     },
                 )
         finally:
@@ -1189,11 +1669,12 @@ class BrowserDomSnapshotter:
                 selected=bool(item.get("selected")),
                 validation_text=_optional_text(item.get("validation_text")),
                 is_priority_target=bool(item.get("is_priority_target")),
+                candidate_label=_optional_text(item.get("candidate_label")),
             )
             for item in raw_elements
             if isinstance(item, dict) and str(item.get("element_id") or "").strip()
         )
-        return BrowserAgentSnapshot(
+        snapshot = BrowserAgentSnapshot(
             url=page.url,
             title=truncate_text(title, limit=160),
             visible_text=truncate_text(
@@ -1208,6 +1689,26 @@ class BrowserDomSnapshotter:
             page_can_scroll_down=bool(raw_payload.get("page_can_scroll_down")),
             page_can_scroll_up=bool(raw_payload.get("page_can_scroll_up")),
         )
+        if focus_locator is not None and self._needs_page_scope_retry(snapshot):
+            logger.info(
+                "linkedin_browser_agent_focus_snapshot_too_sparse",
+                extra={
+                    "url": page.url,
+                    "active_surface": snapshot.active_surface,
+                    "visible_text": snapshot.visible_text,
+                    "element_count": len(snapshot.elements),
+                },
+            )
+            return await self.capture(page, priority_locator=priority_locator)
+        return snapshot
+
+    def _needs_page_scope_retry(self, snapshot: BrowserAgentSnapshot) -> bool:
+        visible_text = snapshot.visible_text.strip()
+        if not snapshot.elements:
+            return True
+        if any(element.is_priority_target or element.focused for element in snapshot.elements):
+            return False
+        return len(snapshot.elements) <= 1 and len(visible_text) < 48
 
 
 class OpenAIResponsesBrowserAgent:
@@ -1242,6 +1743,272 @@ class OpenAIResponsesBrowserAgent:
 
     def _append_browser_agent_log(self, relative_path: str, payload: Mapping[str, object]) -> None:
         append_output_jsonl(relative_path, payload)
+
+    async def _clear_marked_blockers(self, page: Page) -> None:
+        try:
+            await page.evaluate(
+                """
+                () => {
+                  document
+                    .querySelectorAll("[data-job-applier-blocking-action]")
+                    .forEach((node) =>
+                      node.removeAttribute("data-job-applier-blocking-action")
+                    );
+                  document
+                    .querySelectorAll("[data-job-applier-blocking-surface]")
+                    .forEach((node) =>
+                      node.removeAttribute("data-job-applier-blocking-surface")
+                    );
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            return
+
+    async def _mark_intercepting_blocker(
+        self,
+        page: Page,
+        locator: Locator,
+    ) -> str | None:
+        try:
+            payload = await locator.evaluate(
+                """
+                (target) => {
+                  const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                  const isVisible = (node) => {
+                    if (!node || node.nodeType !== 1) {
+                      return false;
+                    }
+                    const style = window.getComputedStyle(node);
+                    const rect = node.getBoundingClientRect();
+                    return (
+                      style.visibility !== "hidden" &&
+                      style.display !== "none" &&
+                      rect.width > 0 &&
+                      rect.height > 0 &&
+                      rect.bottom > 0 &&
+                      rect.right > 0 &&
+                      rect.top < window.innerHeight &&
+                      rect.left < window.innerWidth
+                    );
+                  };
+                  const labelFor = (node) => {
+                    const labels = Array.from(node.labels || []);
+                    const joined = labels
+                      .map((item) => collapse(item.innerText || item.textContent || ""))
+                      .filter(Boolean)
+                      .join(" ");
+                    if (joined) {
+                      return joined;
+                    }
+                    const id = node.getAttribute("id");
+                    if (!id) {
+                      return "";
+                    }
+                    const label = document.querySelector(`label[for="${id}"]`);
+                    return collapse(label?.innerText || label?.textContent || "");
+                  };
+                  const describeNode = (node) => {
+                    if (!node || node.nodeType !== 1) {
+                      return "";
+                    }
+                    const tag = (node.tagName || "").toLowerCase();
+                    const role = collapse(node.getAttribute("role"));
+                    const ariaLabel = collapse(node.getAttribute("aria-label"));
+                    const text = collapse(node.innerText || node.textContent || "");
+                    const placeholder = collapse(node.getAttribute("placeholder"));
+                    const label = ariaLabel || labelFor(node);
+                    if (tag === "input" || tag === "textarea" || tag === "select") {
+                      return collapse([label, placeholder, collapse(node.value)].join(" "));
+                    }
+                    return collapse([label, text].join(" "));
+                  };
+                  const describeSurface = (node) => {
+                    if (!node || node.nodeType !== 1) {
+                      return "";
+                    }
+                    const labelledBy = collapse(node.getAttribute("aria-labelledby"));
+                    if (labelledBy) {
+                      const heading = labelledBy
+                        .split(/\\s+/)
+                        .map((id) => document.getElementById(id))
+                        .find(
+                          (item) => item && collapse(item.innerText || item.textContent || "")
+                        );
+                      if (heading) {
+                        return collapse(heading.innerText || heading.textContent || "");
+                      }
+                    }
+                    const ariaLabel = collapse(node.getAttribute("aria-label"));
+                    if (ariaLabel) {
+                      return ariaLabel;
+                    }
+                    const heading = node.querySelector("h1, h2, h3, [role='heading']");
+                    if (heading) {
+                      const headingText = collapse(heading.innerText || heading.textContent || "");
+                      if (headingText) {
+                        return headingText;
+                      }
+                    }
+                    return describeNode(node);
+                  };
+                  const clearMarks = () => {
+                    document
+                      .querySelectorAll("[data-job-applier-blocking-action]")
+                      .forEach((node) =>
+                        node.removeAttribute("data-job-applier-blocking-action")
+                      );
+                    document
+                      .querySelectorAll("[data-job-applier-blocking-surface]")
+                      .forEach((node) =>
+                        node.removeAttribute("data-job-applier-blocking-surface")
+                      );
+                  };
+                  const interactiveAncestor = (node) =>
+                    node?.closest(
+                      [
+                        "button",
+                        "a[href]",
+                        "label",
+                        "input",
+                        "select",
+                        "textarea",
+                        "[role='button']",
+                        "[role='link']",
+                        "[role='menuitem']",
+                        "[role='option']",
+                        "[role='tab']",
+                      ].join(", ")
+                    ) || null;
+                  const surfaceSelectors = [
+                    "dialog[open]",
+                    "[role='dialog'][open]",
+                    "[role='dialog']",
+                    "[role='alertdialog']",
+                    "[aria-modal='true']",
+                    "[role='listbox']",
+                    "[role='menu']",
+                    "[role='tooltip']",
+                    "[role='status']",
+                    "[role='alert']",
+                    "[aria-live]",
+                    "[popover]",
+                    "[data-test-artdeco-toast-item]",
+                    "[data-artdeco-toast-item-type]",
+                    ".artdeco-toast-item",
+                  ].join(", ");
+                  const pickSurface = (node) => {
+                    if (!node || node.nodeType !== 1) {
+                      return null;
+                    }
+                    const semanticSurface = node.closest(surfaceSelectors);
+                    if (semanticSurface && isVisible(semanticSurface)) {
+                      return semanticSurface;
+                    }
+                    let current = node;
+                    while (current && current.nodeType === 1 && current !== document.body) {
+                      if (!isVisible(current)) {
+                        current = current.parentElement;
+                        continue;
+                      }
+                      const style = window.getComputedStyle(current);
+                      const rect = current.getBoundingClientRect();
+                      const position = style.position || "";
+                      const zIndex = Number.parseInt(style.zIndex || "0", 10);
+                      const looksOverlay =
+                        ["fixed", "sticky", "absolute"].includes(position)
+                        || Number.isFinite(zIndex) && zIndex > 0
+                        || rect.width * rect.height > 80_000;
+                      if (looksOverlay) {
+                        return current;
+                      }
+                      current = current.parentElement;
+                    }
+                    return node.parentElement || node;
+                  };
+                  const rect = target.getBoundingClientRect();
+                  const samplePoints = [
+                    [rect.left + rect.width / 2, rect.top + rect.height / 2],
+                    [rect.left + 12, rect.top + 12],
+                    [rect.right - 12, rect.top + 12],
+                    [rect.left + 12, rect.bottom - 12],
+                    [rect.right - 12, rect.bottom - 12],
+                  ]
+                    .map(([x, y]) => ({
+                      x: Math.max(1, Math.min(window.innerWidth - 1, Math.round(x))),
+                      y: Math.max(1, Math.min(window.innerHeight - 1, Math.round(y))),
+                    }))
+                    .filter((point, index, collection) =>
+                      collection.findIndex(
+                        (candidate) => candidate.x === point.x && candidate.y === point.y
+                      ) === index
+                    );
+                  clearMarks();
+                  for (const point of samplePoints) {
+                    const candidate = document.elementFromPoint(point.x, point.y);
+                    if (!candidate || candidate === target || target.contains(candidate)) {
+                      continue;
+                    }
+                    const blockingAction = interactiveAncestor(candidate) || candidate;
+                    const blockingSurface = pickSurface(blockingAction);
+                    if (blockingAction && blockingAction.nodeType === 1) {
+                      blockingAction.setAttribute("data-job-applier-blocking-action", "true");
+                    }
+                    if (blockingSurface && blockingSurface.nodeType === 1) {
+                      blockingSurface.setAttribute("data-job-applier-blocking-surface", "true");
+                    }
+                    return {
+                      blocker_tag: (blockingAction?.tagName || "").toLowerCase(),
+                      blocker_role: collapse(blockingAction?.getAttribute("role")),
+                      blocker_action_label: describeNode(blockingAction),
+                      blocker_surface_label: describeSurface(blockingSurface),
+                      blocker_point: point,
+                    };
+                  }
+                  return null;
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(payload, dict):
+            return None
+        blocker_action_label = collapse_text(
+            payload.get("blocker_action_label")
+            if isinstance(payload.get("blocker_action_label"), str)
+            else None
+        )
+        blocker_surface_label = collapse_text(
+            payload.get("blocker_surface_label")
+            if isinstance(payload.get("blocker_surface_label"), str)
+            else None
+        )
+        blocker_tag = collapse_text(
+            payload.get("blocker_tag") if isinstance(payload.get("blocker_tag"), str) else None
+        )
+        blocker_role = collapse_text(
+            payload.get("blocker_role") if isinstance(payload.get("blocker_role"), str) else None
+        )
+        summary_parts = []
+        if blocker_action_label:
+            summary_parts.append(f"action '{blocker_action_label}'")
+        elif blocker_tag or blocker_role:
+            summary_parts.append(
+                f"{blocker_role} {blocker_tag}".strip() if blocker_role else blocker_tag
+            )
+        if blocker_surface_label:
+            summary_parts.append(f"surface '{blocker_surface_label}'")
+        summary = ", ".join(part for part in summary_parts if part) or None
+        self._append_browser_agent_log(
+            "browser-agent/blocker-trace.jsonl",
+            {
+                "kind": "intercepting_blocker_marked",
+                "url": page.url,
+                "summary": summary,
+                "payload": payload,
+            },
+        )
+        return summary
 
     async def complete_linkedin_login(
         self,
@@ -1400,7 +2167,12 @@ class OpenAIResponsesBrowserAgent:
                 },
             )
             try:
-                await self._execute_action(page=page, action=action, values=available_values)
+                await self._execute_action(
+                    page=page,
+                    action=action,
+                    values=available_values,
+                    snapshot=snapshot,
+                )
             except BrowserAutomationError as exc:
                 feedback = {
                     "step_index": step_index,
@@ -1570,6 +2342,7 @@ class OpenAIResponsesBrowserAgent:
         repeated_snapshot_count = 0
         stall_diagnosis: BrowserStallDiagnosis | None = None
         for attempt_index in range(self._single_action_max_attempts):
+            await self._align_priority_locator_into_view(page, priority_locator)
             snapshot = await self._snapshotter.capture(
                 page,
                 focus_locator=focus_locator,
@@ -1715,6 +2488,22 @@ class OpenAIResponsesBrowserAgent:
                     ),
                 },
             )
+            if (
+                post_action_signature is not None
+                and post_action_signature == current_snapshot_signature
+            ):
+                self._append_browser_agent_log(
+                    "browser-agent/single-action-trace.jsonl",
+                    {
+                        "kind": "single_action_no_effect",
+                        "task_name": task_name,
+                        "step_index": step_index,
+                        "attempt_index": attempt_index,
+                        "snapshot_signature": current_snapshot_signature,
+                        "action": _serialize_action(action),
+                        "message": "Action completed without a visible snapshot change.",
+                    },
+                )
             previous_snapshot_signature = current_snapshot_signature
             if (
                 post_action_signature is not None
@@ -1724,6 +2513,22 @@ class OpenAIResponsesBrowserAgent:
             return action
         msg = f"Browser agent could not complete a safe single action for {task_name}."
         raise BrowserAutomationError(msg)
+
+    async def _align_priority_locator_into_view(
+        self,
+        page: Page,
+        priority_locator: Locator | None,
+    ) -> None:
+        if priority_locator is None:
+            return
+        try:
+            locator = priority_locator.first
+            if await locator.count() == 0:
+                return
+            await locator.scroll_into_view_if_needed(timeout=1_500)
+            await page.wait_for_timeout(120)
+        except Exception:  # noqa: BLE001
+            return
 
     async def _plan_action(
         self,
@@ -2358,6 +3163,7 @@ class OpenAIResponsesBrowserAgent:
         page: Page,
         action: BrowserAgentAction,
         values: Mapping[BrowserValueSource, str],
+        snapshot: BrowserAgentSnapshot | None = None,
     ) -> None:
         if action.action_type == "wait":
             await page.wait_for_timeout(max(1, action.wait_seconds) * 1_000)
@@ -2368,7 +3174,9 @@ class OpenAIResponsesBrowserAgent:
         if action.action_type == "fail":
             msg = action.reasoning or "Browser agent reported that no safe action was available."
             raise BrowserAutomationError(msg)
+        locator: Locator | None = None
         if action.action_type == "press":
+            await self._clear_marked_blockers(page)
             if action.key_name is None:
                 msg = "Browser agent returned press without a key_name."
                 raise BrowserAutomationError(msg)
@@ -2384,29 +3192,42 @@ class OpenAIResponsesBrowserAgent:
                 msg = summarize_browser_action_error(exc)
                 raise BrowserAutomationError(msg) from exc
         if action.action_type == "scroll":
+            await self._clear_marked_blockers(page)
             await self._pause_before_click(page)
             await self._execute_scroll(page, action)
             await page.wait_for_timeout(350)
             return
 
-        locator = self._locator_for_action(page, action)
         try:
-            await locator.scroll_into_view_if_needed()
-
             if action.action_type == "click":
+                await self._clear_marked_blockers(page)
+                locator = self._locator_for_action(page, action)
+                await locator.scroll_into_view_if_needed()
                 await self._pause_before_click(page)
                 await locator.click()
                 await self._settle_page(page)
                 return
 
             if action.action_type == "fill":
+                await self._clear_marked_blockers(page)
+                locator = await self._resolve_fill_locator(
+                    page,
+                    action=action,
+                    snapshot=snapshot,
+                )
+                await locator.scroll_into_view_if_needed()
                 value = self._resolve_fill_value(action, values)
-                await locator.click()
-                await locator.fill(value)
+                if await self._locator_is_select_like(locator):
+                    await self._select_option_for_fill(locator, value)
+                else:
+                    await self._fill_text_like_locator(page, locator, value)
                 await page.wait_for_timeout(350)
                 return
         except Exception as exc:  # noqa: BLE001
-            msg = summarize_browser_action_error(exc)
+            blocker_summary = None
+            if locator is not None and _error_looks_like_intercepted_pointer(exc):
+                blocker_summary = await self._mark_intercepting_blocker(page, locator)
+            msg = summarize_browser_action_error(exc, blocker_summary=blocker_summary)
             raise BrowserAutomationError(msg) from exc
 
     async def _execute_scroll(self, page: Page, action: BrowserAgentAction) -> None:
@@ -2451,6 +3272,443 @@ class OpenAIResponsesBrowserAgent:
         locator = page.locator(f'[data-job-applier-agent-id="{action.element_id}"]').first
         return locator
 
+    def _element_is_fillable_candidate(self, element: BrowserAgentElement) -> bool:
+        tag = element.tag.lower()
+        input_type = (element.input_type or "").lower()
+        role = (element.role or "").lower()
+        if tag in {"textarea", "select"}:
+            return True
+        if tag == "input":
+            return input_type not in {"hidden", "radio", "checkbox", "button", "submit"}
+        return role in {"textbox", "combobox"}
+
+    def _resolve_contextual_fill_element_id(
+        self,
+        snapshot: BrowserAgentSnapshot | None,
+    ) -> str | None:
+        if snapshot is None:
+            return None
+        priority_candidates = [
+            element
+            for element in snapshot.elements
+            if (
+                element.is_priority_target
+                and not element.disabled
+                and self._element_is_fillable_candidate(element)
+            )
+        ]
+        if len(priority_candidates) == 1:
+            return priority_candidates[0].element_id
+        focused_candidates = [
+            element
+            for element in snapshot.elements
+            if (
+                element.focused
+                and not element.disabled
+                and self._element_is_fillable_candidate(element)
+            )
+        ]
+        if len(focused_candidates) == 1:
+            return focused_candidates[0].element_id
+        return None
+
+    def _snapshot_element_for_action(
+        self,
+        snapshot: BrowserAgentSnapshot | None,
+        action: BrowserAgentAction,
+    ) -> BrowserAgentElement | None:
+        element_id = action.element_id or self._resolve_contextual_fill_element_id(snapshot)
+        if snapshot is None or element_id is None:
+            return None
+        for element in snapshot.elements:
+            if element.element_id == element_id:
+                return element
+        return None
+
+    async def _resolve_fill_locator(
+        self,
+        page: Page,
+        *,
+        action: BrowserAgentAction,
+        snapshot: BrowserAgentSnapshot | None,
+    ) -> Locator:
+        element_id = action.element_id or self._resolve_contextual_fill_element_id(snapshot)
+        if element_id is None:
+            msg = "Browser agent returned fill without a usable target element."
+            raise BrowserAutomationError(msg)
+        locator = page.locator(f'[data-job-applier-agent-id="{element_id}"]').first
+        if await self._locator_is_fillable(locator):
+            return locator
+
+        snapshot_element = self._snapshot_element_for_action(snapshot, action)
+        resolved_token = await page.evaluate(
+            """
+            ({ elementId, expectedLabel, expectedName, expectedPlaceholder, expectedRole,
+               expectedInputType, expectedText, expectedCandidateLabel }) => {
+              const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim().toLowerCase();
+              const isVisible = (node) => {
+                if (!node || node.nodeType !== 1) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                const rect = node.getBoundingClientRect();
+                if (
+                  rect.width <= 0 ||
+                  rect.height <= 0 ||
+                  rect.bottom <= 0 ||
+                  rect.right <= 0 ||
+                  rect.top >= window.innerHeight ||
+                  rect.left >= window.innerWidth
+                ) {
+                  return false;
+                }
+                return style.visibility !== "hidden" && style.display !== "none";
+              };
+              const splitTokens = (value) =>
+                collapse(value)
+                  .split(/[^a-z0-9]+/)
+                  .map((item) => item.trim())
+                  .filter(Boolean);
+              const tokenOverlapScore = (left, right) => {
+                const leftTokens = splitTokens(left);
+                const rightTokens = splitTokens(right);
+                if (leftTokens.length === 0 || rightTokens.length === 0) {
+                  return 0;
+                }
+                const rightSet = new Set(rightTokens);
+                let overlap = 0;
+                for (const token of leftTokens) {
+                  if (rightSet.has(token)) {
+                    overlap += 1;
+                  }
+                }
+                return overlap;
+              };
+              const labelFor = (node) => {
+                const labels = Array.from(node.labels || []);
+                const joined = labels
+                  .map(
+                    (item) =>
+                      (item.innerText || item.textContent || "")
+                        .replace(/\\s+/g, " ")
+                        .trim()
+                  )
+                  .filter(Boolean)
+                  .join(" ");
+                if (joined) {
+                  return joined;
+                }
+                const id = node.getAttribute("id");
+                if (!id) {
+                  return "";
+                }
+                const label = document.querySelector(`label[for="${id}"]`);
+                return (label?.innerText || label?.textContent || "").replace(/\\s+/g, " ").trim();
+              };
+              const isFillable = (node) => {
+                if (!node || node.nodeType !== 1) {
+                  return false;
+                }
+                if (!isVisible(node)) {
+                  return false;
+                }
+                const tag = (node.tagName || "").toLowerCase();
+                const type = collapse(node.getAttribute("type"));
+                const role = collapse(node.getAttribute("role"));
+                if (tag === "textarea" || tag === "select") {
+                  return true;
+                }
+                if (tag === "input") {
+                  return !["hidden", "radio", "checkbox", "button", "submit"].includes(type);
+                }
+                if (node.isContentEditable) {
+                  return true;
+                }
+                return role === "textbox" || role === "combobox";
+              };
+              const fillableSelectors = [
+                "input",
+                "textarea",
+                "select",
+                "[contenteditable='true']",
+                "[role='textbox']",
+                "[role='combobox']",
+              ].join(", ");
+              const candidates = [];
+              const seenNodes = new Set();
+              const addCandidate = (node, baseScore) => {
+                if (!node || seenNodes.has(node) || !isFillable(node)) {
+                  return;
+                }
+                seenNodes.add(node);
+                const label = (
+                  labelFor(node) || node.getAttribute("aria-label") || ""
+                ).replace(/\\s+/g, " ").trim();
+                const placeholder = (
+                  node.getAttribute("placeholder") || ""
+                ).replace(/\\s+/g, " ").trim();
+                const name = (node.getAttribute("name") || "").replace(/\\s+/g, " ").trim();
+                const role = (node.getAttribute("role") || "").replace(/\\s+/g, " ").trim();
+                const inputType = (node.getAttribute("type") || "")
+                  .replace(/\\s+/g, " ")
+                  .trim();
+                const candidateLabel = [
+                  label,
+                  placeholder,
+                  name,
+                  node.innerText || node.textContent || "",
+                ].join(" ").replace(/\\s+/g, " ").trim();
+                let score = baseScore;
+                if (collapse(label) && collapse(label) === collapse(expectedLabel)) {
+                  score += 18;
+                } else {
+                  score += tokenOverlapScore(label, expectedLabel) * 4;
+                }
+                if (collapse(name) && collapse(name) === collapse(expectedName)) {
+                  score += 12;
+                }
+                if (
+                  collapse(placeholder)
+                  && collapse(placeholder) === collapse(expectedPlaceholder)
+                ) {
+                  score += 10;
+                } else {
+                  score += tokenOverlapScore(placeholder, expectedPlaceholder) * 3;
+                }
+                if (collapse(role) && collapse(role) === collapse(expectedRole)) {
+                  score += 6;
+                }
+                if (collapse(inputType) && collapse(inputType) === collapse(expectedInputType)) {
+                  score += 4;
+                }
+                score += tokenOverlapScore(candidateLabel, expectedCandidateLabel) * 2;
+                score += tokenOverlapScore(candidateLabel, expectedText) * 2;
+                candidates.push({ node, score });
+              };
+
+              document
+                .querySelectorAll("[data-job-applier-resolved-fill-target]")
+                .forEach((node) => node.removeAttribute("data-job-applier-resolved-fill-target"));
+
+              const directNode = document.querySelector(
+                `[data-job-applier-agent-id="${elementId}"]`
+              );
+              if (directNode) {
+                addCandidate(directNode, 100);
+                for (const candidate of directNode.querySelectorAll(fillableSelectors)) {
+                  addCandidate(candidate, 90);
+                }
+              }
+
+              const activeSurface = document.querySelector(
+                "[data-job-applier-active-surface='true']"
+              );
+              const scopeRoot = activeSurface || document;
+              for (const candidate of scopeRoot.querySelectorAll(fillableSelectors)) {
+                addCandidate(candidate, 0);
+              }
+
+              candidates.sort((left, right) => right.score - left.score);
+              const best = candidates[0]?.node;
+              if (!best) {
+                return null;
+              }
+              const token = `${elementId}-resolved-fill`;
+              best.setAttribute("data-job-applier-resolved-fill-target", token);
+              return token;
+            }
+            """,
+            {
+                "elementId": element_id,
+                "expectedLabel": snapshot_element.label if snapshot_element is not None else "",
+                "expectedName": snapshot_element.name if snapshot_element is not None else "",
+                "expectedPlaceholder": (
+                    snapshot_element.placeholder if snapshot_element is not None else ""
+                ),
+                "expectedRole": snapshot_element.role if snapshot_element is not None else "",
+                "expectedInputType": (
+                    snapshot_element.input_type if snapshot_element is not None else ""
+                ),
+                "expectedText": snapshot_element.text if snapshot_element is not None else "",
+                "expectedCandidateLabel": (
+                    snapshot_element.candidate_label if snapshot_element is not None else ""
+                ),
+            },
+        )
+        if isinstance(resolved_token, str) and resolved_token.strip():
+            return page.locator(
+                f'[data-job-applier-resolved-fill-target="{resolved_token.strip()}"]'
+            ).first
+        return locator
+
+    async def _locator_is_fillable(self, locator: Locator) -> bool:
+        try:
+            if await locator.count() == 0:
+                return False
+            return bool(
+                await locator.evaluate(
+                    """
+                    (node) => {
+                      if (!node || node.nodeType !== 1) {
+                        return false;
+                      }
+                      const tag = (node.tagName || "").toLowerCase();
+                      const type = (node.getAttribute("type") || "").toLowerCase();
+                      const role = (node.getAttribute("role") || "").toLowerCase();
+                      if (tag === "textarea" || tag === "select") {
+                        return true;
+                      }
+                      if (tag === "input") {
+                        return !["hidden", "radio", "checkbox", "button", "submit"].includes(type);
+                      }
+                      if (node.isContentEditable) {
+                        return true;
+                      }
+                      return role === "textbox" || role === "combobox";
+                    }
+                    """
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _locator_is_select_like(self, locator: Locator) -> bool:
+        try:
+            if await locator.count() == 0:
+                return False
+            return bool(
+                await locator.evaluate(
+                    """
+                    (node) => {
+                      if (!node || node.nodeType !== 1) {
+                        return false;
+                      }
+                      const tag = (node.tagName || "").toLowerCase();
+                      const role = (node.getAttribute("role") || "").toLowerCase();
+                      return tag === "select" || role === "listbox";
+                    }
+                    """
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _select_option_for_fill(self, locator: Locator, value: str) -> None:
+        option_choice = await locator.evaluate(
+            """
+            (node, requestedValue) => {
+              const collapse = (input) => (input || "").replace(/\\s+/g, " ").trim().toLowerCase();
+              const tokenize = (input) =>
+                collapse(input)
+                  .split(/[^a-z0-9]+/)
+                  .map((item) => item.trim())
+                  .filter(Boolean);
+              const overlapScore = (left, right) => {
+                const leftTokens = tokenize(left);
+                const rightTokens = tokenize(right);
+                if (leftTokens.length === 0 || rightTokens.length === 0) {
+                  return 0;
+                }
+                const rightSet = new Set(rightTokens);
+                let overlap = 0;
+                for (const token of leftTokens) {
+                  if (rightSet.has(token)) {
+                    overlap += 1;
+                  }
+                }
+                return overlap;
+              };
+              const requested = collapse(requestedValue);
+              const options = Array.from(node.options || []);
+              let best = null;
+              for (const option of options) {
+                const label = (option.label || option.textContent || "")
+                  .replace(/\\s+/g, " ")
+                  .trim();
+                const optionValue = (option.value || "")
+                  .replace(/\\s+/g, " ")
+                  .trim();
+                const normalizedLabel = collapse(label);
+                const normalizedValue = collapse(optionValue);
+                let score = -1;
+                if (!normalizedLabel && !normalizedValue) {
+                  continue;
+                }
+                if (normalizedLabel === requested) {
+                  score = 120;
+                } else if (normalizedValue === requested) {
+                  score = 118;
+                } else if (
+                  requested &&
+                  normalizedLabel &&
+                  (normalizedLabel.includes(requested) || requested.includes(normalizedLabel))
+                ) {
+                  score = 96;
+                } else if (
+                  requested &&
+                  normalizedValue &&
+                  (normalizedValue.includes(requested) || requested.includes(normalizedValue))
+                ) {
+                  score = 92;
+                } else {
+                  const labelOverlap = overlapScore(label, requestedValue);
+                  const valueOverlap = overlapScore(optionValue, requestedValue);
+                  score = Math.max(labelOverlap * 10, valueOverlap * 8);
+                }
+                if (!best || score > best.score) {
+                  best = {
+                    index: option.index,
+                    value: optionValue,
+                    score,
+                  };
+                }
+              }
+              if (!best || best.score <= 0) {
+                return null;
+              }
+              return best;
+            }
+            """,
+            value,
+        )
+        if not isinstance(option_choice, dict):
+            msg = f"No selectable option matched the requested value: {value!r}"
+            raise BrowserAutomationError(msg)
+        option_value = option_choice.get("value")
+        option_index = option_choice.get("index")
+        if isinstance(option_value, str) and option_value:
+            await locator.select_option(value=option_value)
+            return
+        if isinstance(option_index, int):
+            await locator.select_option(index=option_index)
+            return
+        msg = f"No selectable option matched the requested value: {value!r}"
+        raise BrowserAutomationError(msg)
+
+    async def _fill_text_like_locator(self, page: Page, locator: Locator, value: str) -> None:
+        """Fill text inputs with a more human-like interaction pattern.
+
+        Some LinkedIn controls ignore or immediately reset `fill()` values. Focusing the field,
+        clearing it, and typing sequentially produces browser events closer to a human user while
+        still keeping the execution primitive generic.
+        """
+
+        await self._pause_before_click(page)
+        await locator.click()
+        try:
+            await locator.clear()
+        except Exception:  # noqa: BLE001
+            try:
+                await locator.press("ControlOrMeta+A")
+                await locator.press("Backspace")
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            per_key_delay_ms = random.randint(35, 95)
+            await locator.press_sequentially(value, delay=per_key_delay_ms)
+        except Exception:  # noqa: BLE001
+            await locator.fill(value)
+
     def _resolve_fill_value(
         self,
         action: BrowserAgentAction,
@@ -2486,9 +3744,16 @@ class OpenAIResponsesBrowserAgent:
             msg = "Browser agent returned an action type that is not allowed for this task."
             raise BrowserAutomationError(msg)
         valid_element_ids = {element.element_id for element in snapshot.elements}
-        if action.action_type in {"click", "fill"} and action.element_id not in valid_element_ids:
+        if action.action_type == "click" and action.element_id not in valid_element_ids:
             msg = "Browser agent referenced an element that does not exist in the snapshot."
             raise BrowserAutomationError(msg)
+        if action.action_type == "fill":
+            resolved_element_id = action.element_id or self._resolve_contextual_fill_element_id(
+                snapshot
+            )
+            if resolved_element_id not in valid_element_ids:
+                msg = "Browser agent referenced an element that does not exist in the snapshot."
+                raise BrowserAutomationError(msg)
         if action.action_type == "press" and action.key_name not in {
             "Enter",
             "Tab",
@@ -2735,12 +4000,29 @@ def parse_browser_stall_diagnosis(payload: dict[str, object]) -> BrowserStallDia
     )
 
 
-def summarize_browser_action_error(error: Exception) -> str:
+def _error_looks_like_intercepted_pointer(error: Exception) -> bool:
+    message = collapse_text(str(error)).lower()
+    return (
+        "intercepts pointer events" in message
+        or "another element would receive the click" in message
+    )
+
+
+def summarize_browser_action_error(
+    error: Exception,
+    *,
+    blocker_summary: str | None = None,
+) -> str:
     """Return a planner-friendly summary for browser action failures."""
 
     message = collapse_text(str(error))
     lowered = message.lower()
-    if "intercepts pointer events" in lowered:
+    if _error_looks_like_intercepted_pointer(error):
+        if blocker_summary:
+            return (
+                "The chosen target is blocked by another visible element. "
+                f"Observed blocker: {truncate_text(blocker_summary, limit=140)}."
+            )
         return "The chosen target is blocked by an open dialog or overlay."
     if "element is not attached" in lowered:
         return "The chosen target disappeared before the action could finish."

@@ -6,6 +6,7 @@ from pydantic import SecretStr
 
 from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserAgentAction,
+    BrowserAgentElement,
     BrowserAgentSnapshot,
     BrowserAutomationError,
     BrowserDomSnapshotter,
@@ -165,6 +166,98 @@ def test_browser_agent_single_action_respects_attempt_limit() -> None:
     asyncio.run(scenario())
 
 
+def test_browser_agent_single_action_aligns_priority_field_into_view_before_planning() -> None:
+    async def scenario() -> None:
+        agent = OpenAIResponsesBrowserAgent(
+            api_key=SecretStr("sk-test"),
+            model="o3-mini",
+            single_action_max_attempts=1,
+        )
+        observed_snapshot: BrowserAgentSnapshot | None = None
+
+        async def fake_plan_action(**kwargs):
+            nonlocal observed_snapshot
+            observed_snapshot = kwargs["snapshot"]
+            return BrowserAgentAction(
+                action_type="done",
+                element_id=None,
+                value_source=None,
+                value=None,
+                action_intent="field_visible_for_follow_up",
+                key_name=None,
+                scroll_target=None,
+                scroll_direction=None,
+                scroll_amount=250,
+                wait_seconds=0,
+                reasoning="The priority field is visible and ready for the next step.",
+            )
+
+        agent._plan_action = fake_plan_action  # type: ignore[method-assign]
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                await page.set_content(
+                    """
+                    <style>
+                      body { margin: 0; font-family: sans-serif; }
+                      .dialog {
+                        position: fixed;
+                        inset: 48px auto auto 120px;
+                        width: 520px;
+                        max-height: 240px;
+                        overflow-y: auto;
+                        background: white;
+                        border: 1px solid #ddd;
+                        padding: 16px;
+                      }
+                      .spacer {
+                        height: 520px;
+                      }
+                    </style>
+                    <div class="dialog" role="dialog" aria-label="Apply to Example Corp">
+                      <div class="spacer"></div>
+                      <label for="city">Location (city)</label>
+                      <input
+                        id="city"
+                        aria-label="Location (city)"
+                        role="combobox"
+                        aria-invalid="true"
+                        value=""
+                      />
+                    </div>
+                    """
+                )
+
+                action = await agent.perform_single_task_action(
+                    page=page,
+                    available_values={"intended_field_value": "Sao Paulo"},
+                    goal="Finish the interaction for the invalid city field.",
+                    task_name="linkedin_easy_apply_finalize_field_interaction",
+                    focus_locator=page.locator('[role="dialog"]'),
+                    priority_locator=page.locator("#city"),
+                    allowed_action_types=("done",),
+                )
+
+                assert action.action_type == "done"
+                assert observed_snapshot is not None
+                city = next(
+                    element
+                    for element in observed_snapshot.elements
+                    if element.label == "Location (city)"
+                )
+                assert city.is_priority_target is True
+                assert city.invalid is True
+                dialog_scroll_top = await page.locator(".dialog").evaluate("node => node.scrollTop")
+                assert isinstance(dialog_scroll_top, (int, float))
+                assert dialog_scroll_top > 0
+            finally:
+                await browser.close()
+
+    asyncio.run(scenario())
+
+
 def test_manual_intervention_detection_flags_captcha_and_otp_pages() -> None:
     snapshot = BrowserAgentSnapshot(
         url="https://www.linkedin.com/checkpoint/challenge/",
@@ -257,6 +350,16 @@ def test_summarize_browser_action_error_normalizes_overlay_interception() -> Non
     assert message == "The chosen target is blocked by an open dialog or overlay."
 
 
+def test_summarize_browser_action_error_includes_blocker_summary_when_available() -> None:
+    message = summarize_browser_action_error(
+        RuntimeError("Locator.click: dialog intercepts pointer events while clicking the target"),
+        blocker_summary="action 'Close', surface 'Link copied to clipboard.'",
+    )
+
+    assert "Observed blocker" in message
+    assert "Close" in message
+
+
 def test_summarize_openai_responses_error_marks_openai_rate_limit_clearly() -> None:
     message = summarize_openai_responses_error(
         status=429,
@@ -344,6 +447,66 @@ def test_browser_dom_snapshotter_focus_locator_prioritizes_visible_modal_control
     asyncio.run(scenario())
 
 
+def test_browser_dom_snapshotter_prioritizes_marked_blocking_surface() -> None:
+    async def scenario() -> None:
+        snapshotter = BrowserDomSnapshotter(max_elements=12, max_visible_text=600)
+        agent = OpenAIResponsesBrowserAgent(
+            api_key=SecretStr("sk-test"),
+            model="o3-mini",
+        )
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                await page.set_content(
+                    """
+                    <style>
+                      body { margin: 0; font-family: sans-serif; }
+                      .page {
+                        padding: 120px;
+                      }
+                      #easy-apply {
+                        width: 220px;
+                        height: 48px;
+                      }
+                      .toast {
+                        position: fixed;
+                        top: 118px;
+                        left: 118px;
+                        width: 260px;
+                        min-height: 90px;
+                        padding: 12px;
+                        background: white;
+                        border: 1px solid #ddd;
+                        z-index: 80;
+                      }
+                    </style>
+                    <div class="page">
+                      <button id="easy-apply" aria-label="Easy Apply">Easy Apply</button>
+                    </div>
+                    <div class="toast" role="status" aria-label="Link copied to clipboard.">
+                      <button id="toast-close" aria-label="Close">Close</button>
+                      <p>Link copied to clipboard.</p>
+                    </div>
+                    """
+                )
+
+                summary = await agent._mark_intercepting_blocker(page, page.locator("#easy-apply"))
+                snapshot = await snapshotter.capture(page)
+                labels = [element.label for element in snapshot.elements]
+
+                assert summary is not None
+                assert "Close" in summary or "Link copied" in summary
+                assert snapshot.active_surface == "Link copied to clipboard."
+                assert labels[0] in {"Close", "Link copied to clipboard."}
+                assert "Close" in labels
+                assert all(label != "Easy Apply" for label in labels)
+            finally:
+                await browser.close()
+
+    asyncio.run(scenario())
+
+
 def test_browser_dom_snapshotter_focus_locator_includes_popup_options_for_active_field() -> None:
     async def scenario() -> None:
         snapshotter = BrowserDomSnapshotter(max_elements=12, max_visible_text=600)
@@ -414,6 +577,557 @@ def test_browser_dom_snapshotter_focus_locator_includes_popup_options_for_active
                 assert city.expanded is True
                 assert city.validation_text == "Please enter a valid answer"
                 assert city.is_priority_target is True
+            finally:
+                await browser.close()
+
+    asyncio.run(scenario())
+
+
+def test_browser_dom_snapshotter_focus_locator_includes_priority_field_when_scope_is_narrow() -> (
+    None
+):
+    async def scenario() -> None:
+        snapshotter = BrowserDomSnapshotter(max_elements=12, max_visible_text=600)
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                await page.set_content(
+                    """
+                    <style>
+                      body { margin: 0; font-family: sans-serif; }
+                      .dialog {
+                        position: fixed;
+                        inset: 80px auto auto 120px;
+                        width: 520px;
+                        background: white;
+                        border: 1px solid #ddd;
+                        z-index: 20;
+                        padding: 16px;
+                      }
+                      .field-shell {
+                        display: inline-block;
+                      }
+                    </style>
+                    <div class="dialog" role="dialog" aria-label="Apply to Example Corp">
+                      <label for="city">Location (city)</label>
+                      <div class="field-shell">
+                        <input
+                          id="city"
+                          aria-label="Location (city)"
+                          role="combobox"
+                          aria-invalid="true"
+                          value="Sao Paulo"
+                        />
+                      </div>
+                    </div>
+                    """
+                )
+                await page.locator("#city").focus()
+
+                snapshot = await snapshotter.capture(
+                    page,
+                    focus_locator=page.locator(".field-shell"),
+                    priority_locator=page.locator("#city"),
+                )
+
+                city = next(
+                    element for element in snapshot.elements if element.label == "Location (city)"
+                )
+                assert city.focused is True
+                assert city.invalid is True
+                assert city.is_priority_target is True
+                assert "Location (city)" in snapshot.visible_text
+            finally:
+                await browser.close()
+
+    asyncio.run(scenario())
+
+
+def test_browser_dom_snapshotter_retries_with_page_scope_when_focus_snapshot_has_no_elements() -> (
+    None
+):
+    async def scenario() -> None:
+        snapshotter = BrowserDomSnapshotter(max_elements=12, max_visible_text=600)
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                await page.set_content(
+                    """
+                    <style>
+                      body { margin: 0; font-family: sans-serif; }
+                      .dialog {
+                        position: fixed;
+                        inset: 80px auto auto 120px;
+                        width: 520px;
+                        background: white;
+                        border: 1px solid #ddd;
+                        z-index: 20;
+                        padding: 16px;
+                      }
+                    </style>
+                    <div class="dialog" role="dialog" aria-label="Apply to Example Corp">
+                      <div class="label-shell">Location (city)</div>
+                      <input
+                        id="city"
+                        aria-label="Location (city)"
+                        role="combobox"
+                        aria-invalid="true"
+                        value=""
+                      />
+                    </div>
+                    """
+                )
+                await page.locator("#city").focus()
+
+                snapshot = await snapshotter.capture(
+                    page,
+                    focus_locator=page.locator(".label-shell"),
+                    priority_locator=page.locator("#city"),
+                )
+
+                city = next(
+                    element for element in snapshot.elements if element.label == "Location (city)"
+                )
+                assert city.is_priority_target is True
+                assert city.focused is True
+                assert snapshot.visible_text
+            finally:
+                await browser.close()
+
+    asyncio.run(scenario())
+
+
+def test_browser_dom_snapshotter_page_scope_keeps_priority_context() -> None:
+    async def scenario() -> None:
+        snapshotter = BrowserDomSnapshotter(max_elements=12, max_visible_text=600)
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                await page.set_content(
+                    """
+                    <style>
+                      body { margin: 0; font-family: sans-serif; }
+                      .dialog {
+                        position: fixed;
+                        inset: 80px auto auto 120px;
+                        width: 520px;
+                        background: white;
+                        border: 1px solid #ddd;
+                        z-index: 20;
+                        padding: 16px;
+                      }
+                      .portal {
+                        position: fixed;
+                        inset: 280px auto auto 160px;
+                        width: 360px;
+                        background: white;
+                        border: 1px solid #ddd;
+                        z-index: 30;
+                      }
+                    </style>
+                    <div class="dialog" role="dialog" aria-label="Apply to Example Corp">
+                      <label for="city">Location (city)</label>
+                      <input
+                        id="city"
+                        aria-label="Location (city)"
+                        role="combobox"
+                        aria-autocomplete="list"
+                        aria-controls="city-options"
+                        aria-expanded="true"
+                        aria-invalid="true"
+                        aria-describedby="city-error"
+                        value="Sao"
+                      />
+                      <div id="city-error" role="alert">Please fill out this field.</div>
+                    </div>
+                    <div class="portal" id="city-options" role="listbox">
+                      <div class="option" role="option">Sao Paulo, SP, Brazil</div>
+                      <div class="option" role="option">Sao Jose dos Campos, SP, Brazil</div>
+                    </div>
+                    """
+                )
+                await page.locator("#city").focus()
+
+                snapshot = await snapshotter.capture(
+                    page,
+                    priority_locator=page.locator("#city"),
+                )
+
+                city = next(
+                    element for element in snapshot.elements if element.label == "Location (city)"
+                )
+                option_texts = {element.text for element in snapshot.elements if element.text}
+
+                assert snapshot.active_surface == "Apply to Example Corp"
+                assert city.focused is True
+                assert city.invalid is True
+                assert city.validation_text == "Please fill out this field."
+                assert city.is_priority_target is True
+                assert any("Sao Paulo, SP, Brazil" in text for text in option_texts)
+            finally:
+                await browser.close()
+
+    asyncio.run(scenario())
+
+
+def test_browser_dom_snapshotter_focus_locator_ignores_unrelated_describedby_noise() -> None:
+    async def scenario() -> None:
+        snapshotter = BrowserDomSnapshotter(max_elements=12, max_visible_text=600)
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                await page.set_content(
+                    """
+                    <style>
+                      body { margin: 0; font-family: sans-serif; }
+                      .dialog {
+                        position: fixed;
+                        inset: 80px auto auto 120px;
+                        width: 520px;
+                        background: white;
+                        border: 1px solid #ddd;
+                        z-index: 20;
+                        padding: 16px;
+                      }
+                      .sidebar {
+                        position: fixed;
+                        inset: 60px 40px auto auto;
+                        width: 280px;
+                      }
+                    </style>
+                    <div class="dialog" role="dialog" aria-label="Apply to Example Corp">
+                      <label for="city">What is your current location?</label>
+                      <input
+                        id="city"
+                        aria-label="What is your current location?"
+                        aria-invalid="true"
+                        aria-describedby="sidebar-copy"
+                        aria-errormessage="city-error"
+                        value=""
+                      />
+                      <div id="city-error" role="alert">Please fill out this field.</div>
+                    </div>
+                    <aside class="sidebar">
+                      <p id="sidebar-copy">No response insights available yet</p>
+                    </aside>
+                    """
+                )
+
+                snapshot = await snapshotter.capture(
+                    page,
+                    focus_locator=page.locator('[role="dialog"]'),
+                    priority_locator=page.locator("#city"),
+                )
+                city = next(element for element in snapshot.elements if element.label)
+
+                assert city.validation_text == "Please fill out this field."
+                assert city.invalid is True
+            finally:
+                await browser.close()
+
+    asyncio.run(scenario())
+
+
+def test_browser_agent_fill_reconciles_to_editable_descendant() -> None:
+    async def scenario() -> None:
+        agent = OpenAIResponsesBrowserAgent(
+            api_key=SecretStr("sk-test"),
+            model="o3-mini",
+        )
+        snapshot = BrowserAgentSnapshot(
+            url="https://www.linkedin.com/jobs/view/123",
+            title="LinkedIn",
+            visible_text="What is your current location?",
+            active_surface="What is your current location?",
+            elements=(
+                BrowserAgentElement(
+                    element_id="agent-1",
+                    tag="input",
+                    label="What is your current location?",
+                    input_type="text",
+                    invalid=True,
+                    is_priority_target=True,
+                    candidate_label="What is your current location?",
+                ),
+            ),
+        )
+        action = BrowserAgentAction(
+            action_type="fill",
+            element_id="agent-1",
+            value_source="intended_field_value",
+            value=None,
+            action_intent="fill_field_with_intended_value",
+            key_name=None,
+            scroll_target=None,
+            scroll_direction=None,
+            scroll_amount=250,
+            wait_seconds=0,
+            reasoning="Fill the focused invalid location field.",
+        )
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                await page.set_content(
+                    """
+                    <div
+                      role="dialog"
+                      aria-label="What is your current location?"
+                      data-job-applier-active-surface="true"
+                    >
+                      <div data-job-applier-agent-id="agent-1">
+                        <label for="city">What is your current location?</label>
+                        <input id="city" type="text" />
+                      </div>
+                    </div>
+                    """
+                )
+
+                await agent._execute_action(
+                    page=page,
+                    action=action,
+                    values={"intended_field_value": "Sao Paulo"},
+                    snapshot=snapshot,
+                )
+
+                assert await page.locator("#city").input_value() == "Sao Paulo"
+            finally:
+                await browser.close()
+
+    asyncio.run(scenario())
+
+
+def test_browser_agent_fill_selects_option_for_select_controls() -> None:
+    async def scenario() -> None:
+        agent = OpenAIResponsesBrowserAgent(
+            api_key=SecretStr("sk-test"),
+            model="o3-mini",
+        )
+        snapshot = BrowserAgentSnapshot(
+            url="https://www.linkedin.com/jobs/view/123",
+            title="LinkedIn",
+            visible_text="Do you have experience with BI tools?",
+            active_surface="Apply to Example Corp",
+            elements=(
+                BrowserAgentElement(
+                    element_id="agent-3",
+                    tag="select",
+                    label="Do you have experience with BI tools?",
+                    text="Select an option Yes No",
+                    current_value="Select an option",
+                    candidate_label="Do you have experience with BI tools? Select an option",
+                ),
+            ),
+        )
+        action = BrowserAgentAction(
+            action_type="fill",
+            element_id="agent-3",
+            value_source="literal",
+            value="Yes",
+            action_intent="fill_select_field",
+            key_name=None,
+            scroll_target=None,
+            scroll_direction=None,
+            scroll_amount=250,
+            wait_seconds=0,
+            reasoning="Select the valid affirmative option.",
+        )
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                await page.set_content(
+                    """
+                    <div
+                      role="dialog"
+                      aria-label="Apply to Example Corp"
+                      data-job-applier-active-surface="true"
+                    >
+                      <label for="bi-tools">Do you have experience with BI tools?</label>
+                      <select id="bi-tools" data-job-applier-agent-id="agent-3">
+                        <option value="">Select an option</option>
+                        <option value="yes">Yes</option>
+                        <option value="no">No</option>
+                      </select>
+                    </div>
+                    """
+                )
+
+                await agent._execute_action(
+                    page=page,
+                    action=action,
+                    values={},
+                    snapshot=snapshot,
+                )
+
+                assert await page.locator("#bi-tools").input_value() == "yes"
+            finally:
+                await browser.close()
+
+    asyncio.run(scenario())
+
+
+def test_browser_agent_fill_types_sequentially_when_plain_fill_is_rejected() -> None:
+    async def scenario() -> None:
+        agent = OpenAIResponsesBrowserAgent(
+            api_key=SecretStr("sk-test"),
+            model="o3-mini",
+        )
+        snapshot = BrowserAgentSnapshot(
+            url="https://www.linkedin.com/jobs/view/123",
+            title="LinkedIn",
+            visible_text="What is your current location?",
+            active_surface="What is your current location?",
+            elements=(
+                BrowserAgentElement(
+                    element_id="agent-1",
+                    tag="input",
+                    label="What is your current location?",
+                    input_type="text",
+                    current_value="",
+                    invalid=True,
+                    is_priority_target=True,
+                    candidate_label="What is your current location?",
+                ),
+            ),
+        )
+        action = BrowserAgentAction(
+            action_type="fill",
+            element_id="agent-1",
+            value_source="intended_field_value",
+            value=None,
+            action_intent="finalize_field_interaction",
+            key_name=None,
+            scroll_target=None,
+            scroll_direction=None,
+            scroll_amount=250,
+            wait_seconds=0,
+            reasoning="Type the intended location into the focused field.",
+        )
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                await page.set_content(
+                    """
+                    <div
+                      role="dialog"
+                      aria-label="What is your current location?"
+                      data-job-applier-active-surface="true"
+                    >
+                      <label for="city">What is your current location?</label>
+                      <input id="city" data-job-applier-agent-id="agent-1" type="text" />
+                    </div>
+                    <script>
+                      const input = document.getElementById("city");
+                      let sawKeydown = false;
+                      input.addEventListener("keydown", () => {
+                        sawKeydown = true;
+                      });
+                      input.addEventListener("input", () => {
+                        if (!sawKeydown) {
+                          input.value = "";
+                        }
+                      });
+                      input.addEventListener("keyup", () => {
+                        sawKeydown = false;
+                      });
+                    </script>
+                    """
+                )
+
+                await agent._execute_action(
+                    page=page,
+                    action=action,
+                    values={"intended_field_value": "Sao Paulo"},
+                    snapshot=snapshot,
+                )
+
+                assert await page.locator("#city").input_value() == "Sao Paulo"
+            finally:
+                await browser.close()
+
+    asyncio.run(scenario())
+
+
+def test_browser_agent_fill_without_element_id_uses_priority_target() -> None:
+    async def scenario() -> None:
+        agent = OpenAIResponsesBrowserAgent(
+            api_key=SecretStr("sk-test"),
+            model="o3-mini",
+        )
+        snapshot = BrowserAgentSnapshot(
+            url="https://www.linkedin.com/jobs/view/123",
+            title="LinkedIn",
+            visible_text="Location (city)",
+            active_surface="Apply dialog",
+            elements=(
+                BrowserAgentElement(
+                    element_id="agent-9",
+                    tag="input",
+                    label="Location (city)",
+                    input_type="text",
+                    current_value="Sao",
+                    focused=True,
+                    invalid=True,
+                    is_priority_target=True,
+                    candidate_label="Location (city) Sao",
+                ),
+            ),
+        )
+        action = BrowserAgentAction(
+            action_type="fill",
+            element_id=None,
+            value_source="intended_field_value",
+            value=None,
+            action_intent="finalize_field_interaction",
+            key_name=None,
+            scroll_target=None,
+            scroll_direction=None,
+            scroll_amount=250,
+            wait_seconds=0,
+            reasoning="Fill the currently focused priority field.",
+        )
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                await page.set_content(
+                    """
+                    <div
+                      role="dialog"
+                      aria-label="Apply to Example Corp"
+                      data-job-applier-active-surface="true"
+                    >
+                      <label for="city">Location (city)</label>
+                      <input
+                        id="city"
+                        data-job-applier-agent-id="agent-9"
+                        type="text"
+                        value="Sao"
+                      />
+                    </div>
+                    """
+                )
+
+                agent._validate_action_against_snapshot(  # noqa: SLF001
+                    action,
+                    snapshot=snapshot,
+                    available_values={"intended_field_value": "Sao Paulo, SP, Brazil"},
+                    allowed_action_types=("fill",),
+                )
+                await agent._execute_action(
+                    page=page,
+                    action=action,
+                    values={"intended_field_value": "Sao Paulo, SP, Brazil"},
+                    snapshot=snapshot,
+                )
+
+                assert await page.locator("#city").input_value() == "Sao Paulo, SP, Brazil"
             finally:
                 await browser.close()
 
