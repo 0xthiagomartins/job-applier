@@ -65,6 +65,8 @@ from job_applier.infrastructure.linkedin.question_resolution import (
     LinkedInAnswerResolver,
     LinkedInQuestionExtractor,
     ResolvedFieldValue,
+    _profile_first_name,
+    _profile_last_name,
     normalize_text,
 )
 from job_applier.infrastructure.linkedin.recruiter_connect import (
@@ -156,6 +158,41 @@ class TextFieldInteractionState:
                 )
             )
         )
+
+
+def _field_debug_summary(field: EasyApplyField) -> dict[str, object]:
+    return {
+        "question_raw": field.question_raw,
+        "normalized_key": field.normalized_key,
+        "question_type": field.question_type.value,
+        "control_kind": field.control_kind,
+        "input_type": field.input_type,
+        "required": field.required,
+        "prefilled": field.prefilled,
+        "current_value": field.current_value,
+        "classification_confidence": field.classification_confidence,
+        "classification_rule": field.classification_rule,
+        "option_count": len(field.options),
+        "options_preview": list(field.options[:6]),
+    }
+
+
+def _step_field_signature(step: EasyApplyStep) -> tuple[tuple[str, ...], ...]:
+    return tuple(
+        (
+            normalize_text(field.question_raw),
+            normalize_text(field.normalized_key),
+            field.question_type.value,
+            field.control_kind,
+            field.input_type or "",
+            "required" if field.required else "optional",
+        )
+        for field in step.fields
+    )
+
+
+def _step_surface_changed(previous_step: EasyApplyStep, current_step: EasyApplyStep) -> bool:
+    return _step_field_signature(previous_step) != _step_field_signature(current_step)
 
 
 class EasyApplyExecutor(Protocol):
@@ -400,6 +437,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             "step_index": step.step_index,
                             "total_steps": step.total_steps,
                             "field_count": len(step.fields),
+                            "field_summaries": [
+                                _field_debug_summary(field) for field in step.fields
+                            ],
                         },
                     )
                     last_known_step_index = step.step_index
@@ -415,6 +455,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             "step_index": step.step_index,
                             "total_steps": step.total_steps,
                             "field_count": len(step.fields),
+                            "field_summaries": [
+                                _field_debug_summary(field) for field in step.fields
+                            ],
                         },
                     )
                     logger.info(
@@ -674,6 +717,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     assessment_status, assessment_notes = await self._assess_easy_apply_step_state(
                         page,
                         settings=settings,
+                        posting=posting,
                         execution_id=execution_id,
                         submission_id=submission_id,
                         execution_events=execution_events,
@@ -701,6 +745,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         ) = await self._resolve_easy_apply_bottleneck_with_agent(
                             page,
                             settings=settings,
+                            posting=posting,
                             execution_id=execution_id,
                             submission_id=submission_id,
                             execution_events=execution_events,
@@ -868,6 +913,30 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 )
             resolution = await self._answer_resolver.resolve(field, settings, posting=posting)
             if resolution is None:
+                stage = (
+                    "easy_apply_field_preserved"
+                    if field.prefilled and field.current_value.strip()
+                    else "easy_apply_field_unresolved"
+                )
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.STEP_REACHED,
+                    payload={
+                        "stage": stage,
+                        "step_index": step.step_index,
+                        "question_raw": field.question_raw,
+                        "normalized_key": field.normalized_key,
+                        "question_type": field.question_type.value,
+                        "control_kind": field.control_kind,
+                        "required": field.required,
+                        "prefilled": field.prefilled,
+                        "current_value": field.current_value,
+                        "classification_confidence": field.classification_confidence,
+                        "options_preview": list(field.options[:6]),
+                    },
+                )
                 continue
 
             applied_value = await self._apply_field_value(
@@ -879,6 +948,21 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 submission_cv_path=submission_cv_path,
             )
             if applied_value is None:
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.STEP_REACHED,
+                    payload={
+                        "stage": "easy_apply_field_apply_failed",
+                        "step_index": step.step_index,
+                        "normalized_key": field.normalized_key,
+                        "question_type": field.question_type.value,
+                        "control_kind": field.control_kind,
+                        "answer_source": resolution.answer_source.value,
+                        "fill_strategy": resolution.fill_strategy.value,
+                    },
+                )
                 continue
 
             if resolution.ambiguity_flag:
@@ -921,6 +1005,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     "answer_source": resolution.answer_source.value,
                     "fill_strategy": resolution.fill_strategy.value,
                     "ambiguity_flag": resolution.ambiguity_flag,
+                    "confidence": resolution.confidence,
+                    "reasoning": resolution.reasoning,
                 },
             )
             answers.append(
@@ -971,12 +1057,22 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     await locator.click()
                     await locator.fill(resolution.value)
                     await page.wait_for_timeout(250)
-                return await self._complete_text_field_interaction(
-                    page=page,
-                    field=field,
-                    target_value=resolution.value,
-                    settings=settings,
-                )
+                try:
+                    return await asyncio.wait_for(
+                        self._complete_text_field_interaction(
+                            page=page,
+                            field=field,
+                            target_value=resolution.value,
+                            settings=settings,
+                        ),
+                        timeout=self._runtime_settings.linkedin_field_interaction_timeout_seconds,
+                    )
+                except TimeoutError as exc:
+                    msg = (
+                        "Timed out while the browser agent was trying to finalize an "
+                        "interactive Easy Apply field."
+                    )
+                    raise LinkedInEasyApplyError(msg) from exc
             case "select":
                 if field.question_type is QuestionType.RESUME_UPLOAD:
                     return await self._apply_resume_choice_field(
@@ -1105,13 +1201,23 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "intended value."
                     ),
                     (
+                        "When visible chooser options already exist for this field, prefer "
+                        "clicking the best matching visible option before using Enter or Tab."
+                    ),
+                    (
                         "A visible option may still be correct even when it is not an exact "
                         "string match. Abbreviations, state or country suffixes, and nearby "
                         "regional formats can still represent the intended location."
                     ),
                     (
-                        "If the current field likely needs keyboard confirmation or blur, use "
-                        "press with Enter, Tab, ArrowDown, or ArrowUp before Enter when needed."
+                        "Use ArrowDown or ArrowUp only when they help reveal or highlight a "
+                        "better visible option. Do not rely on Enter as the first confirmation "
+                        "move when visible options are already present."
+                    ),
+                    (
+                        "If no visible chooser option is currently present, the field may need "
+                        "keyboard confirmation or blur. In that case, use press with Enter, "
+                        "Tab, ArrowDown, or ArrowUp before Enter when needed."
                     ),
                     (
                         "Do not click Continue, Next, Review, Submit, Dismiss, Close, Back, or "
@@ -1125,6 +1231,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "Use done only when the current field appears accepted and no chooser "
                         "for it still needs attention."
                     ),
+                    (
+                        "If recent_action_history shows field_changed_after_action=false, "
+                        "that previous move had no visible effect on the field. Prefer a "
+                        "materially different next action instead of repeating it."
+                    ),
                 ),
                 allowed_action_types=("click", "fill", "press", "scroll", "wait", "done", "fail"),
                 recent_actions=recent_actions[-6:],
@@ -1132,6 +1243,24 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 focus_locator=focus_locator or root,
                 priority_locator=locator,
             )
+            root_after_action = await self._easy_apply_root(page)
+            locator_after_action = await self._find_control_locator(root_after_action, field)
+            post_state = (
+                await self._inspect_text_field_interaction(locator_after_action)
+                if locator_after_action is not None
+                else None
+            )
+            field_changed_after_action = False
+            if post_state is not None:
+                field_changed_after_action = (
+                    post_state.current_value != state.current_value
+                    or post_state.invalid != state.invalid
+                    or post_state.focused != state.focused
+                    or post_state.aria_expanded != state.aria_expanded
+                    or post_state.visible_option_count != state.visible_option_count
+                    or post_state.visible_option_texts != state.visible_option_texts
+                    or post_state.validation_message != state.validation_message
+                )
             recent_actions.append(
                 {
                     "attempt_index": attempt_index,
@@ -1142,9 +1271,31 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     "field_invalid_before_action": state.invalid,
                     "field_focused_before_action": state.focused,
                     "visible_option_count_before_action": state.visible_option_count,
+                    "visible_option_texts_before_action": list(state.visible_option_texts),
                     "validation_message_before_action": state.validation_message,
+                    "field_value_after_action": (
+                        post_state.current_value if post_state is not None else None
+                    ),
+                    "field_invalid_after_action": (
+                        post_state.invalid if post_state is not None else None
+                    ),
+                    "field_focused_after_action": (
+                        post_state.focused if post_state is not None else None
+                    ),
+                    "visible_option_count_after_action": (
+                        post_state.visible_option_count if post_state is not None else None
+                    ),
+                    "visible_option_texts_after_action": (
+                        list(post_state.visible_option_texts) if post_state is not None else None
+                    ),
+                    "validation_message_after_action": (
+                        post_state.validation_message if post_state is not None else None
+                    ),
+                    "field_changed_after_action": field_changed_after_action,
                 }
             )
+            if post_state is not None and self._text_field_interaction_complete(post_state):
+                return post_state.current_value or target_value
             if action.action_type in {"done", "fail"}:
                 break
 
@@ -1196,7 +1347,49 @@ class PlaywrightLinkedInEasyApplyExecutor:
                   - Math.max(fieldRect.left, candidateRect.left);
                 return overlap > Math.min(fieldRect.width, candidateRect.width) * 0.25;
               };
-              const nearbyValidationTexts = [];
+              const isPotentialOptionNode = (candidate) => {
+                if (!candidate || candidate.nodeType !== 1) {
+                  return false;
+                }
+                const role = collapse(candidate.getAttribute("role"));
+                if (role === "option") {
+                  return true;
+                }
+                if (
+                  candidate.hasAttribute("aria-selected")
+                  || candidate.hasAttribute("data-value")
+                ) {
+                  return true;
+                }
+                const tagName = (candidate.tagName || "").toLowerCase();
+                return tagName === "li";
+              };
+              const isNearbyOptionForField = (candidate) => {
+                if (
+                  !candidate
+                  || candidate.nodeType !== 1
+                  || candidate === node
+                  || candidate.contains(node)
+                  || node.contains(candidate)
+                  || !isVisible(candidate)
+                  || !isPotentialOptionNode(candidate)
+                ) {
+                  return false;
+                }
+                const rect = candidate.getBoundingClientRect();
+                const verticalGap = rect.top - fieldRect.bottom;
+                const aboveFieldGap = fieldRect.top - rect.bottom;
+                if (verticalGap > 420 || aboveFieldGap > 48) {
+                  return false;
+                }
+                if (overlapsHorizontally(rect)) {
+                  return true;
+                }
+                const fieldCenter = fieldRect.left + (fieldRect.width / 2);
+                const candidateCenter = rect.left + (rect.width / 2);
+                return Math.abs(fieldCenter - candidateCenter) <= Math.max(96, fieldRect.width);
+              };
+              const explicitValidationTexts = [];
               const seenValidationTexts = new Set();
               const pushValidationText = (candidate) => {
                 if (!candidate || candidate.nodeType !== 1) {
@@ -1221,7 +1414,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                   return;
                 }
                 seenValidationTexts.add(text);
-                nearbyValidationTexts.push({ text, verticalGap });
+                explicitValidationTexts.push({ text, verticalGap });
               };
               const relatedRoots = [];
               const seenRoots = new Set();
@@ -1237,7 +1430,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                   pushRoot(document.getElementById(id));
                 }
               }
-              for (const attributeName of ["aria-describedby", "aria-errormessage"]) {
+              for (const attributeName of ["aria-errormessage"]) {
                 for (const id of splitIds(node.getAttribute(attributeName))) {
                   pushValidationText(document.getElementById(id));
                 }
@@ -1245,19 +1438,62 @@ class PlaywrightLinkedInEasyApplyExecutor:
               for (const id of splitIds(node.getAttribute("aria-activedescendant"))) {
                 pushRoot(document.getElementById(id));
               }
+              const validationScopes = [];
+              const pushValidationScope = (candidate) => {
+                if (
+                  !candidate
+                  || candidate.nodeType !== 1
+                  || validationScopes.includes(candidate)
+                ) {
+                  return;
+                }
+                validationScopes.push(candidate);
+              };
+              pushValidationScope(
+                node.closest(
+                  [
+                    ".fb-form-element",
+                    ".jobs-easy-apply-form-section__grouping",
+                    ".jobs-easy-apply-form-element",
+                    "[role='group']",
+                    "fieldset",
+                    "section",
+                    "form",
+                  ].join(", ")
+                )
+              );
+              pushValidationScope(node.parentElement);
               let ancestor = node.parentElement;
               let depth = 0;
-              while (ancestor && depth < 4) {
+              while (ancestor && depth < 3) {
                 for (const candidate of ancestor.querySelectorAll(
-                  "[role='alert'], [aria-live='assertive'], [aria-live='polite']"
+                  [
+                    "[role='alert']",
+                    "[aria-live='assertive']",
+                    "[aria-live='polite']",
+                    ".artdeco-inline-feedback__message",
+                    ".fb-dash-form-element__error-message",
+                    "[data-test-form-element-error-messages]",
+                  ].join(", ")
                 )) {
                   pushValidationText(candidate);
                 }
                 ancestor = ancestor.parentElement;
                 depth += 1;
               }
-              for (const candidate of document.querySelectorAll("div, p, span, small, li")) {
-                pushValidationText(candidate);
+              for (const scope of validationScopes) {
+                for (const candidate of scope.querySelectorAll(
+                  [
+                    "[role='alert']",
+                    "[aria-live='assertive']",
+                    "[aria-live='polite']",
+                    ".artdeco-inline-feedback__message",
+                    ".fb-dash-form-element__error-message",
+                    "[data-test-form-element-error-messages]",
+                  ].join(", ")
+                )) {
+                  pushValidationText(candidate);
+                }
               }
               const optionTexts = [];
               const seenOptions = new Set();
@@ -1288,6 +1524,16 @@ class PlaywrightLinkedInEasyApplyExecutor:
                   pushOption(optionNode);
                 }
               }
+              if (optionTexts.length === 0) {
+                for (const optionNode of document.querySelectorAll(
+                  "[role='option'], [aria-selected], [data-value], li"
+                )) {
+                  if (!isNearbyOptionForField(optionNode)) {
+                    continue;
+                  }
+                  pushOption(optionNode);
+                }
+              }
               if (
                 optionTexts.length === 0 &&
                 document.activeElement === node
@@ -1296,7 +1542,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                   pushOption(optionNode);
                 }
               }
-              nearbyValidationTexts.sort((left, right) => {
+              explicitValidationTexts.sort((left, right) => {
                 if (left.verticalGap !== right.verticalGap) {
                   return left.verticalGap - right.verticalGap;
                 }
@@ -1312,7 +1558,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
               const ariaInvalid = node.getAttribute("aria-invalid") === "true";
               const combinedValidationTexts = [
                 validationMessage,
-                ...nearbyValidationTexts.map((item) => item.text),
+                ...explicitValidationTexts.map((item) => item.text),
               ].filter(Boolean);
               return {
                 current_value: collapse(
@@ -2045,6 +2291,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         page: Page,
         *,
         settings: UserAgentSettings,
+        posting: JobPosting,
         execution_id: UUID,
         submission_id: UUID,
         execution_events: list[ExecutionEvent],
@@ -2055,12 +2302,40 @@ class PlaywrightLinkedInEasyApplyExecutor:
         await self._retry_invalid_fields_after_primary_action(
             page,
             settings=settings,
+            posting=posting,
             execution_id=execution_id,
             submission_id=submission_id,
             execution_events=execution_events,
             previous_step=step,
             step_answers=step_answers,
         )
+        current_step = await self._extract_step(
+            page,
+            last_known_step_index=step.step_index,
+            last_known_total_steps=step.total_steps,
+        )
+        if current_step.step_index != step.step_index:
+            return "complete", "The Easy Apply flow advanced to the next step."
+        if _step_surface_changed(step, current_step):
+            self._record_event(
+                execution_events,
+                execution_id=execution_id,
+                submission_id=submission_id,
+                event_type=ExecutionEventType.STEP_REACHED,
+                payload={
+                    "stage": "easy_apply_surface_changed_without_step_counter",
+                    "previous_step_index": step.step_index,
+                    "current_step_index": current_step.step_index,
+                    "field_count": len(current_step.fields),
+                    "field_summaries": [
+                        _field_debug_summary(field) for field in current_step.fields
+                    ],
+                },
+            )
+            return (
+                "complete",
+                "The Easy Apply modal changed to a new surface without updating the step counter.",
+            )
         root = await self._easy_apply_root(page)
         assessment = await self._assess_browser_state_with_agent(
             page,
@@ -2105,6 +2380,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         page: Page,
         *,
         settings: UserAgentSettings,
+        posting: JobPosting,
         execution_id: UUID,
         submission_id: UUID,
         execution_events: list[ExecutionEvent],
@@ -2115,6 +2391,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         browser_agent = self._create_browser_agent(settings)
         available_values = self._build_easy_apply_remediation_values(
             settings=settings,
+            posting=posting,
             step_answers=step_answers,
         )
         recent_actions: list[dict[str, object]] = []
@@ -2130,6 +2407,26 @@ class PlaywrightLinkedInEasyApplyExecutor:
             )
             if current_step.step_index != step.step_index:
                 return "complete", "The Easy Apply flow advanced after blocker remediation."
+            if _step_surface_changed(step, current_step):
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.STEP_REACHED,
+                    payload={
+                        "stage": "easy_apply_surface_changed_during_remediation",
+                        "previous_step_index": step.step_index,
+                        "current_step_index": current_step.step_index,
+                        "field_count": len(current_step.fields),
+                        "field_summaries": [
+                            _field_debug_summary(field) for field in current_step.fields
+                        ],
+                    },
+                )
+                return (
+                    "complete",
+                    "The Easy Apply modal changed to a new field surface during remediation.",
+                )
 
             root = await self._easy_apply_root(page)
             diagnosis = await self._assess_browser_state_with_agent(
@@ -2266,6 +2563,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         self,
         *,
         settings: UserAgentSettings,
+        posting: JobPosting,
         step_answers: tuple[ApplicationAnswer, ...],
     ) -> dict[str, str]:
         values: dict[str, str] = {}
@@ -2281,9 +2579,28 @@ class PlaywrightLinkedInEasyApplyExecutor:
             seen_keys[base_key] = suffix + 1
             key = base_key if suffix == 0 else f"{base_key}_{suffix + 1}"
             values[key] = raw_value
+        values.setdefault("profile_full_name", settings.profile.name)
+        values.setdefault("profile_first_name", _profile_first_name(settings.profile.name))
+        values.setdefault("profile_last_name", _profile_last_name(settings.profile.name))
         values.setdefault("profile_city", settings.profile.city)
         values.setdefault("profile_email", settings.profile.email)
         values.setdefault("profile_phone", settings.profile.phone)
+        values.setdefault("job_title", posting.title)
+        values.setdefault("job_company_name", posting.company_name)
+        if posting.location:
+            values.setdefault("job_location", posting.location)
+        if settings.profile.salary_expectation is not None:
+            values.setdefault(
+                "profile_salary_expectation",
+                str(settings.profile.salary_expectation),
+            )
+        if settings.profile.availability.strip():
+            values.setdefault("profile_availability", settings.profile.availability.strip())
+        for key, value in settings.profile.default_responses.items():
+            if not value.strip():
+                continue
+            slug = re.sub(r"[^a-z0-9]+", "_", normalize_text(key)).strip("_") or "default"
+            values.setdefault(f"default_response_{slug}", value.strip())
         return values
 
     async def _find_priority_blocker_locator(
@@ -2331,6 +2648,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         page: Page,
         *,
         settings: UserAgentSettings,
+        posting: JobPosting,
         execution_id: UUID,
         submission_id: UUID,
         execution_events: list[ExecutionEvent],
@@ -2364,7 +2682,32 @@ class PlaywrightLinkedInEasyApplyExecutor:
             if not state.invalid:
                 continue
 
-            target_value = answer_by_key.get(field.normalized_key) or state.current_value
+            resolved_retry = None
+            if not answer_by_key.get(field.normalized_key):
+                resolved_retry = await self._answer_resolver.resolve(
+                    field,
+                    settings,
+                    posting=posting,
+                )
+            target_value = (
+                answer_by_key.get(field.normalized_key)
+                or (resolved_retry.value if resolved_retry is not None else None)
+                or state.current_value
+            )
+            if not target_value.strip():
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.STEP_REACHED,
+                    payload={
+                        "stage": "easy_apply_retry_invalid_field_missing_target",
+                        "step_index": current_step.step_index,
+                        "normalized_key": field.normalized_key,
+                        "validation_message": state.validation_message,
+                    },
+                )
+                continue
             self._record_event(
                 execution_events,
                 execution_id=execution_id,
@@ -2376,14 +2719,43 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     "normalized_key": field.normalized_key,
                     "validation_message": state.validation_message,
                     "target_value": target_value,
+                    "answer_source": (
+                        resolved_retry.answer_source.value if resolved_retry is not None else None
+                    ),
+                    "fill_strategy": (
+                        resolved_retry.fill_strategy.value if resolved_retry is not None else None
+                    ),
+                    "confidence": (
+                        resolved_retry.confidence if resolved_retry is not None else None
+                    ),
+                    "reasoning": (resolved_retry.reasoning if resolved_retry is not None else None),
                 },
             )
             try:
-                await self._complete_text_field_interaction(
-                    page=page,
-                    field=field,
-                    target_value=target_value,
-                    settings=settings,
+                await asyncio.wait_for(
+                    self._complete_text_field_interaction(
+                        page=page,
+                        field=field,
+                        target_value=target_value,
+                        settings=settings,
+                    ),
+                    timeout=self._runtime_settings.linkedin_field_interaction_timeout_seconds,
+                )
+            except TimeoutError:
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.EXECUTION_FAILED,
+                    payload={
+                        "stage": "easy_apply_retry_invalid_field_timeout",
+                        "step_index": current_step.step_index,
+                        "normalized_key": field.normalized_key,
+                        "message": (
+                            "Timed out while the browser agent was trying to finish an "
+                            "interactive Easy Apply field."
+                        ),
+                    },
                 )
             except LinkedInEasyApplyError as exc:
                 self._record_event(
@@ -2927,16 +3299,52 @@ def _existing_path(raw_path: str | None) -> Path | None:
 def _pick_option_index(options: tuple[str, ...], *, preferred: str | None) -> int | None:
     if not options:
         return None
+    placeholder_tokens = {
+        "",
+        "select an option",
+        "choose an option",
+        "select one",
+        "choose one",
+        "selecione uma opcao",
+        "selecionar opcao",
+        "selecione",
+        "selecionar",
+    }
+    yes_tokens = {"yes", "y", "true", "sim", "s"}
+    no_tokens = {"no", "n", "false", "nao"}
+
+    def canonical_binary(value: str) -> str | None:
+        if value in yes_tokens:
+            return "yes"
+        if value in no_tokens:
+            return "no"
+        return None
+
+    candidate_indexes = [
+        index
+        for index, option in enumerate(options)
+        if normalize_text(option) not in placeholder_tokens
+    ]
     if preferred is None:
-        return 0
+        return candidate_indexes[0] if candidate_indexes else 0
     normalized_preferred = normalize_text(preferred)
-    for index, option in enumerate(options):
-        if normalize_text(option) == normalized_preferred:
+    canonical_preferred = canonical_binary(normalized_preferred)
+    for index in candidate_indexes:
+        option = options[index]
+        normalized_option = normalize_text(option)
+        if normalized_option == normalized_preferred:
             return index
-    for index, option in enumerate(options):
-        if normalized_preferred in normalize_text(option):
+        if (
+            canonical_preferred is not None
+            and canonical_binary(normalized_option) == canonical_preferred
+        ):
             return index
-    return 0
+    for index in candidate_indexes:
+        option = options[index]
+        normalized_option = normalize_text(option)
+        if normalized_preferred in normalized_option or normalized_option in normalized_preferred:
+            return index
+    return candidate_indexes[0] if candidate_indexes else 0
 
 
 def _pick_resume_option_index(options: tuple[str, ...], filename: str) -> int | None:

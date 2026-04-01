@@ -2180,7 +2180,7 @@ class OpenAIResponsesBrowserAgent:
                     "failed_action_type": action.action_type,
                     "element_id": action.element_id,
                     "action_intent": action.action_intent,
-                    "message": str(exc),
+                    "error_message": str(exc),
                     "url": snapshot.url,
                 }
                 execution_feedback.append(feedback)
@@ -2424,7 +2424,7 @@ class OpenAIResponsesBrowserAgent:
                     "failed_action_type": action.action_type,
                     "element_id": action.element_id,
                     "action_intent": action.action_intent,
-                    "message": str(exc),
+                    "error_message": str(exc),
                     "url": snapshot.url,
                 }
                 feedback_history.append(feedback)

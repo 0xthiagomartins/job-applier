@@ -1,7 +1,10 @@
 import asyncio
+from types import SimpleNamespace
+from typing import cast
 from uuid import uuid4
 
 import pytest
+from playwright.async_api import Locator, Page, async_playwright
 from pydantic import AnyUrl, SecretStr, TypeAdapter
 
 from job_applier.application.config import (
@@ -30,12 +33,21 @@ from job_applier.infrastructure.linkedin import (
     LinkedInAnswerResolver,
     LinkedInQuestionClassifier,
     LinkedInQuestionExtractor,
+    ResolvedFieldValue,
+)
+from job_applier.infrastructure.linkedin.browser_agent import (
+    BrowserAgentAction,
+    OpenAIResponsesBrowserAgent,
 )
 from job_applier.infrastructure.linkedin.easy_apply import (
+    EasyApplyStep,
     PlaywrightLinkedInEasyApplyExecutor,
     TextFieldInteractionState,
+    _pick_option_index,
     _pick_resume_option_index,
+    _step_surface_changed,
 )
+from job_applier.settings import RuntimeSettings
 
 
 @pytest.mark.parametrize(
@@ -43,6 +55,8 @@ from job_applier.infrastructure.linkedin.easy_apply import (
     [
         ("Email address", "text", "email", (), QuestionType.EMAIL, 0.99),
         ("Phone number", "text", "tel", (), QuestionType.PHONE, 0.99),
+        ("First name", "text", "text", (), QuestionType.FIRST_NAME, 0.98),
+        ("Last name", "text", "text", (), QuestionType.LAST_NAME, 0.98),
         ("LinkedIn profile", "text", "url", (), QuestionType.LINKEDIN_URL, 0.98),
         ("GitHub URL", "text", "url", (), QuestionType.GITHUB_URL, 0.98),
         ("Portfolio website", "text", "url", (), QuestionType.PORTFOLIO_URL, 0.9),
@@ -65,6 +79,32 @@ from job_applier.infrastructure.linkedin.easy_apply import (
         ("Salary expectation", "text", "number", (), QuestionType.SALARY_EXPECTATION, 0.95),
         ("When can you start?", "text", "text", (), QuestionType.START_DATE, 0.95),
         ("Current city", "text", "text", (), QuestionType.CITY, 0.9),
+        ("Número de celular", "text", "tel", (), QuestionType.PHONE, 0.99),
+        (
+            "Código do país",
+            "select",
+            "select",
+            ("Selecione uma opção", "Brasil +55"),
+            QuestionType.PHONE,
+            0.95,
+        ),
+        ("Carregue o currículo", "file", "file", (), QuestionType.RESUME_UPLOAD, 0.99),
+        (
+            "Você possui experiência sólida com Python em nível avançado?",
+            "select",
+            "select",
+            ("Selecionar opção", "Sim", "Não"),
+            QuestionType.YES_NO_GENERIC,
+            0.9,
+        ),
+        (
+            "Qual sua pretensão salarial para atuar como PJ?",
+            "text",
+            "number",
+            (),
+            QuestionType.SALARY_EXPECTATION,
+            0.95,
+        ),
         (
             "How many years of experience do you have with Python?",
             "text",
@@ -90,6 +130,14 @@ from job_applier.infrastructure.linkedin.easy_apply import (
             ("Yes", "No"),
             QuestionType.YES_NO_GENERIC,
             0.75,
+        ),
+        (
+            "Are you an expert with python software development?",
+            "select",
+            "select",
+            ("Select an option", "Yes", "No"),
+            QuestionType.YES_NO_GENERIC,
+            0.9,
         ),
         (
             "Tell us more about yourself",
@@ -155,6 +203,36 @@ def test_question_extractor_returns_standardized_field_structure() -> None:
     assert field.normalized_key == "how_many_years_of_experience_do_you_have_with_python"
 
 
+def test_question_classifier_assigns_phone_country_code_key_for_portuguese_label() -> None:
+    classifier = LinkedInQuestionClassifier()
+
+    classification = classifier.classify(
+        question_raw="Código do país",
+        control_kind="select",
+        input_type="select",
+        options=("Selecione uma opção", "Brasil +55"),
+    )
+
+    assert classification.question_type is QuestionType.PHONE
+    assert classification.normalized_key == "phone_country_code"
+    assert classification.matched_rule == "phone_country_code"
+
+
+def test_pick_option_index_skips_placeholder_entries() -> None:
+    options = ("Select an option", "Yes", "No")
+
+    assert _pick_option_index(options, preferred="Yes") == 1
+    assert _pick_option_index(options, preferred="No") == 2
+    assert _pick_option_index(options, preferred=None) == 1
+
+
+def test_pick_option_index_matches_localized_yes_no_options() -> None:
+    options = ("Selecionar opção", "Sim", "Não")
+
+    assert _pick_option_index(options, preferred="Yes") == 1
+    assert _pick_option_index(options, preferred="No") == 2
+
+
 def test_answer_resolver_respects_priority_chain_and_prefilled_fields() -> None:
     settings = build_user_agent_settings()
     resolver = LinkedInAnswerResolver()
@@ -176,6 +254,20 @@ def test_answer_resolver_respects_priority_chain_and_prefilled_fields() -> None:
         input_type="email",
         classification_confidence=0.99,
     )
+    first_name_field = EasyApplyField(
+        question_raw="First name",
+        normalized_key="first_name",
+        question_type=QuestionType.FIRST_NAME,
+        control_kind="text",
+        classification_confidence=0.98,
+    )
+    last_name_field = EasyApplyField(
+        question_raw="Last name",
+        normalized_key="last_name",
+        question_type=QuestionType.LAST_NAME,
+        control_kind="text",
+        classification_confidence=0.98,
+    )
     cover_letter_field = EasyApplyField(
         question_raw="Cover letter",
         normalized_key="cover_letter",
@@ -194,6 +286,8 @@ def test_answer_resolver_respects_priority_chain_and_prefilled_fields() -> None:
 
     work_auth_answer = asyncio.run(resolver.resolve(work_auth_field, settings, posting=posting))
     email_answer = asyncio.run(resolver.resolve(email_field, settings, posting=posting))
+    first_name_answer = asyncio.run(resolver.resolve(first_name_field, settings, posting=posting))
+    last_name_answer = asyncio.run(resolver.resolve(last_name_field, settings, posting=posting))
     cover_letter_answer = asyncio.run(
         resolver.resolve(cover_letter_field, settings, posting=posting)
     )
@@ -207,6 +301,14 @@ def test_answer_resolver_respects_priority_chain_and_prefilled_fields() -> None:
     assert email_answer.value == "thiago@example.com"
     assert email_answer.answer_source is AnswerSource.PROFILE_SNAPSHOT
     assert email_answer.fill_strategy is FillStrategy.DETERMINISTIC
+
+    assert first_name_answer is not None
+    assert first_name_answer.value == "Thiago"
+    assert first_name_answer.answer_source is AnswerSource.PROFILE_SNAPSHOT
+
+    assert last_name_answer is not None
+    assert last_name_answer.value == "Martins"
+    assert last_name_answer.answer_source is AnswerSource.PROFILE_SNAPSHOT
 
     assert cover_letter_answer is not None
     assert cover_letter_answer.value == "Open to discuss the role."
@@ -241,6 +343,109 @@ def test_answer_resolver_uses_ai_for_ambiguous_questions() -> None:
     assert answer.reasoning == "matched user preference"
 
 
+def test_answer_resolver_resolves_phone_country_code_for_brazilian_profile() -> None:
+    settings = build_user_agent_settings()
+    posting = build_posting()
+    resolver = LinkedInAnswerResolver()
+    field = EasyApplyField(
+        question_raw="Código do país",
+        normalized_key="phone_country_code",
+        question_type=QuestionType.PHONE,
+        control_kind="select",
+        options=("Selecionar opção", "Estados Unidos +1", "Brasil +55"),
+    )
+
+    answer = asyncio.run(resolver.resolve(field, settings, posting=posting))
+
+    assert answer is not None
+    assert answer.value == "Brasil +55"
+    assert answer.answer_source is AnswerSource.PROFILE_SNAPSHOT
+
+
+def test_answer_resolver_uses_matched_stack_overlap_for_years_experience() -> None:
+    settings = build_user_agent_settings().model_copy(
+        update={
+            "profile": build_user_agent_settings().profile.model_copy(
+                update={"years_experience_by_stack": {"python": 8, "sql": 5, "fastapi": 4}}
+            )
+        }
+    )
+    posting = build_posting()
+    resolver = LinkedInAnswerResolver()
+    years_field = EasyApplyField(
+        question_raw=(
+            "How many years of experience do you have working with Python and SQL in "
+            "analytics or BI environments?"
+        ),
+        normalized_key=(
+            "how_many_years_of_experience_do_you_have_working_with_python_and_sql_in_"
+            "analytics_or_bi_environments"
+        ),
+        question_type=QuestionType.YEARS_EXPERIENCE,
+        control_kind="text",
+        input_type="text",
+    )
+
+    answer = asyncio.run(resolver.resolve(years_field, settings, posting=posting))
+
+    assert answer is not None
+    assert answer.value == "5"
+    assert answer.answer_source is AnswerSource.PROFILE_SNAPSHOT
+    assert answer.fill_strategy is FillStrategy.DETERMINISTIC
+
+
+def test_answer_resolver_uses_ai_for_years_experience_when_profile_data_is_missing() -> None:
+    base_settings = build_user_agent_settings()
+    settings = base_settings.model_copy(
+        update={
+            "profile": base_settings.profile.model_copy(update={"years_experience_by_stack": {}})
+        }
+    )
+    posting = build_posting()
+    resolver = LinkedInAnswerResolver(
+        ambiguous_answer_generator=YearsExperienceGenerator(),
+    )
+    years_field = EasyApplyField(
+        question_raw="How many years of experience do you have with Python?",
+        normalized_key="how_many_years_of_experience_do_you_have_with_python",
+        question_type=QuestionType.YEARS_EXPERIENCE,
+        control_kind="text",
+        input_type="text",
+    )
+
+    answer = asyncio.run(resolver.resolve(years_field, settings, posting=posting))
+
+    assert answer is not None
+    assert answer.value == "6"
+    assert answer.answer_source is AnswerSource.AI
+    assert answer.fill_strategy is FillStrategy.AUTOFILL_AI
+    assert answer.ambiguity_flag is True
+
+
+def test_answer_resolver_avoids_generic_yes_fallback_for_years_experience() -> None:
+    base_settings = build_user_agent_settings()
+    settings = base_settings.model_copy(
+        update={
+            "profile": base_settings.profile.model_copy(update={"years_experience_by_stack": {}})
+        }
+    )
+    posting = build_posting()
+    resolver = LinkedInAnswerResolver(
+        ambiguous_answer_generator=NoopGenerator(),
+    )
+    years_field = EasyApplyField(
+        question_raw="How many years of experience do you have with Python?",
+        normalized_key="how_many_years_of_experience_do_you_have_with_python",
+        question_type=QuestionType.YEARS_EXPERIENCE,
+        control_kind="text",
+        input_type="text",
+    )
+
+    answer = asyncio.run(resolver.resolve(years_field, settings, posting=posting))
+
+    assert answer is None
+
+
 def test_answer_resolver_falls_back_gracefully_when_ai_fails() -> None:
     settings = build_user_agent_settings()
     posting = build_posting()
@@ -263,7 +468,64 @@ def test_answer_resolver_falls_back_gracefully_when_ai_fails() -> None:
     assert answer.answer_source is AnswerSource.BEST_EFFORT_AUTOFILL
     assert answer.fill_strategy is FillStrategy.BEST_EFFORT
     assert answer.ambiguity_flag is True
-    assert answer.reasoning == "heuristic_fallback"
+    assert answer.reasoning == "typed_guardrail_option_pick"
+
+
+def test_answer_resolver_uses_plausible_profile_inference_for_related_years() -> None:
+    settings = build_user_agent_settings().model_copy(
+        update={
+            "profile": build_user_agent_settings().profile.model_copy(
+                update={"years_experience_by_stack": {"python": 8, "sql": 5}}
+            )
+        }
+    )
+    posting = build_posting()
+    resolver = LinkedInAnswerResolver(
+        ambiguous_answer_generator=NoopGenerator(),
+    )
+    field = EasyApplyField(
+        question_raw="How many years of experience do you have with LangChain?",
+        normalized_key="how_many_years_of_experience_do_you_have_with_langchain",
+        question_type=QuestionType.YEARS_EXPERIENCE,
+        control_kind="text",
+        input_type="number",
+    )
+
+    answer = asyncio.run(resolver.resolve(field, settings, posting=posting))
+
+    assert answer is not None
+    assert answer.value == "2"
+    assert answer.answer_source is AnswerSource.BEST_EFFORT_AUTOFILL
+    assert answer.fill_strategy is FillStrategy.BEST_EFFORT
+    assert answer.reasoning == "plausible_profile_inference"
+
+
+def test_answer_resolver_maps_inferred_years_to_numeric_option() -> None:
+    settings = build_user_agent_settings().model_copy(
+        update={
+            "profile": build_user_agent_settings().profile.model_copy(
+                update={"years_experience_by_stack": {"python": 8}}
+            )
+        }
+    )
+    posting = build_posting()
+    resolver = LinkedInAnswerResolver(
+        ambiguous_answer_generator=NoopGenerator(),
+    )
+    field = EasyApplyField(
+        question_raw="How many years of experience do you have with LangChain?",
+        normalized_key="how_many_years_of_experience_do_you_have_with_langchain",
+        question_type=QuestionType.YEARS_EXPERIENCE,
+        control_kind="select",
+        input_type="select",
+        options=("Select an option", "0-1", "2-3", "4+"),
+    )
+
+    answer = asyncio.run(resolver.resolve(field, settings, posting=posting))
+
+    assert answer is not None
+    assert answer.value == "2-3"
+    assert answer.reasoning == "plausible_profile_inference"
 
 
 def test_text_field_interaction_requires_follow_up_when_field_is_invalid() -> None:
@@ -304,9 +566,199 @@ def test_text_field_interaction_completes_when_value_is_accepted() -> None:
     assert executor._text_field_interaction_complete(state) is True
 
 
+def test_inspect_text_field_interaction_detects_nearby_combobox_options() -> None:
+    async def scenario() -> None:
+        executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                await page.set_content(
+                    """
+                    <style>
+                      body {
+                        margin: 0;
+                        font-family: sans-serif;
+                      }
+                      .dialog {
+                        position: fixed;
+                        inset: 48px auto auto 120px;
+                        width: 520px;
+                        background: white;
+                        border: 1px solid #ddd;
+                        padding: 24px;
+                      }
+                      .options {
+                        margin-top: 12px;
+                        border: 1px solid #ccc;
+                        background: white;
+                      }
+                      .option {
+                        padding: 10px 12px;
+                      }
+                    </style>
+                    <div class="dialog" role="dialog" aria-label="Apply to Example Corp">
+                      <label for="city">Location (city)</label>
+                      <input
+                        id="city"
+                        type="text"
+                        role="combobox"
+                        aria-autocomplete="list"
+                        value="Sao Paulo"
+                      />
+                      <div class="options">
+                        <div class="option" role="option">São Paulo, Brazil</div>
+                        <div class="option" role="option">São Paulo, São Paulo, Brazil</div>
+                      </div>
+                    </div>
+                    """
+                )
+
+                state = await executor._inspect_text_field_interaction(page.locator("#city"))
+
+                assert state.visible_option_count == 2
+                assert state.visible_option_texts == (
+                    "São Paulo, Brazil",
+                    "São Paulo, São Paulo, Brazil",
+                )
+                assert state.needs_agentic_follow_up is True
+            finally:
+                await browser.close()
+
+    asyncio.run(scenario())
+
+
+def test_complete_text_field_interaction_reports_visible_options_to_agent() -> None:
+    async def scenario() -> None:
+        settings = build_user_agent_settings()
+        field = EasyApplyField(
+            question_raw="Location (city) Location (city)",
+            normalized_key="city",
+            question_type=QuestionType.CITY,
+            control_kind="text",
+            input_type="text",
+            required=True,
+        )
+        fake_root = object()
+        fake_locator = object()
+        captured_extra_rules: tuple[str, ...] = ()
+        states = iter(
+            (
+                TextFieldInteractionState(
+                    current_value="Sao Paulo",
+                    focused=False,
+                    role="combobox",
+                    aria_autocomplete="list",
+                    aria_expanded=True,
+                    has_popup_binding=False,
+                    active_descendant=None,
+                    visible_option_count=2,
+                    visible_option_texts=(
+                        "São Paulo, Brazil",
+                        "São Paulo, São Paulo, Brazil",
+                    ),
+                    invalid=True,
+                    validation_message="Please enter a valid answer",
+                ),
+                TextFieldInteractionState(
+                    current_value="São Paulo, Brazil",
+                    focused=False,
+                    role="combobox",
+                    aria_autocomplete="list",
+                    aria_expanded=False,
+                    has_popup_binding=False,
+                    active_descendant=None,
+                    visible_option_count=0,
+                    visible_option_texts=(),
+                    invalid=False,
+                    validation_message=None,
+                ),
+            )
+        )
+
+        class FakeBrowserAgent:
+            async def perform_single_task_action(self, **kwargs):
+                nonlocal captured_extra_rules
+                captured_extra_rules = kwargs["extra_rules"]
+                return BrowserAgentAction(
+                    action_type="click",
+                    element_id="agent-2",
+                    value_source=None,
+                    value=None,
+                    action_intent="select_dropdown_option",
+                    key_name=None,
+                    scroll_target=None,
+                    scroll_direction=None,
+                    scroll_amount=120,
+                    wait_seconds=0,
+                    reasoning="Click the visible matching option.",
+                )
+
+        class ExecutorDouble(PlaywrightLinkedInEasyApplyExecutor):
+            def __init__(self) -> None:
+                pass
+
+            def _create_browser_agent(
+                self,
+                settings: UserAgentSettings,
+            ) -> OpenAIResponsesBrowserAgent:
+                del settings
+                return cast(OpenAIResponsesBrowserAgent, FakeBrowserAgent())
+
+            async def _easy_apply_root(self, page: Page) -> Locator:
+                del page
+                return cast(Locator, fake_root)
+
+            async def _find_control_locator(
+                self,
+                root: Locator,
+                easy_apply_field: EasyApplyField,
+            ) -> Locator | None:
+                del root, easy_apply_field
+                return cast(Locator, fake_locator)
+
+            async def _field_interaction_focus_locator(
+                self,
+                root: Locator,
+                easy_apply_field: EasyApplyField,
+            ) -> Locator | None:
+                del root, easy_apply_field
+                return None
+
+            async def _inspect_text_field_interaction(
+                self,
+                locator: Locator,
+            ) -> TextFieldInteractionState:
+                del locator
+                return next(states)
+
+        executor = ExecutorDouble()
+
+        result = await executor._complete_text_field_interaction(
+            page=cast(Page, object()),
+            field=field,
+            target_value="Sao Paulo",
+            settings=settings,
+        )
+
+        assert result == "São Paulo, Brazil"
+        assert any(
+            "Visible chooser options" in rule and "São Paulo, Brazil" in rule
+            for rule in captured_extra_rules
+        )
+        assert any(
+            "prefer clicking the best matching visible option" in rule
+            for rule in captured_extra_rules
+        )
+
+    asyncio.run(scenario())
+
+
 def test_build_easy_apply_remediation_values_uses_descriptive_sources() -> None:
     executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
     settings = build_user_agent_settings()
+    posting = build_posting()
     answers = (
         ApplicationAnswer(
             submission_id=uuid4(),
@@ -332,13 +784,19 @@ def test_build_easy_apply_remediation_values_uses_descriptive_sources() -> None:
 
     values = executor._build_easy_apply_remediation_values(
         settings=settings,
+        posting=posting,
         step_answers=answers,
     )
 
     assert values["field_value_city"] == "Sao Paulo"
     assert values["field_value_email"] == "thiago@example.com"
+    assert values["profile_full_name"] == "Thiago Martins"
+    assert values["profile_first_name"] == "Thiago"
+    assert values["profile_last_name"] == "Martins"
     assert values["profile_city"] == "Sao Paulo"
     assert values["profile_phone"] == "+5511999999999"
+    assert values["job_title"] == "Senior Python Engineer"
+    assert values["job_company_name"] == "Acme"
 
 
 def test_pick_resume_option_index_prefers_semantic_match_for_configured_cv() -> None:
@@ -351,6 +809,159 @@ def test_pick_resume_option_index_prefers_semantic_match_for_configured_cv() -> 
     best_index = _pick_resume_option_index(options, "Thiago Martins - CV 2026.pdf")
 
     assert best_index == 1
+
+
+def test_retry_invalid_fields_uses_fresh_answer_resolution_for_remediation() -> None:
+    async def scenario() -> None:
+        settings = build_user_agent_settings()
+        posting = build_posting()
+        field = EasyApplyField(
+            question_raw="How many years of experience do you have with LangChain?",
+            normalized_key="how_many_years_of_experience_do_you_have_with_langchain",
+            question_type=QuestionType.YEARS_EXPERIENCE,
+            control_kind="text",
+            input_type="number",
+            required=True,
+        )
+        step = EasyApplyStep(step_index=0, total_steps=1, fields=(field,))
+        captured: dict[str, str] = {}
+
+        class FakeResolver:
+            async def resolve(
+                self,
+                field: EasyApplyField,
+                settings: UserAgentSettings,
+                *,
+                posting: JobPosting,
+            ) -> ResolvedFieldValue | None:
+                del field, settings, posting
+                return ResolvedFieldValue(
+                    value="2",
+                    answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
+                    fill_strategy=FillStrategy.BEST_EFFORT,
+                    ambiguity_flag=True,
+                    confidence=0.42,
+                    reasoning="plausible_profile_inference",
+                )
+
+        class ExecutorDouble(PlaywrightLinkedInEasyApplyExecutor):
+            def __init__(self) -> None:
+                pass
+
+            async def _easy_apply_modal_visible(self, page: Page) -> bool:
+                del page
+                return True
+
+            async def _extract_step(
+                self,
+                page: Page,
+                *,
+                last_known_step_index: int,
+                last_known_total_steps: int,
+            ) -> EasyApplyStep:
+                del page, last_known_step_index, last_known_total_steps
+                return step
+
+            async def _easy_apply_root(self, page: Page) -> Locator:
+                del page
+                return cast(Locator, object())
+
+            async def _find_control_locator(
+                self,
+                root: Locator,
+                easy_apply_field: EasyApplyField,
+            ) -> Locator | None:
+                del root, easy_apply_field
+                return cast(Locator, object())
+
+            async def _inspect_text_field_interaction(
+                self,
+                locator: Locator,
+            ) -> TextFieldInteractionState:
+                del locator
+                return TextFieldInteractionState(
+                    current_value="",
+                    focused=True,
+                    role="combobox",
+                    aria_autocomplete="list",
+                    aria_expanded=False,
+                    has_popup_binding=False,
+                    active_descendant=None,
+                    visible_option_count=0,
+                    invalid=True,
+                    validation_message="Please enter a valid answer",
+                )
+
+            async def _complete_text_field_interaction(
+                self,
+                *,
+                page: Page,
+                field: EasyApplyField,
+                target_value: str,
+                settings: UserAgentSettings,
+            ) -> str:
+                del page, field, settings
+                captured["target_value"] = target_value
+                return target_value
+
+        executor = ExecutorDouble()
+        executor._answer_resolver = cast(LinkedInAnswerResolver, FakeResolver())
+        executor._runtime_settings = cast(
+            RuntimeSettings,
+            SimpleNamespace(linkedin_field_interaction_timeout_seconds=1),
+        )
+
+        await executor._retry_invalid_fields_after_primary_action(
+            page=cast(Page, object()),
+            settings=settings,
+            posting=posting,
+            execution_id=uuid4(),
+            submission_id=uuid4(),
+            execution_events=[],
+            previous_step=step,
+            step_answers=(),
+        )
+
+        assert captured["target_value"] == "2"
+
+    asyncio.run(scenario())
+
+
+def test_step_surface_changed_detects_new_fields_without_counter_change() -> None:
+    previous_step = EasyApplyStep(
+        step_index=0,
+        total_steps=1,
+        fields=(
+            EasyApplyField(
+                question_raw="Carregue o currículo",
+                normalized_key="resume_upload",
+                question_type=QuestionType.RESUME_UPLOAD,
+                control_kind="file",
+            ),
+        ),
+    )
+    current_step = EasyApplyStep(
+        step_index=0,
+        total_steps=1,
+        fields=(
+            EasyApplyField(
+                question_raw="Qual sua pretensão salarial para atuar como PJ?",
+                normalized_key="salary_expectation",
+                question_type=QuestionType.SALARY_EXPECTATION,
+                control_kind="text",
+                input_type="number",
+            ),
+            EasyApplyField(
+                question_raw="Você possui experiência sólida com Python em nível avançado?",
+                normalized_key="python_experience",
+                question_type=QuestionType.YES_NO_GENERIC,
+                control_kind="select",
+                options=("Selecionar opção", "Sim", "Não"),
+            ),
+        ),
+    )
+
+    assert _step_surface_changed(previous_step, current_step) is True
 
 
 class SuccessfulGenerator:
@@ -368,6 +979,21 @@ class SuccessfulGenerator:
         )
 
 
+class YearsExperienceGenerator:
+    async def generate(
+        self,
+        *,
+        field: EasyApplyField,
+        settings: UserAgentSettings,
+        posting: JobPosting,
+    ) -> GeneratedAnswer | None:
+        return GeneratedAnswer(
+            value="6",
+            confidence=0.58,
+            reasoning="best effort numeric estimate",
+        )
+
+
 class FailingGenerator:
     async def generate(
         self,
@@ -377,6 +1003,17 @@ class FailingGenerator:
         posting: JobPosting,
     ) -> GeneratedAnswer | None:
         raise RuntimeError("temporary OpenAI outage")
+
+
+class NoopGenerator:
+    async def generate(
+        self,
+        *,
+        field: EasyApplyField,
+        settings: UserAgentSettings,
+        posting: JobPosting,
+    ) -> GeneratedAnswer | None:
+        return None
 
 
 def build_posting() -> JobPosting:

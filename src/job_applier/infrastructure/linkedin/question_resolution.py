@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Literal, Protocol, cast
 from urllib import error, request
@@ -17,6 +18,27 @@ from job_applier.domain.enums import AnswerSource, FillStrategy, QuestionType
 logger = logging.getLogger(__name__)
 
 ControlKind = Literal["text", "textarea", "select", "radio", "checkbox", "file"]
+
+_PLACEHOLDER_OPTION_TOKENS = frozenset(
+    {
+        "",
+        "select an option",
+        "choose an option",
+        "select one",
+        "choose one",
+        "select",
+        "choose",
+        "selecione uma opcao",
+        "selecionar opcao",
+        "selecionar uma opcao",
+        "selecione",
+        "selecionar",
+        "escolha uma opcao",
+        "escolher uma opcao",
+    }
+)
+_YES_OPTION_TOKENS = frozenset({"yes", "y", "true", "sim", "s"})
+_NO_OPTION_TOKENS = frozenset({"no", "n", "false", "nao"})
 
 STRUCTURED_OUTPUT_SCHEMA = {
     "type": "object",
@@ -46,7 +68,9 @@ STRUCTURED_OUTPUT_SCHEMA = {
 def normalize_text(value: str) -> str:
     """Collapse repeated whitespace and lowercase for comparisons."""
 
-    return re.sub(r"\s+", " ", value).strip().lower()
+    decomposed = unicodedata.normalize("NFKD", value)
+    ascii_only = "".join(char for char in decomposed if not unicodedata.combining(char))
+    return re.sub(r"\s+", " ", ascii_only).strip().lower()
 
 
 def normalize_key(value: str) -> str:
@@ -55,6 +79,22 @@ def normalize_key(value: str) -> str:
     normalized = normalize_text(value)
     slug = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
     return slug or "unknown"
+
+
+def _non_empty_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _canonical_binary_token(value: str) -> str | None:
+    normalized = normalize_text(value)
+    if normalized in _YES_OPTION_TOKENS:
+        return "yes"
+    if normalized in _NO_OPTION_TOKENS:
+        return "no"
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +149,15 @@ class GeneratedAnswer:
     reasoning: str
 
 
+@dataclass(frozen=True, slots=True)
+class GuardrailAnswer:
+    """Conservative local fallback answer used when the AI path cannot help."""
+
+    value: str
+    confidence: float
+    reasoning: str
+
+
 class AmbiguousAnswerGenerator(Protocol):
     """Generate a best-effort answer when deterministic resolution is not possible."""
 
@@ -138,7 +187,10 @@ class LinkedInQuestionClassifier:
         normalized = normalize_text(question_raw)
         default_key = normalize_key(question_raw)
         normalized_options = {normalize_text(option) for option in options if option.strip()}
-        options_text = " ".join(option for option in normalized_options if option)
+        meaningful_options = {
+            option for option in normalized_options if option not in _PLACEHOLDER_OPTION_TOKENS
+        }
+        options_text = " ".join(option for option in meaningful_options if option)
 
         if self._looks_like_resume_control(
             question_text=normalized,
@@ -151,21 +203,66 @@ class LinkedInQuestionClassifier:
                 confidence=0.99 if control_kind == "file" else 0.94,
                 matched_rule="file_resume" if control_kind == "file" else "choice_resume",
             )
-        if "cover letter" in normalized:
+        if self._contains_any(normalized, "cover letter", "carta de apresentacao"):
             return QuestionClassification(
                 question_type=QuestionType.COVER_LETTER,
                 normalized_key="cover_letter",
                 confidence=0.99,
                 matched_rule="cover_letter",
             )
-        if input_type == "email" or self._contains_any(normalized, "email", "e-mail"):
+        if self._contains_any(normalized, "first name", "given name", "forename"):
+            return QuestionClassification(
+                question_type=QuestionType.FIRST_NAME,
+                normalized_key="first_name",
+                confidence=0.98,
+                matched_rule="first_name",
+            )
+        if self._contains_any(normalized, "last name", "family name", "surname"):
+            return QuestionClassification(
+                question_type=QuestionType.LAST_NAME,
+                normalized_key="last_name",
+                confidence=0.98,
+                matched_rule="last_name",
+            )
+        if input_type == "email" or self._contains_any(
+            normalized,
+            "email",
+            "e-mail",
+            "endereco de email",
+            "endereco de e mail",
+            "correio eletronico",
+        ):
             return QuestionClassification(
                 question_type=QuestionType.EMAIL,
                 normalized_key="email",
                 confidence=0.99,
                 matched_rule="email",
             )
-        if input_type == "tel" or self._contains_any(normalized, "phone", "mobile", "telephone"):
+        if self._contains_any(
+            normalized,
+            "country code",
+            "codigo do pais",
+            "codigo de pais",
+            "codigo do telefone",
+            "ddd",
+        ):
+            return QuestionClassification(
+                question_type=QuestionType.PHONE,
+                normalized_key="phone_country_code",
+                confidence=0.96,
+                matched_rule="phone_country_code",
+            )
+        if input_type == "tel" or self._contains_any(
+            normalized,
+            "phone",
+            "mobile",
+            "telephone",
+            "telefone",
+            "celular",
+            "numero de celular",
+            "numero do celular",
+            "numero de telefone",
+        ):
             return QuestionClassification(
                 question_type=QuestionType.PHONE,
                 normalized_key="phone",
@@ -199,6 +296,9 @@ class LinkedInQuestionClassifier:
             "work authorization",
             "legally authorized",
             "eligible to work",
+            "autorizado a trabalhar",
+            "autorizacao de trabalho",
+            "autorizacao para trabalhar",
         ):
             return QuestionClassification(
                 question_type=QuestionType.WORK_AUTHORIZATION,
@@ -206,14 +306,30 @@ class LinkedInQuestionClassifier:
                 confidence=0.98,
                 matched_rule="work_authorization",
             )
-        if self._contains_any(normalized, "sponsorship", "visa", "require sponsor"):
+        if self._contains_any(
+            normalized,
+            "sponsorship",
+            "visa",
+            "require sponsor",
+            "patrocinio",
+            "patrocinio de visto",
+            "necessita de visto",
+        ):
             return QuestionClassification(
                 question_type=QuestionType.VISA_SPONSORSHIP,
                 normalized_key="visa_sponsorship",
                 confidence=0.98,
                 matched_rule="visa_sponsorship",
             )
-        if self._contains_any(normalized, "salary", "compensation", "pay expectation"):
+        if self._contains_any(
+            normalized,
+            "salary",
+            "compensation",
+            "pay expectation",
+            "pretensao salarial",
+            "faixa salarial",
+            "remuneracao",
+        ):
             return QuestionClassification(
                 question_type=QuestionType.SALARY_EXPECTATION,
                 normalized_key="salary_expectation",
@@ -226,6 +342,10 @@ class LinkedInQuestionClassifier:
             "availability",
             "notice period",
             "when can you start",
+            "data de inicio",
+            "disponibilidade",
+            "quando pode comecar",
+            "quando voce pode comecar",
         ):
             return QuestionClassification(
                 question_type=QuestionType.START_DATE,
@@ -233,8 +353,9 @@ class LinkedInQuestionClassifier:
                 confidence=0.95,
                 matched_rule="start_date",
             )
-        if "city" in normalized or (
-            "location" in normalized and control_kind in {"text", "textarea"}
+        if self._contains_any(normalized, "city", "cidade", "municipio") or (
+            self._contains_any(normalized, "location", "localizacao", "localidade")
+            and control_kind in {"text", "textarea"}
         ):
             return QuestionClassification(
                 question_type=QuestionType.CITY,
@@ -249,11 +370,11 @@ class LinkedInQuestionClassifier:
                 confidence=0.9,
                 matched_rule="years_experience",
             )
-        if normalized_options and normalized_options.issubset({"yes", "no"}):
+        if self._is_binary_option_set(meaningful_options):
             return QuestionClassification(
                 question_type=QuestionType.YES_NO_GENERIC,
                 normalized_key=default_key,
-                confidence=0.75,
+                confidence=0.9,
                 matched_rule="yes_no_generic",
             )
         if control_kind == "textarea":
@@ -272,6 +393,13 @@ class LinkedInQuestionClassifier:
 
     def _contains_any(self, value: str, *terms: str) -> bool:
         return any(term in value for term in terms)
+
+    def _is_binary_option_set(self, options: set[str]) -> bool:
+        if not options:
+            return False
+        canonical_tokens = {_canonical_binary_token(option) for option in options}
+        canonical_values = {token for token in canonical_tokens if token is not None}
+        return bool(canonical_values) and canonical_values.issubset({"yes", "no"})
 
     def _looks_like_resume_control(
         self,
@@ -373,6 +501,8 @@ class OpenAIResponsesAnswerGenerator:
             QuestionType.UNKNOWN,
             QuestionType.YES_NO_GENERIC,
             QuestionType.FREE_TEXT_GENERIC,
+            QuestionType.YEARS_EXPERIENCE,
+            QuestionType.SALARY_EXPECTATION,
         }:
             return None
 
@@ -434,6 +564,15 @@ class OpenAIResponsesAnswerGenerator:
         reasoning = str(payload.get("reasoning") or "").strip()
         if field.options:
             selected_option = pick_option(field.options, preferred=answer)
+            if (
+                selected_option is None
+                and field.question_type is QuestionType.YEARS_EXPERIENCE
+                and re.fullmatch(r"\d+(?:[.,]\d+)?", answer)
+            ):
+                selected_option = pick_numeric_option(
+                    field.options,
+                    target_value=float(answer.replace(",", ".")),
+                )
             if selected_option is None:
                 return None
             answer = selected_option
@@ -462,8 +601,19 @@ class OpenAIResponsesAnswerGenerator:
                             "text": (
                                 "You resolve ambiguous LinkedIn Easy Apply questions. "
                                 "Return one best-effort answer only. "
-                                "If options exist, answer with exactly one available option. "
-                                "Keep free-text answers concise and plausible."
+                                "Respect the control type and visible options exactly. "
+                                "If options exist, answer with exactly one available option label. "
+                                "If the field expects years of experience and there are no "
+                                "options, answer with a plain integer string such as '2'. "
+                                "If the field expects a salary or numeric value, answer with a "
+                                "plain positive number string without currency symbols. "
+                                "Prefer plausible and conservative answers over exactness when "
+                                "the candidate profile lacks the precise detail. "
+                                "For derived technologies, infer from the closest parent stack, "
+                                "stay internally consistent, and never exceed the broader stack "
+                                "experience. Prefer modest values for newer frameworks. "
+                                "Do not invent legal, visa, or certification facts. "
+                                "Keep free-text answers concise, professional, and believable."
                             ),
                         },
                     ],
@@ -517,6 +667,8 @@ class OpenAIResponsesAnswerGenerator:
     ) -> dict[str, object]:
         profile_payload = {
             "name": settings.profile.name,
+            "first_name": _profile_first_name(settings.profile.name),
+            "last_name": _profile_last_name(settings.profile.name),
             "email": str(settings.profile.email),
             "phone": settings.profile.phone,
             "city": settings.profile.city,
@@ -540,8 +692,53 @@ class OpenAIResponsesAnswerGenerator:
             "question_type": field.question_type.value,
             "control_kind": field.control_kind,
             "input_type": field.input_type,
+            "expected_answer_shape": (
+                "integer_years"
+                if field.question_type is QuestionType.YEARS_EXPERIENCE
+                else "numeric_salary"
+                if field.question_type is QuestionType.SALARY_EXPECTATION
+                else None
+            ),
+            "response_contract": {
+                "must_choose_visible_option": bool(field.options),
+                "must_return_yes_or_no": (
+                    field.question_type is QuestionType.YES_NO_GENERIC and not field.options
+                ),
+                "must_return_plain_integer": field.question_type is QuestionType.YEARS_EXPERIENCE,
+                "must_return_plain_number": (
+                    field.question_type is QuestionType.SALARY_EXPECTATION
+                    or field.input_type == "number"
+                ),
+                "keep_free_text_concise": field.control_kind == "textarea",
+            },
             "options": list(field.options),
             "current_value": field.current_value,
+            "experience_inference_context": self._build_experience_inference_context(
+                field=field,
+                settings=settings,
+                posting=posting,
+            ),
+            "inference_policy": [
+                "Prefer exact profile facts when they exist.",
+                "When exact data is missing, choose a conservative plausible answer.",
+                (
+                    "If a tool or framework is implied by a broader stack, infer from that "
+                    "stack conservatively."
+                ),
+                "Never exceed the candidate's broader stack experience or total experience.",
+                (
+                    "For newer frameworks, prefer a modest number such as 1, 2, or 3 instead "
+                    "of an aggressive claim."
+                ),
+                (
+                    "If visible options exist, choose the closest plausible visible option "
+                    "rather than inventing text."
+                ),
+                (
+                    "For legal authorization, visa, certifications, or other compliance facts, "
+                    "do not invent missing facts."
+                ),
+            ],
             "job": {
                 "title": posting.title,
                 "company_name": posting.company_name,
@@ -549,6 +746,54 @@ class OpenAIResponsesAnswerGenerator:
                 "description_raw": posting.description_raw,
             },
             "candidate_profile": profile_payload,
+        }
+
+    def _build_experience_inference_context(
+        self,
+        *,
+        field: EasyApplyField,
+        settings: UserAgentSettings,
+        posting: JobPosting,
+    ) -> dict[str, object]:
+        exact_stack_matches: list[dict[str, object]] = []
+        normalized_question = normalize_text(
+            " ".join(
+                (
+                    field.question_raw,
+                    field.normalized_key,
+                    posting.title,
+                    posting.description_raw,
+                )
+            )
+        )
+        ordered_stacks = sorted(
+            settings.profile.years_experience_by_stack.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        for stack_name, years in ordered_stacks:
+            normalized_stack = normalize_text(stack_name)
+            normalized_stack_key = normalize_key(stack_name)
+            if (normalized_stack and normalized_stack in normalized_question) or (
+                normalized_stack_key and normalized_stack_key in normalized_question
+            ):
+                exact_stack_matches.append({"stack": stack_name, "years": years})
+
+        strongest_stack = ordered_stacks[0] if ordered_stacks else None
+        conservative_years = _infer_conservative_related_years(
+            settings.profile.years_experience_by_stack
+        )
+        return {
+            "exact_stack_matches": exact_stack_matches,
+            "top_known_stacks": [
+                {"stack": stack_name, "years": years} for stack_name, years in ordered_stacks[:6]
+            ],
+            "strongest_known_stack": (
+                {"stack": strongest_stack[0], "years": strongest_stack[1]}
+                if strongest_stack is not None
+                else None
+            ),
+            "conservative_inferred_years_for_related_tooling": conservative_years,
         }
 
     def _extract_output_text(self, response_data: dict[str, object]) -> str:
@@ -641,16 +886,16 @@ class LinkedInAnswerResolver:
                 reasoning=ai_answer.reasoning,
             )
 
-        best_effort = self._resolve_best_effort_fallback(field, settings)
-        if best_effort is None:
+        guardrail_answer = self._resolve_guardrail_fallback(field, settings)
+        if guardrail_answer is None:
             return None
         return ResolvedFieldValue(
-            value=best_effort,
+            value=guardrail_answer.value,
             answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
             fill_strategy=FillStrategy.BEST_EFFORT,
             ambiguity_flag=True,
-            confidence=0.35,
-            reasoning="heuristic_fallback",
+            confidence=guardrail_answer.confidence,
+            reasoning=guardrail_answer.reasoning,
         )
 
     async def _generate_ai_answer(
@@ -706,12 +951,18 @@ class LinkedInAnswerResolver:
         profile = settings.profile
 
         match field.question_type:
+            case QuestionType.FIRST_NAME:
+                return _non_empty_value(_profile_first_name(profile.name))
+            case QuestionType.LAST_NAME:
+                return _non_empty_value(_profile_last_name(profile.name))
             case QuestionType.EMAIL:
-                return str(profile.email)
+                return _non_empty_value(str(profile.email))
             case QuestionType.PHONE:
-                return profile.phone
+                if normalize_key(field.normalized_key) == "phone_country_code":
+                    return self._resolve_phone_country_code(field)
+                return _non_empty_value(profile.phone)
             case QuestionType.CITY:
-                return profile.city
+                return _non_empty_value(profile.city)
             case QuestionType.LINKEDIN_URL:
                 return str(profile.linkedin_url) if profile.linkedin_url else None
             case QuestionType.GITHUB_URL:
@@ -720,67 +971,255 @@ class LinkedInAnswerResolver:
                 return str(profile.portfolio_url) if profile.portfolio_url else None
             case QuestionType.SALARY_EXPECTATION:
                 return (
-                    str(profile.salary_expectation)
+                    _non_empty_value(str(profile.salary_expectation))
                     if profile.salary_expectation is not None
                     else None
                 )
             case QuestionType.START_DATE:
-                return profile.availability
+                return _non_empty_value(profile.availability)
             case QuestionType.RESUME_UPLOAD:
-                return profile.cv_path
+                return _non_empty_value(profile.cv_path)
             case QuestionType.YEARS_EXPERIENCE:
-                return self._resolve_years_experience(field, settings)
+                return self._resolve_exact_years_experience(field, settings)
+            case _:
+                return self._resolve_profile_value_by_normalized_key(field.normalized_key, settings)
+
+    def _resolve_profile_value_by_normalized_key(
+        self,
+        normalized_key: str,
+        settings: UserAgentSettings,
+    ) -> str | None:
+        match normalize_key(normalized_key):
+            case "first_name" | "given_name" | "forename":
+                return _non_empty_value(_profile_first_name(settings.profile.name))
+            case "last_name" | "family_name" | "surname":
+                return _non_empty_value(_profile_last_name(settings.profile.name))
+            case "city" | "current_city" | "location_city":
+                return _non_empty_value(settings.profile.city)
+            case "email":
+                return _non_empty_value(str(settings.profile.email))
+            case "phone_country_code":
+                synthetic_field = EasyApplyField(
+                    question_raw="Country code",
+                    normalized_key="phone_country_code",
+                    question_type=QuestionType.PHONE,
+                    control_kind="select",
+                )
+                return self._resolve_phone_country_code(synthetic_field)
+            case "phone" | "phone_number" | "mobile" | "mobile_number":
+                return _non_empty_value(settings.profile.phone)
             case _:
                 return None
 
-    def _resolve_years_experience(
+    def _resolve_phone_country_code(self, field: EasyApplyField) -> str | None:
+        if field.options:
+            preferred_tokens = (
+                normalize_text("Brazil"),
+                normalize_text("Brasil"),
+                normalize_text("+55"),
+                normalize_text("55"),
+            )
+            for option in field.options:
+                normalized_option = normalize_text(option)
+                if normalized_option in _PLACEHOLDER_OPTION_TOKENS:
+                    continue
+                if any(token and token in normalized_option for token in preferred_tokens):
+                    return option
+            fallback_option = pick_option(field.options, preferred=None)
+            if fallback_option is not None:
+                return fallback_option
+        return "+55"
+
+    def _resolve_exact_years_experience(
         self,
         field: EasyApplyField,
         settings: UserAgentSettings,
     ) -> str | None:
         normalized_question = normalize_text(f"{field.question_raw} {field.normalized_key}")
+        matched_years: list[int] = []
         for stack_name, years in settings.profile.years_experience_by_stack.items():
-            if normalize_key(stack_name) in normalized_question:
-                return str(years)
+            normalized_stack = normalize_text(stack_name)
+            normalized_stack_key = normalize_key(stack_name)
+            if (normalized_stack and normalized_stack in normalized_question) or (
+                normalized_stack_key and normalized_stack_key in normalized_question
+            ):
+                matched_years.append(years)
 
-        years_values = tuple(settings.profile.years_experience_by_stack.values())
-        if years_values:
-            return str(max(years_values))
+        if matched_years:
+            return str(matched_years[0] if len(matched_years) == 1 else min(matched_years))
         return None
 
-    def _resolve_best_effort_fallback(
+    def _resolve_guardrail_fallback(
         self,
         field: EasyApplyField,
         settings: UserAgentSettings,
-    ) -> str | None:
+    ) -> GuardrailAnswer | None:
         profile = settings.profile
         normalized_question = normalize_text(field.question_raw)
 
         if field.question_type is QuestionType.RESUME_UPLOAD:
-            return profile.cv_path
+            cv_path = _non_empty_value(profile.cv_path)
+            if cv_path is None:
+                return None
+            return GuardrailAnswer(
+                value=cv_path,
+                confidence=0.55,
+                reasoning="guardrail_resume_path",
+            )
+        if field.question_type is QuestionType.YEARS_EXPERIENCE:
+            inferred_years = self._infer_plausible_years_experience(field, settings)
+            if inferred_years is None:
+                return None
+            resolved_value = inferred_years
+            if field.options:
+                numeric_option = pick_numeric_option(
+                    field.options,
+                    target_value=float(inferred_years),
+                )
+                if numeric_option is not None:
+                    resolved_value = numeric_option
+            return GuardrailAnswer(
+                value=resolved_value,
+                confidence=0.42,
+                reasoning="plausible_profile_inference",
+            )
+        normalized_key = normalize_key(field.normalized_key)
+        if normalized_key in {"first_name", "given_name", "forename"}:
+            first_name = _non_empty_value(_profile_first_name(profile.name))
+            if first_name is None:
+                return None
+            return GuardrailAnswer(
+                value=first_name,
+                confidence=0.72,
+                reasoning="guardrail_profile_identity",
+            )
+        if normalized_key in {"last_name", "family_name", "surname"}:
+            last_name = _non_empty_value(_profile_last_name(profile.name))
+            if last_name is None:
+                return None
+            return GuardrailAnswer(
+                value=last_name,
+                confidence=0.72,
+                reasoning="guardrail_profile_identity",
+            )
+        if normalized_key in {"city", "current_city", "location_city"}:
+            city = _non_empty_value(profile.city)
+            if city is None:
+                return None
+            return GuardrailAnswer(
+                value=city,
+                confidence=0.68,
+                reasoning="guardrail_profile_location",
+            )
+        if normalized_key == "phone_country_code":
+            phone_country_code = self._resolve_phone_country_code(field)
+            if phone_country_code is None:
+                return None
+            return GuardrailAnswer(
+                value=phone_country_code,
+                confidence=0.7,
+                reasoning="guardrail_phone_country_code",
+            )
 
         if field.options:
-            preferred = "No" if "follow" in normalized_question else None
-            return pick_option(field.options, preferred=preferred)
+            preferred = "No" if _prefers_negative_answer(normalized_question) else None
+            option = pick_option(field.options, preferred=preferred)
+            if option is None:
+                return None
+            return GuardrailAnswer(
+                value=option,
+                confidence=0.3,
+                reasoning="typed_guardrail_option_pick",
+            )
 
         if field.control_kind == "checkbox":
-            return "No" if "follow" in normalized_question else "Yes"
+            return GuardrailAnswer(
+                value="No" if _prefers_negative_answer(normalized_question) else "Yes",
+                confidence=0.28,
+                reasoning="typed_guardrail_checkbox",
+            )
         if field.control_kind == "file":
-            return profile.cv_path
+            cv_path = _non_empty_value(profile.cv_path)
+            if cv_path is None:
+                return None
+            return GuardrailAnswer(
+                value=cv_path,
+                confidence=0.55,
+                reasoning="guardrail_resume_path",
+            )
         if field.control_kind == "textarea":
-            return self._first_default_response(settings) or "Open to discuss."
+            textarea_value = self._first_default_response(settings) or "Open to discuss."
+            return GuardrailAnswer(
+                value=textarea_value,
+                confidence=0.4,
+                reasoning="guardrail_concise_free_text",
+            )
         if field.input_type == "email":
-            return str(profile.email)
+            email = _non_empty_value(str(profile.email))
+            if email is None:
+                return None
+            return GuardrailAnswer(
+                value=email,
+                confidence=0.7,
+                reasoning="guardrail_profile_contact",
+            )
         if field.input_type == "tel":
-            return profile.phone
+            phone = _non_empty_value(profile.phone)
+            if phone is None:
+                return None
+            return GuardrailAnswer(
+                value=phone,
+                confidence=0.7,
+                reasoning="guardrail_profile_contact",
+            )
         if field.input_type == "url":
-            return str(profile.linkedin_url) if profile.linkedin_url else None
+            if profile.linkedin_url is None:
+                return None
+            return GuardrailAnswer(
+                value=str(profile.linkedin_url),
+                confidence=0.5,
+                reasoning="guardrail_profile_url",
+            )
         if field.input_type == "number":
-            if profile.salary_expectation is not None:
-                return str(profile.salary_expectation)
-            years_values = tuple(profile.years_experience_by_stack.values())
-            return str(max(years_values)) if years_values else "0"
-        return self._first_default_response(settings) or profile.availability or profile.city
+            if field.question_type is QuestionType.SALARY_EXPECTATION:
+                if profile.salary_expectation is None:
+                    return None
+                return GuardrailAnswer(
+                    value=str(profile.salary_expectation),
+                    confidence=0.6,
+                    reasoning="guardrail_profile_salary",
+                )
+            inferred_years = self._infer_plausible_years_experience(field, settings)
+            if inferred_years is None:
+                return None
+            return GuardrailAnswer(
+                value=inferred_years,
+                confidence=0.38,
+                reasoning="plausible_profile_inference",
+            )
+        if field.question_type is QuestionType.FREE_TEXT_GENERIC:
+            free_text_value = self._first_default_response(settings) or "Open to discuss."
+            return GuardrailAnswer(
+                value=free_text_value,
+                confidence=0.36,
+                reasoning="guardrail_concise_free_text",
+            )
+        return None
+
+    def _infer_plausible_years_experience(
+        self,
+        field: EasyApplyField,
+        settings: UserAgentSettings,
+    ) -> str | None:
+        exact_match = self._resolve_exact_years_experience(field, settings)
+        if exact_match is not None:
+            return exact_match
+        inferred_years = _infer_conservative_related_years(
+            settings.profile.years_experience_by_stack
+        )
+        if inferred_years is None:
+            return None
+        return str(inferred_years)
 
     def _first_default_response(self, settings: UserAgentSettings) -> str | None:
         for value in settings.profile.default_responses.values():
@@ -795,9 +1234,15 @@ def pick_option(options: tuple[str, ...], *, preferred: str | None = None) -> st
 
     if preferred is not None:
         normalized_preferred = normalize_text(preferred)
+        canonical_preferred = _canonical_binary_token(normalized_preferred)
         for option in options:
             normalized_option = normalize_text(option)
             if normalized_option == normalized_preferred:
+                return option
+            if (
+                canonical_preferred is not None
+                and _canonical_binary_token(normalized_option) == canonical_preferred
+            ):
                 return option
         for option in options:
             normalized_option = normalize_text(option)
@@ -808,6 +1253,86 @@ def pick_option(options: tuple[str, ...], *, preferred: str | None = None) -> st
                 return option
 
     for option in options:
-        if normalize_text(option) not in {"", "select an option", "choose an option"}:
+        if normalize_text(option) not in _PLACEHOLDER_OPTION_TOKENS:
             return option
     return options[0]
+
+
+def pick_numeric_option(options: tuple[str, ...], *, target_value: float) -> str | None:
+    """Pick the option whose numeric meaning best matches the requested target."""
+
+    best_option: str | None = None
+    best_score: tuple[int, float, float] | None = None
+    for option in options:
+        normalized_option = normalize_text(option)
+        if normalized_option in _PLACEHOLDER_OPTION_TOKENS:
+            continue
+        numeric_bounds = _parse_numeric_option_bounds(option)
+        if numeric_bounds is None:
+            continue
+        lower_bound, upper_bound = numeric_bounds
+        if lower_bound <= target_value <= upper_bound:
+            range_width = upper_bound - lower_bound
+            score = (3, -range_width, -abs(target_value - lower_bound))
+        else:
+            nearest_bound = lower_bound if target_value < lower_bound else upper_bound
+            distance = abs(target_value - nearest_bound)
+            score = (2, -distance, -(upper_bound - lower_bound))
+        if best_score is None or score > best_score:
+            best_score = score
+            best_option = option
+    return best_option
+
+
+def _parse_numeric_option_bounds(option: str) -> tuple[float, float] | None:
+    numbers = [
+        float(match.group(0).replace(",", ".")) for match in re.finditer(r"\d+(?:[.,]\d+)?", option)
+    ]
+    if not numbers:
+        return None
+    normalized_option = normalize_text(option)
+    if len(numbers) >= 2 and any(token in normalized_option for token in {"-", " to ", " a "}):
+        lower_bound, upper_bound = sorted(numbers[:2])
+        return lower_bound, upper_bound
+    if "+" in option:
+        return numbers[0], numbers[0] + 100.0
+    if any(token in normalized_option for token in {"less than", "up to", "ate ", "até ", "<"}):
+        return 0.0, numbers[0]
+    return numbers[0], numbers[0]
+
+
+def _infer_conservative_related_years(years_by_stack: dict[str, int]) -> int | None:
+    if not years_by_stack:
+        return None
+    strongest_years = max(years_by_stack.values())
+    if strongest_years <= 0:
+        return None
+    conservative_years = round(strongest_years * 0.25)
+    return max(1, min(3, conservative_years))
+
+
+def _prefers_negative_answer(normalized_question: str) -> bool:
+    return any(
+        token in normalized_question
+        for token in (
+            "follow",
+            "talent community",
+            "newsletter",
+            "mailing list",
+            "job alerts",
+            "marketing",
+            "future opportunities",
+        )
+    )
+
+
+def _profile_first_name(full_name: str) -> str:
+    parts = [part for part in full_name.strip().split() if part]
+    return parts[0] if parts else ""
+
+
+def _profile_last_name(full_name: str) -> str:
+    parts = [part for part in full_name.strip().split() if part]
+    if len(parts) >= 2:
+        return " ".join(parts[1:])
+    return ""

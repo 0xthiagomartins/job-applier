@@ -52,6 +52,7 @@ class RuntimeSettings(BaseSettings):
     openai_responses_retry_max_delay_seconds: float = 20.0
     browser_agent_single_action_max_attempts: int = 3
     browser_agent_stall_threshold: int = 3
+    linkedin_field_interaction_timeout_seconds: int = 45
     bootstrap_panel_on_empty_state: bool = True
     bootstrap_profile_name: str | None = None
     bootstrap_profile_email: str | None = None
