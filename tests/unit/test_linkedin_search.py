@@ -4,7 +4,7 @@ from typing import cast
 
 from alembic import command
 from alembic.config import Config
-from playwright.async_api import Page
+from playwright.async_api import Page, async_playwright
 from pydantic import AnyUrl, SecretStr, TypeAdapter
 
 from job_applier.application.config import (
@@ -22,6 +22,7 @@ from job_applier.infrastructure.linkedin.search import (
     LinkedInCollectedJob,
     LinkedInJobFetcher,
     LinkedInJobParser,
+    LinkedInResultsPageCollection,
     LinkedInSearchCriteria,
     LinkedInSearchError,
     PlaywrightLinkedInJobsClient,
@@ -254,6 +255,99 @@ def test_wait_for_search_surface_short_circuits_when_job_cards_are_visible(tmp_p
         result = await client._wait_for_search_surface(cast(Page, FakePage()), criteria=criteria)
         assert result.status == "complete"
         assert "job cards" in result.summary.lower()
+
+    asyncio.run(scenario())
+
+
+def test_collect_listing_cards_from_results_page_hydrates_virtualized_results(
+    tmp_path: Path,
+) -> None:
+    runtime_settings = RuntimeSettings(data_dir=tmp_path)
+    client = PlaywrightLinkedInJobsClient(runtime_settings)
+
+    async def scenario() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                await page.set_content(
+                    """
+                    <style>
+                      body { margin: 0; font-family: sans-serif; }
+                      #results {
+                        height: 240px;
+                        overflow-y: auto;
+                        border: 1px solid #ddd;
+                      }
+                      ul {
+                        list-style: none;
+                        margin: 0;
+                        padding: 0;
+                      }
+                      li {
+                        min-height: 120px;
+                        padding: 12px;
+                        border-bottom: 1px solid #eee;
+                      }
+                      a {
+                        display: inline-block;
+                        margin-bottom: 6px;
+                      }
+                    </style>
+                    <div id="results"><ul id="jobs"></ul></div>
+                    <script>
+                      const allJobs = [
+                        ["101", "Senior Python Developer", "Acme", "Remote"],
+                        ["102", "Staff Python Engineer", "Acme", "Remote"],
+                        ["103", "Automation Engineer", "Acme", "Remote"],
+                        ["104", "Data Platform Engineer", "Acme", "Remote"],
+                        ["105", "Backend Engineer", "Acme", "Remote"],
+                        ["106", "AI Automations Engineer", "Acme", "Remote"],
+                      ];
+                      let loaded = 0;
+                      const list = document.getElementById("jobs");
+                      const results = document.getElementById("results");
+                      const appendBatch = (count) => {
+                        const nextJobs = allJobs.slice(loaded, loaded + count);
+                        for (const [jobId, title, company, location] of nextJobs) {
+                          const li = document.createElement("li");
+                          li.innerHTML = `
+                            <a href="https://www.linkedin.com/jobs/view/${jobId}/">${title}</a>
+                            <div>${company}</div>
+                            <div>${location}</div>
+                            <div>Easy Apply</div>
+                          `;
+                          list.appendChild(li);
+                        }
+                        loaded += nextJobs.length;
+                      };
+                      appendBatch(2);
+                      results.addEventListener("scroll", () => {
+                        const nearBottom =
+                          results.scrollTop + results.clientHeight >= results.scrollHeight - 24;
+                        if (nearBottom && loaded < allJobs.length) {
+                          appendBatch(2);
+                        }
+                      });
+                    </script>
+                    """
+                )
+
+                collection = await client._collect_listing_cards_from_results_page(page)
+
+                assert isinstance(collection, LinkedInResultsPageCollection)
+                assert len(collection.listings) == 6
+                assert collection.rounds >= 2
+                assert {listing.external_job_id for listing in collection.listings} == {
+                    "101",
+                    "102",
+                    "103",
+                    "104",
+                    "105",
+                    "106",
+                }
+            finally:
+                await browser.close()
 
     asyncio.run(scenario())
 

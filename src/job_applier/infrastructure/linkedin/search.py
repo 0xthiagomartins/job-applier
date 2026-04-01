@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 LINKEDIN_JOBS_URL = "https://www.linkedin.com/jobs/"
 LINKEDIN_JOBS_SEARCH_URL = "https://www.linkedin.com/jobs/search/"
 RESULTS_PER_PAGE = 25
+RESULTS_PAGE_MAX_SCROLL_ROUNDS = 12
+RESULTS_PAGE_STALE_SCROLL_ROUNDS = 2
 
 
 class LinkedInSearchError(RuntimeError):
@@ -91,6 +93,16 @@ class LinkedInCollectedJob:
     metadata_text: str = ""
     workplace_type: WorkplaceType | None = None
     seniority: SeniorityLevel | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LinkedInResultsPageCollection:
+    """One hydrated LinkedIn results page after scroll-based collection."""
+
+    listings: tuple[LinkedInCollectedJob, ...]
+    rounds: int
+    visible_listing_count: int
+    stale_rounds: int
 
 
 class LinkedInJobsClient(Protocol):
@@ -388,12 +400,21 @@ class PlaywrightLinkedInJobsClient:
                     )
                 await self._ensure_authenticated_page(page)
                 await self._capture_screenshot(page, run_dir / f"results-page-{page_index + 1}.png")
-                listings = await self._extract_listing_cards(page)
+                page_collection = await self._collect_listing_cards_from_results_page(page)
+                listings = list(page_collection.listings)
+                duplicate_listing_count = sum(
+                    1 for listing in listings if listing.url in seen_job_urls
+                )
+                new_listing_count = len(listings) - duplicate_listing_count
                 append_timeline_event(
                     "linkedin_search_results_page_loaded",
                     {
                         "page_index": page_index + 1,
                         "listing_count": len(listings),
+                        "visible_listing_count": page_collection.visible_listing_count,
+                        "collection_rounds": page_collection.rounds,
+                        "duplicate_listing_count": duplicate_listing_count,
+                        "new_listing_count": new_listing_count,
                         "url": page.url,
                     },
                 )
@@ -403,6 +424,8 @@ class PlaywrightLinkedInJobsClient:
                         "current_job": None,
                         "search_page_index": page_index + 1,
                         "search_listing_count": len(listings),
+                        "search_visible_listing_count": page_collection.visible_listing_count,
+                        "search_new_listing_count": new_listing_count,
                     },
                 )
                 if not listings:
@@ -433,6 +456,25 @@ class PlaywrightLinkedInJobsClient:
                         },
                     )
                     jobs.append(await self._load_job_details(context, listing))
+            else:
+                append_output_jsonl(
+                    "run.log",
+                    {
+                        "source": "linkedin_search",
+                        "kind": "search_pagination_limit_reached",
+                        "max_pages": criteria.max_pages,
+                        "jobs_collected": len(jobs),
+                        "unique_job_urls": len(seen_job_urls),
+                    },
+                )
+                append_timeline_event(
+                    "linkedin_search_pagination_limit_reached",
+                    {
+                        "max_pages": criteria.max_pages,
+                        "jobs_collected": len(jobs),
+                        "unique_job_urls": len(seen_job_urls),
+                    },
+                )
 
             return jobs
         finally:
@@ -848,6 +890,148 @@ class PlaywrightLinkedInJobsClient:
             """,
         )
         return [LinkedInCollectedJob(**payload) for payload in payloads]
+
+    async def _collect_listing_cards_from_results_page(
+        self,
+        page: Page,
+    ) -> LinkedInResultsPageCollection:
+        collected_by_url: dict[str, LinkedInCollectedJob] = {}
+        stale_rounds = 0
+        last_visible_listing_count = 0
+        completed_rounds = 0
+
+        for round_index in range(RESULTS_PAGE_MAX_SCROLL_ROUNDS):
+            visible_listings = await self._extract_listing_cards(page)
+            last_visible_listing_count = len(visible_listings)
+            new_listing_count = 0
+            duplicate_listing_count = 0
+
+            for listing in visible_listings:
+                if listing.url in collected_by_url:
+                    duplicate_listing_count += 1
+                    continue
+                collected_by_url[listing.url] = listing
+                new_listing_count += 1
+
+            scroll_state = await self._scroll_results_surface(page)
+            completed_rounds = round_index + 1
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "linkedin_search",
+                    "kind": "results_page_collection_round",
+                    "round_index": completed_rounds,
+                    "visible_listing_count": last_visible_listing_count,
+                    "unique_listing_count": len(collected_by_url),
+                    "new_listing_count": new_listing_count,
+                    "duplicate_listing_count": duplicate_listing_count,
+                    **scroll_state,
+                },
+            )
+
+            if new_listing_count == 0:
+                stale_rounds += 1
+            else:
+                stale_rounds = 0
+
+            scrolled = bool(scroll_state.get("scrolled", False))
+            if stale_rounds >= RESULTS_PAGE_STALE_SCROLL_ROUNDS:
+                break
+            if not scrolled:
+                break
+            await page.wait_for_timeout(650 + min(round_index, 4) * 120)
+
+        return LinkedInResultsPageCollection(
+            listings=tuple(collected_by_url.values()),
+            rounds=completed_rounds,
+            visible_listing_count=last_visible_listing_count,
+            stale_rounds=stale_rounds,
+        )
+
+    async def _scroll_results_surface(self, page: Page) -> dict[str, object]:
+        payload = await page.evaluate(
+            """
+            () => {
+              const jobSelector = "a[href*='/jobs/view/']";
+              const isScrollable = (node) => {
+                if (!node || node.nodeType !== 1) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                const overflowY = style.overflowY || style.overflow;
+                return (
+                  ["auto", "scroll", "overlay"].includes(overflowY)
+                  && node.scrollHeight - node.clientHeight > 24
+                );
+              };
+              const scoreContainer = (node) => node.querySelectorAll(jobSelector).length;
+              const anchors = Array.from(document.querySelectorAll(jobSelector));
+              let best = null;
+
+              for (const anchor of anchors) {
+                let current = anchor.parentElement;
+                let depth = 0;
+                while (current && current !== document.body && depth < 8) {
+                  if (isScrollable(current)) {
+                    const score = scoreContainer(current);
+                    const area = current.clientWidth * current.clientHeight;
+                    if (
+                      !best
+                      || score > best.score
+                      || (score === best.score && area < best.area)
+                    ) {
+                      best = { node: current, score, area };
+                    }
+                  }
+                  current = current.parentElement;
+                  depth += 1;
+                }
+              }
+
+              if (best && best.node) {
+                const node = best.node;
+                const before = node.scrollTop;
+                const step = Math.max(240, Math.round(node.clientHeight * 0.8));
+                node.scrollBy({ top: step, behavior: "instant" });
+                const after = node.scrollTop;
+                return {
+                  scroll_mode: "container",
+                  scrolled: after > before + 1,
+                  can_continue: after + node.clientHeight < node.scrollHeight - 8,
+                  scroll_top_before: before,
+                  scroll_top_after: after,
+                  scroll_height: node.scrollHeight,
+                  client_height: node.clientHeight,
+                  container_job_anchor_count: scoreContainer(node),
+                };
+              }
+
+              const root = document.scrollingElement || document.documentElement;
+              const before = root.scrollTop || window.scrollY || 0;
+              const step = Math.max(320, Math.round(window.innerHeight * 0.8));
+              window.scrollBy({ top: step, behavior: "instant" });
+              const after = root.scrollTop || window.scrollY || 0;
+              const viewportHeight = window.innerHeight || root.clientHeight || 0;
+              return {
+                scroll_mode: "page",
+                scrolled: after > before + 1,
+                can_continue: after + viewportHeight < root.scrollHeight - 8,
+                scroll_top_before: before,
+                scroll_top_after: after,
+                scroll_height: root.scrollHeight,
+                client_height: viewportHeight,
+                container_job_anchor_count: anchors.length,
+              };
+            }
+            """
+        )
+        if not isinstance(payload, dict):
+            return {
+                "scroll_mode": "unknown",
+                "scrolled": False,
+                "can_continue": False,
+            }
+        return payload
 
     async def _load_job_details(
         self,

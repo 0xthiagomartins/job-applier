@@ -32,6 +32,7 @@ class RuntimeSettings(BaseSettings):
     scheduler_poll_interval_seconds: int = 30
     agent_test_mode: bool = False
     agent_max_selected_jobs_per_run: int | None = None
+    agent_test_minimum_score_threshold: float | None = None
     playwright_headless: bool = False
     playwright_trace_enabled: bool = True
     playwright_display: str | None = Field(default=None, alias="DISPLAY")
@@ -39,7 +40,7 @@ class RuntimeSettings(BaseSettings):
     linkedin_password: SecretStr | None = None
     linkedin_storage_state_path: Path | None = None
     linkedin_artifacts_dir: Path | None = None
-    linkedin_max_search_pages: int = 2
+    linkedin_max_search_pages: int = 4
     linkedin_default_timeout_ms: int = 15_000
     linkedin_login_timeout_seconds: int = 120
     linkedin_min_action_delay_ms: int = 350
@@ -129,6 +130,16 @@ class RuntimeSettings(BaseSettings):
         if self.agent_test_mode:
             return 1
         return None
+
+    @property
+    def resolved_agent_test_minimum_score_threshold(self) -> float | None:
+        """Return the score threshold override used only in agent test mode."""
+
+        if not self.agent_test_mode:
+            return None
+        if self.agent_test_minimum_score_threshold is None:
+            return None
+        return min(1.0, max(0.0, self.agent_test_minimum_score_threshold))
 
     @property
     def resolved_openai_responses_max_retries(self) -> int:
