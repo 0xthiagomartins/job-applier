@@ -2440,6 +2440,17 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             "action_intent to advance_step."
                         ),
                         (
+                            "When the current surface has zero visible form fields, treat it as "
+                            "a review, confirmation, or finalization surface. Do not invent "
+                            "missing inputs. Inspect the visible primary CTA and choose between "
+                            "advance_step and submit_application based on that CTA."
+                        ),
+                        (
+                            "If there are zero visible fields and a single dominant primary CTA "
+                            "is already visible, prefer clicking that CTA immediately instead of "
+                            "scrolling again."
+                        ),
+                        (
                             "If the active surface can scroll and the primary advance control "
                             "is not visible yet, scroll the active surface downward instead "
                             "of the page."

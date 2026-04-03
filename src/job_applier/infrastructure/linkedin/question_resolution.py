@@ -637,6 +637,17 @@ class OpenAIResponsesAnswerGenerator:
             if selected_option is None:
                 return None
             answer = selected_option
+        if _answer_matches_unreliable_negative_option_label(field=field, answer=answer):
+            logger.info(
+                "linkedin_ai_autofill_guardrail_rejected",
+                extra={
+                    "normalized_key": field.normalized_key,
+                    "question_type": field.question_type.value,
+                    "answer": answer,
+                    "reason": "unreliable_negative_option_label",
+                },
+            )
+            return None
         if _answer_uses_target_employer_for_candidate_field(
             field=field,
             answer=answer,
@@ -683,11 +694,23 @@ class OpenAIResponsesAnswerGenerator:
                                 "options, answer with a plain integer string such as '2'. "
                                 "If the field expects a salary or numeric value, answer with a "
                                 "plain positive number string without currency symbols. "
+                                "Some LinkedIn radio/select groups expose a broken field label "
+                                "that is actually just one visible option, sometimes the most "
+                                "negative one. When that happens, treat the raw field label as "
+                                "unreliable and infer the real intent from the full option set, "
+                                "the job context, and the candidate profile. "
                                 "Prefer plausible and conservative answers over exactness when "
                                 "the candidate profile lacks the precise detail. "
                                 "For derived technologies, infer from the closest parent stack, "
                                 "stay internally consistent, and never exceed the broader stack "
                                 "experience. Prefer modest values for newer frameworks. "
+                                "For proficiency ladders such as Basic/Intermediate/Advanced/"
+                                "Native, never choose the lowest or negative option merely "
+                                "because it repeats the raw field label. Prefer the lowest "
+                                "plausible working level instead. "
+                                "If the job description requires English or international remote "
+                                "collaboration, do not answer with no English at all unless the "
+                                "candidate profile explicitly says that. "
                                 "Never reuse the target job company as the candidate's current "
                                 "or previous employer unless the profile explicitly says so. "
                                 "If current employer data is missing, prefer a neutral plausible "
@@ -794,6 +817,10 @@ class OpenAIResponsesAnswerGenerator:
                 "keep_free_text_concise": field.control_kind == "textarea",
             },
             "options": list(field.options),
+            "field_label_reliability": (
+                "low" if _field_label_matches_visible_option(field) else "normal"
+            ),
+            "option_set_observations": _build_option_set_observations(field),
             "current_value": field.current_value,
             "experience_inference_context": self._build_experience_inference_context(
                 field=field,
@@ -988,6 +1015,11 @@ class LinkedInAnswerResolver:
                 field=field,
                 answer=ai_answer.value,
                 posting=posting,
+            ):
+                ai_answer = None
+            elif _answer_matches_unreliable_negative_option_label(
+                field=field,
+                answer=ai_answer.value,
             ):
                 ai_answer = None
             else:
@@ -1699,13 +1731,15 @@ def _answer_uses_target_employer_for_candidate_field(
 
 
 def _looks_like_language_proficiency_question(field: EasyApplyField) -> bool:
-    normalized = normalize_text(f"{field.question_raw} {field.normalized_key}")
+    normalized = normalize_text(
+        " ".join((field.question_raw, field.normalized_key, *field.options))
+    )
     if not any(
         token in normalized
         for token in ("english", "ingles", "spanish", "espanhol", "language", "idioma")
     ):
         return False
-    return any(
+    if any(
         token in normalized
         for token in (
             "proficiency",
@@ -1716,6 +1750,68 @@ def _looks_like_language_proficiency_question(field: EasyApplyField) -> bool:
             "comfortable",
             "confortavel",
             "comfort",
+        )
+    ):
+        return True
+    return any(
+        token in normalized
+        for token in (
+            "beginner",
+            "basic",
+            "intermediate",
+            "advanced",
+            "native",
+            "fluent",
+            "fluente",
+            "working proficiency",
+            "professional working proficiency",
+        )
+    )
+
+
+def _field_label_matches_visible_option(field: EasyApplyField) -> bool:
+    normalized_question = normalize_text(field.question_raw)
+    if not normalized_question:
+        return False
+    return any(normalize_text(option) == normalized_question for option in field.options)
+
+
+def _build_option_set_observations(field: EasyApplyField) -> list[str]:
+    observations: list[str] = []
+    if _field_label_matches_visible_option(field):
+        observations.append("raw_field_label_matches_one_visible_option")
+    if _looks_like_language_proficiency_question(field):
+        observations.append("visible_options_form_language_or_proficiency_ladder")
+    if len(field.options) >= 3:
+        observations.append("multiple_visible_options_available")
+    return observations
+
+
+def _answer_matches_unreliable_negative_option_label(
+    *,
+    field: EasyApplyField,
+    answer: str,
+) -> bool:
+    if not _field_label_matches_visible_option(field):
+        return False
+    if not _looks_like_language_proficiency_question(field):
+        return False
+    normalized_answer = normalize_text(answer)
+    normalized_question = normalize_text(field.question_raw)
+    if normalized_answer != normalized_question:
+        return False
+    return any(
+        token in normalized_answer
+        for token in (
+            "don't know",
+            "do not know",
+            "no english",
+            "not know english",
+            "nenhum ingles",
+            "nao sei ingles",
+            "i don't know",
+            "zero english",
+            "sem ingles",
         )
     )
 

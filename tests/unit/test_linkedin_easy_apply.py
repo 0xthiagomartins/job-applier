@@ -462,6 +462,82 @@ def test_answer_resolver_uses_conservative_guardrail_for_language_proficiency_op
     assert answer.reasoning == "guardrail_conservative_language_proficiency"
 
 
+def test_answer_resolver_uses_conservative_guardrail_for_broken_language_option_label() -> None:
+    settings = build_user_agent_settings()
+    posting = build_posting()
+    resolver = LinkedInAnswerResolver(
+        ambiguous_answer_generator=NoopGenerator(),
+    )
+    field = EasyApplyField(
+        question_raw="I don't know English at all",
+        normalized_key="i_don_t_know_english_at_all",
+        question_type=QuestionType.UNKNOWN,
+        control_kind="radio",
+        input_type="radio",
+        options=(
+            "I don't know English at all",
+            "Basic",
+            "Intermediate (intermediate reading and writing)",
+            "Intermediate + (I can have a fluid conversation in English)",
+            "Advanced",
+            "Native",
+        ),
+    )
+
+    answer = asyncio.run(resolver.resolve(field, settings, posting=posting))
+
+    assert answer is not None
+    assert answer.value == "Intermediate (intermediate reading and writing)"
+    assert answer.answer_source is AnswerSource.BEST_EFFORT_AUTOFILL
+    assert answer.reasoning == "guardrail_conservative_language_proficiency"
+
+
+def test_answer_resolver_rejects_ai_answer_that_copies_broken_negative_language_label() -> None:
+    settings = build_user_agent_settings()
+    posting = build_posting()
+
+    class BrokenLanguageGenerator:
+        async def generate(
+            self,
+            *,
+            field: EasyApplyField,
+            settings: UserAgentSettings,
+            posting: JobPosting,
+        ) -> GeneratedAnswer | None:
+            del field, settings, posting
+            return GeneratedAnswer(
+                value="I don't know English at all",
+                confidence=1.0,
+                reasoning="copied_field_label",
+            )
+
+    resolver = LinkedInAnswerResolver(
+        ambiguous_answer_generator=BrokenLanguageGenerator(),
+    )
+    field = EasyApplyField(
+        question_raw="I don't know English at all",
+        normalized_key="i_don_t_know_english_at_all",
+        question_type=QuestionType.UNKNOWN,
+        control_kind="radio",
+        input_type="radio",
+        options=(
+            "I don't know English at all",
+            "Basic",
+            "Intermediate (intermediate reading and writing)",
+            "Intermediate + (I can have a fluid conversation in English)",
+            "Advanced",
+            "Native",
+        ),
+    )
+
+    answer = asyncio.run(resolver.resolve(field, settings, posting=posting))
+
+    assert answer is not None
+    assert answer.value == "Intermediate (intermediate reading and writing)"
+    assert answer.answer_source is AnswerSource.BEST_EFFORT_AUTOFILL
+    assert answer.reasoning == "guardrail_conservative_language_proficiency"
+
+
 def test_answer_resolver_uses_opt_out_for_sensitive_questions_when_available() -> None:
     settings = build_user_agent_settings()
     posting = build_posting()
