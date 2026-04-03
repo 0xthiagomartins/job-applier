@@ -95,6 +95,15 @@ wheels = [
 ]
 
 [[package]]
+name = "distro"
+version = "1.9.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/fc/f8/98eea607f65de6527f8a2e8885fc8015d3e6f5775df186e443e0964a11c3/distro-1.9.0.tar.gz", hash = "sha256:2fa77c6fd8940f116ee1d6b94a2f90b13b5ea8d019b98bc8bafdcabcdd9bdbed", size = 60722, upload-time = "2023-12-24T09:54:32.31Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/12/b3/231ffd4ab1fc9d679809f356cebee130ac7daa00d6d6f3206dd4fd137e9e/distro-1.9.0-py3-none-any.whl", hash = "sha256:7bffd925d65168f85027d8da9af6bddab658135b840670a223589bc0c8ef02b2", size = 20277, upload-time = "2023-12-24T09:54:30.421Z" },
+]
+
+[[package]]
 name = "dnspython"
 version = "2.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -243,6 +252,7 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "python-multipart" },
     { name = "sqlalchemy" },
+    { name = "stagehand" },
     { name = "uvicorn" },
 ]
 
@@ -265,6 +275,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.10.0,<3.0.0" },
     { name = "python-multipart", specifier = ">=0.0.20,<1.0.0" },
     { name = "sqlalchemy", specifier = ">=2.0.40,<3.0.0" },
+    { name = "stagehand", specifier = ">=3.19.4" },
     { name = "uvicorn", specifier = ">=0.35.0,<1.0.0" },
 ]
 
@@ -651,6 +662,15 @@ wheels = [
 ]
 
 [[package]]
+name = "sniffio"
+version = "1.3.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a2/87/a6771e1546d97e7e041b6ae58d80074f81b7d5121207425c964ddf5cfdbd/sniffio-1.3.1.tar.gz", hash = "sha256:f4324edc670a0f49750a81b895f35c3adb843cca46f0530f79fc1babb23789dc", size = 20372, upload-time = "2024-02-25T23:20:04.057Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e9/44/75a9c9421471a6c4805dbf2356f7c181a29c1879239abab1ea2cc8f38b40/sniffio-1.3.1-py3-none-any.whl", hash = "sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2", size = 10235, upload-time = "2024-02-25T23:20:01.196Z" },
+]
+
+[[package]]
 name = "sqlalchemy"
 version = "2.0.48"
 source = { registry = "https://pypi.org/simple" }
@@ -674,6 +694,26 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c8/95/32107c4d13be077a9cae61e9ae49966a35dc4bf442a8852dd871db31f62e/sqlalchemy-2.0.48-cp314-cp314t-win32.whl", hash = "sha256:b8438ec5594980d405251451c5b7ea9aa58dda38eb7ac35fb7e4c696712ee24f", size = 2147209, upload-time = "2026-03-02T15:52:54.274Z" },
     { url = "https://files.pythonhosted.org/packages/d2/d7/1e073da7a4bc645eb83c76067284a0374e643bc4be57f14cc6414656f92c/sqlalchemy-2.0.48-cp314-cp314t-win_amd64.whl", hash = "sha256:d854b3970067297f3a7fbd7a4683587134aa9b3877ee15aa29eea478dc68f933", size = 2182198, upload-time = "2026-03-02T15:52:55.606Z" },
     { url = "https://files.pythonhosted.org/packages/46/2c/9664130905f03db57961b8980b05cab624afd114bf2be2576628a9f22da4/sqlalchemy-2.0.48-py3-none-any.whl", hash = "sha256:a66fe406437dd65cacd96a72689a3aaaecaebbcd62d81c5ac1c0fdbeac835096", size = 1940202, upload-time = "2026-03-02T15:52:43.285Z" },
+]
+
+[[package]]
+name = "stagehand"
+version = "3.19.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "distro" },
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/41/98/4373098b91716dcf89cac76a09e9b424811ab47df6a7d964c20dc6dec906/stagehand-3.19.4.tar.gz", hash = "sha256:dcdad508dae485edcb01d18a9824958e58cb2a7007f9586da46acff2d9a6138a", size = 281114, upload-time = "2026-04-03T19:47:42.262Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fc/34/b502c1f3bc7403d5c8c949f81358837b6bd68626aa2f296c08caa150e499/stagehand-3.19.4-py3-none-macosx_10_9_x86_64.whl", hash = "sha256:7d7476d8ca6fedca1d1792a7875896faa47c875fef45ad9981c92c988526b97e", size = 34496055, upload-time = "2026-04-03T19:47:44.254Z" },
+    { url = "https://files.pythonhosted.org/packages/11/f4/8f38b14890420933b66e6e51fff651b960b8984396bb29e6f13cf1ae93e1/stagehand-3.19.4-py3-none-macosx_11_0_arm64.whl", hash = "sha256:6879dbc70a37d5a8d37318818e9bc022d386b9f4a9a5e64ef2886860edfa0ed8", size = 33193716, upload-time = "2026-04-03T19:47:47.838Z" },
+    { url = "https://files.pythonhosted.org/packages/21/a4/74cd965e992e9bda3e8985dab9e2623c7fbfb750d56d735f9bd30475f7b6/stagehand-3.19.4-py3-none-manylinux2014_x86_64.whl", hash = "sha256:8900f87495e094ec27921ba6145967c45f2a7dd00099258b9f5568b7077d324f", size = 37273327, upload-time = "2026-04-03T19:47:51.492Z" },
+    { url = "https://files.pythonhosted.org/packages/05/18/4d41dcb6bd6966eb2a5fcee0e16d5d82be9abfe928fc217d225e7a85ba8e/stagehand-3.19.4-py3-none-win_amd64.whl", hash = "sha256:e1b1926e133d1e4703bc95c72ea2c92f0ae216e4e47f53bd4bd966315d3165ec", size = 30758536, upload-time = "2026-04-03T19:47:54.834Z" },
 ]
 
 [[package]]

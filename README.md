@@ -95,6 +95,7 @@ Runtime behavior:
 - later runs reuse that storage state automatically;
 - if LinkedIn expires the session, the app clears the saved state and logs in again;
 - when `JOB_APPLIER_PLAYWRIGHT_MCP_URL` is configured, the login bootstrap runs through Playwright MCP and exports the storage state back to the Python app;
+- when `JOB_APPLIER_STAGEHAND_ENABLED=true`, the search flow can use Stagehand to semantically repair noisy LinkedIn job-detail extraction, especially in direct-target debugging and suspicious detail pages;
 - in headful mode, the browser stays visible so the user can solve captcha or checkpoint screens.
 - when the panel state is still empty, the app bootstraps a local profile automatically from `.env` and tries to import a CV from `~/Documents`.
 
@@ -119,6 +120,8 @@ For deeper agent debugging, the last-run bundle now also keeps machine-oriented 
 For low-cost manual debugging, you can enable `JOB_APPLIER_AGENT_TEST_MODE=true`. In this mode the app processes only 1 selected job per run, disables OpenAI HTTP retries, and keeps the richer browser-agent traces so we can refine prompts without falling back to brittle heuristics. If you need to force one near-match through the pipeline while debugging the apply flow, set `JOB_APPLIER_AGENT_TEST_MINIMUM_SCORE_THRESHOLD` too.
 
 For immediate iteration on a single problematic job, set `JOB_APPLIER_LINKEDIN_DEBUG_TARGET_JOB_URL=https://www.linkedin.com/jobs/view/...`. In that mode the agent bypasses the search pages and opens the target job directly, which is much faster when we are polishing the Easy Apply agent. When `JOB_APPLIER_AGENT_TEST_MODE=true`, this direct-target mode also relaxes the score threshold to `0.0` automatically so the debug run reaches `Easy Apply` instead of being blocked by ranking.
+
+If you also enable `JOB_APPLIER_STAGEHAND_ENABLED=true`, the debug-target path will use Stagehand observe/extract to get a cleaner semantic view of the LinkedIn job page before the parser merges the detail payload.
 
 ## Quality commands
 

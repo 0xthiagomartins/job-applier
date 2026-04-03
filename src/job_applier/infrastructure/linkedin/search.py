@@ -31,6 +31,11 @@ from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserTaskAssessment,
     OpenAIResponsesBrowserAgent,
 )
+from job_applier.infrastructure.linkedin.stagehand import (
+    StagehandLinkedInError,
+    StagehandLinkedInJobDetailExtractor,
+    resolve_stagehand_model_name,
+)
 from job_applier.observability import (
     append_artifact_reference,
     append_output_jsonl,
@@ -562,12 +567,26 @@ class LinkedInJobFetcher(JobFetcher):
 class PlaywrightLinkedInJobsClient:
     """Use Playwright to search LinkedIn Jobs and capture structured postings."""
 
-    def __init__(self, runtime_settings: RuntimeSettings) -> None:
+    def __init__(
+        self,
+        runtime_settings: RuntimeSettings,
+        *,
+        stagehand_job_detail_extractor: StagehandLinkedInJobDetailExtractor | None = None,
+    ) -> None:
         self._runtime_settings = runtime_settings
         self._session_manager: LinkedInSessionManager | None = None
+        self._stagehand_job_detail_extractor_override = stagehand_job_detail_extractor
+        self._active_stagehand_job_detail_extractor: StagehandLinkedInJobDetailExtractor | None = (
+            stagehand_job_detail_extractor
+        )
+        self._playwright_executable_path: str | None = None
 
     async def fetch_jobs(self, criteria: LinkedInSearchCriteria) -> list[LinkedInCollectedJob]:
         async with async_playwright() as playwright:
+            self._activate_stagehand_for_run(
+                criteria,
+                playwright_executable_path=playwright.chromium.executable_path,
+            )
             session_manager = self._create_session_manager(criteria)
             browser = await playwright.chromium.launch(
                 headless=self._runtime_settings.playwright_headless,
@@ -596,6 +615,10 @@ class PlaywrightLinkedInJobsClient:
         """Capture jobs incrementally and forward them as soon as each detail page loads."""
 
         async with async_playwright() as playwright:
+            self._activate_stagehand_for_run(
+                criteria,
+                playwright_executable_path=playwright.chromium.executable_path,
+            )
             session_manager = self._create_session_manager(criteria)
             browser = await playwright.chromium.launch(
                 headless=self._runtime_settings.playwright_headless,
@@ -880,6 +903,7 @@ class PlaywrightLinkedInJobsClient:
                 description_raw="",
                 easy_apply=True,
             ),
+            prefer_stagehand=True,
         )
         update_progress_snapshot(
             {
@@ -1579,6 +1603,8 @@ class PlaywrightLinkedInJobsClient:
         self,
         context: BrowserContext,
         listing: LinkedInCollectedJob,
+        *,
+        prefer_stagehand: bool = False,
     ) -> LinkedInCollectedJob:
         detail_page = await context.new_page()
         try:
@@ -1737,6 +1763,14 @@ class PlaywrightLinkedInJobsClient:
                 }
                 """,
             )
+            if not isinstance(detail_payload, dict):
+                msg = "LinkedIn job detail extraction returned an invalid payload."
+                raise LinkedInSearchError(msg)
+            detail_payload = await self._maybe_enrich_detail_payload_with_stagehand(
+                listing=listing,
+                detail_payload=detail_payload,
+                prefer_stagehand=prefer_stagehand,
+            )
             append_timeline_event(
                 "linkedin_job_detail_loaded",
                 {
@@ -1757,11 +1791,17 @@ class PlaywrightLinkedInJobsClient:
         self,
         context: BrowserContext,
         listing: LinkedInCollectedJob,
+        *,
+        prefer_stagehand: bool = False,
     ) -> LinkedInCollectedJob:
         last_error: str | None = None
         for attempt_index in range(2):
             try:
-                return await self._load_job_details(context, listing)
+                return await self._load_job_details(
+                    context,
+                    listing,
+                    prefer_stagehand=prefer_stagehand,
+                )
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)
                 append_output_jsonl(
@@ -1830,6 +1870,129 @@ class PlaywrightLinkedInJobsClient:
             await self._capture_screenshot(detail_page, run_dir / "debug-target-job.png")
         finally:
             await detail_page.close()
+
+    def _activate_stagehand_for_run(
+        self,
+        criteria: LinkedInSearchCriteria,
+        *,
+        playwright_executable_path: str | None,
+    ) -> None:
+        self._playwright_executable_path = playwright_executable_path
+        if self._stagehand_job_detail_extractor_override is not None:
+            self._active_stagehand_job_detail_extractor = (
+                self._stagehand_job_detail_extractor_override
+            )
+            return
+        if not self._runtime_settings.stagehand_enabled:
+            self._active_stagehand_job_detail_extractor = None
+            return
+        api_key = criteria.ai_api_key or self._runtime_settings.openai_api_key
+        if api_key is None:
+            self._active_stagehand_job_detail_extractor = None
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "linkedin_search",
+                    "kind": "stagehand_skipped_missing_api_key",
+                },
+            )
+            return
+        self._active_stagehand_job_detail_extractor = StagehandLinkedInJobDetailExtractor(
+            api_key=api_key,
+            model_name=resolve_stagehand_model_name(criteria.ai_model),
+            runtime_settings=self._runtime_settings,
+        )
+
+    async def _maybe_enrich_detail_payload_with_stagehand(
+        self,
+        *,
+        listing: LinkedInCollectedJob,
+        detail_payload: dict[str, object],
+        prefer_stagehand: bool,
+    ) -> dict[str, object]:
+        extractor = self._active_stagehand_job_detail_extractor
+        if extractor is None:
+            return detail_payload
+        if not prefer_stagehand and not self._detail_payload_needs_semantic_repair(
+            listing=listing,
+            detail_payload=detail_payload,
+        ):
+            return detail_payload
+        try:
+            extraction = await extractor.extract_job_detail(
+                url=listing.url,
+                storage_state_path=self._runtime_settings.resolved_linkedin_storage_state_path,
+                chrome_path=self._playwright_executable_path,
+            )
+        except StagehandLinkedInError as exc:
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "linkedin_search",
+                    "kind": "stagehand_job_detail_failed",
+                    "external_job_id": listing.external_job_id,
+                    "url": listing.url,
+                    "message": str(exc),
+                },
+            )
+            append_timeline_event(
+                "linkedin_job_detail_stagehand_failed",
+                {
+                    "external_job_id": listing.external_job_id,
+                    "url": listing.url,
+                    "message": str(exc),
+                },
+            )
+            return detail_payload
+
+        merged_payload = {
+            **detail_payload,
+            **extraction.to_detail_payload(),
+        }
+        append_output_jsonl(
+            "run.log",
+            {
+                "source": "linkedin_search",
+                "kind": "stagehand_job_detail_applied",
+                "external_job_id": listing.external_job_id,
+                "url": listing.url,
+                "title": extraction.title,
+                "company_name": extraction.company_name,
+                "location": extraction.location,
+                "easy_apply_visible": extraction.easy_apply_visible,
+            },
+        )
+        append_timeline_event(
+            "linkedin_job_detail_stagehand_applied",
+            {
+                "external_job_id": listing.external_job_id,
+                "url": listing.url,
+                "title": extraction.title,
+                "company_name": extraction.company_name,
+                "location": extraction.location,
+                "easy_apply_visible": extraction.easy_apply_visible,
+            },
+        )
+        return merged_payload
+
+    def _detail_payload_needs_semantic_repair(
+        self,
+        *,
+        listing: LinkedInCollectedJob,
+        detail_payload: dict[str, object],
+    ) -> bool:
+        merged_preview = merge_job_detail_payload(listing, detail_payload)
+        company_name = _collapse_text(merged_preview.company_name)
+        title = _collapse_text(merged_preview.title)
+        location = _collapse_text(merged_preview.location)
+        description = _collapse_text(merged_preview.description_raw)
+        if _looks_like_placeholder_label(title):
+            return True
+        if not company_name or _looks_like_non_company_line(company_name):
+            return True
+        if not location:
+            return True
+        return len(description) < 80
 
     def _extract_job_id_from_url(self, url: str) -> str | None:
         match = re.search(r"/jobs/view/(\d+)", url)

@@ -30,6 +30,7 @@ def test_runtime_settings_fall_back_to_local_sqlite(tmp_path: Path) -> None:
     assert settings.resolved_browser_agent_single_action_max_attempts == 3
     assert settings.resolved_browser_agent_stall_threshold == 3
     assert settings.resolved_agent_max_selected_jobs_per_run is None
+    assert settings.resolved_stagehand_cache_dir == tmp_path / "runtime" / "stagehand-cache"
 
 
 def test_runtime_settings_test_mode_enables_cheaper_single_job_execution() -> None:
@@ -89,6 +90,7 @@ def test_initialize_runtime_environment_creates_panel_dir_and_sqlite_file(tmp_pa
 
     assert settings.resolved_panel_storage_dir.exists()
     assert settings.output_dir.exists()
+    assert settings.resolved_stagehand_cache_dir.exists()
     sqlite_path = sqlite_path_from_url(settings.resolved_database_url)
     assert sqlite_path is not None
     assert sqlite_path.exists()

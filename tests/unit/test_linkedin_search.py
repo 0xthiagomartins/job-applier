@@ -41,6 +41,10 @@ from job_applier.infrastructure.linkedin.search import (
     infer_workplace_type,
     merge_job_detail_payload,
 )
+from job_applier.infrastructure.linkedin.stagehand import (
+    StagehandJobDetailExtraction,
+    resolve_stagehand_model_name,
+)
 from job_applier.infrastructure.sqlite import (
     SqliteJobPostingRepository,
     create_session_factory,
@@ -123,6 +127,11 @@ def test_search_criteria_carries_debug_target_job_url(tmp_path: Path) -> None:
     criteria = build_search_criteria(build_user_agent_settings(), runtime_settings)
 
     assert criteria.debug_target_job_url == "https://www.linkedin.com/jobs/view/1234567890/"
+
+
+def test_resolve_stagehand_model_name_prefixes_openai_provider() -> None:
+    assert resolve_stagehand_model_name("o3-mini") == "openai/o3-mini"
+    assert resolve_stagehand_model_name("openai/gpt-4.1-mini") == "openai/gpt-4.1-mini"
 
 
 def test_linkedin_job_fetcher_persists_and_deduplicates_by_external_id(tmp_path: Path) -> None:
@@ -567,8 +576,10 @@ def test_fetch_jobs_once_bypasses_search_when_debug_target_job_url_is_set(tmp_pa
         async def fake_load_job_details(
             context: object,
             listing: LinkedInCollectedJob,
+            *,
+            prefer_stagehand: bool = False,
         ) -> LinkedInCollectedJob:
-            del context
+            del context, prefer_stagehand
             return LinkedInCollectedJob(
                 external_job_id=listing.external_job_id,
                 url=listing.url,
@@ -731,8 +742,10 @@ def test_load_job_details_with_resilience_falls_back_to_listing_after_retries(
         async def failing_loader(
             context: BrowserContext,
             current_listing: LinkedInCollectedJob,
+            *,
+            prefer_stagehand: bool = False,
         ) -> LinkedInCollectedJob:
-            del context, current_listing
+            del context, current_listing, prefer_stagehand
             attempts["count"] += 1
             raise PlaywrightTimeoutError("timed out")
 
@@ -747,6 +760,130 @@ def test_load_job_details_with_resilience_falls_back_to_listing_after_retries(
         assert recovered == listing
 
     asyncio.run(scenario())
+
+
+def test_stagehand_enrichment_repairs_debug_target_company_name(tmp_path: Path) -> None:
+    runtime_settings = RuntimeSettings(data_dir=tmp_path, stagehand_enabled=True)
+
+    class FakeStagehandExtractor:
+        async def extract_job_detail(
+            self,
+            *,
+            url: str,
+            storage_state_path: Path,
+            chrome_path: str | None = None,
+        ) -> StagehandJobDetailExtraction:
+            del storage_state_path, chrome_path
+            assert url == "https://www.linkedin.com/jobs/view/1234567890/"
+            return StagehandJobDetailExtraction(
+                title="Senior Python Engineer",
+                company_name="Example Corp",
+                location="Sao Paulo, SP, Brazil",
+                description_raw="Lead the Python platform roadmap.",
+                easy_apply_visible=True,
+                page_summary="Primary LinkedIn job detail surface",
+                observed_apply_actions=(),
+            )
+
+    client = PlaywrightLinkedInJobsClient(
+        runtime_settings,
+        stagehand_job_detail_extractor=FakeStagehandExtractor(),  # type: ignore[arg-type]
+    )
+    listing = LinkedInCollectedJob(
+        external_job_id="1234567890",
+        url="https://www.linkedin.com/jobs/view/1234567890/",
+        title="LinkedIn debug target",
+        company_name="LinkedIn debug target",
+        location=None,
+        description_raw="",
+        easy_apply=True,
+    )
+
+    repaired = asyncio.run(
+        client._maybe_enrich_detail_payload_with_stagehand(
+            listing=listing,
+            detail_payload={
+                "title": "LinkedIn debug target",
+                "company_name": "Save",
+                "location": "",
+                "description_raw": "",
+                "metadata_text": "Save | Apply | Premium",
+                "easy_apply": True,
+            },
+            prefer_stagehand=True,
+        )
+    )
+    merged = merge_job_detail_payload(listing, repaired)
+
+    assert merged.title == "Senior Python Engineer"
+    assert merged.company_name == "Example Corp"
+    assert merged.location == "Sao Paulo, SP, Brazil"
+
+
+def test_stagehand_enrichment_is_skipped_for_clean_payloads(tmp_path: Path) -> None:
+    runtime_settings = RuntimeSettings(data_dir=tmp_path, stagehand_enabled=True)
+    called = {"value": False}
+
+    class FakeStagehandExtractor:
+        async def extract_job_detail(
+            self,
+            *,
+            url: str,
+            storage_state_path: Path,
+            chrome_path: str | None = None,
+        ) -> StagehandJobDetailExtraction:
+            del url, storage_state_path, chrome_path
+            called["value"] = True
+            return StagehandJobDetailExtraction(
+                title="Should not run",
+                company_name="Should not run",
+                location=None,
+                description_raw=None,
+                easy_apply_visible=None,
+                page_summary=None,
+                observed_apply_actions=(),
+            )
+
+    client = PlaywrightLinkedInJobsClient(
+        runtime_settings,
+        stagehand_job_detail_extractor=FakeStagehandExtractor(),  # type: ignore[arg-type]
+    )
+    listing = LinkedInCollectedJob(
+        external_job_id="1234567890",
+        url="https://www.linkedin.com/jobs/view/1234567890/",
+        title="Senior Python Engineer",
+        company_name="Example Corp",
+        location="Sao Paulo, SP, Brazil",
+        description_raw=(
+            "Lead the Python platform roadmap, partner with product and design, "
+            "mentor backend engineers, and keep the distributed platform healthy."
+        ),
+        easy_apply=True,
+    )
+
+    payload = asyncio.run(
+        client._maybe_enrich_detail_payload_with_stagehand(
+            listing=listing,
+            detail_payload={
+                "title": "Senior Python Engineer",
+                "company_name": "Example Corp",
+                "location": "Sao Paulo, SP, Brazil",
+                "description_raw": (
+                    "Lead the Python platform roadmap, partner with product and design, "
+                    "mentor backend engineers, and keep the distributed platform healthy."
+                ),
+                "metadata_text": (
+                    "Senior Python Engineer | Example Corp | Sao Paulo, SP, Brazil | "
+                    "Distributed systems | Backend platform"
+                ),
+                "easy_apply": True,
+            },
+            prefer_stagehand=False,
+        )
+    )
+
+    assert called["value"] is False
+    assert payload["company_name"] == "Example Corp"
 
 
 async def _collect_posting_and_stop(posting: JobPosting, forwarded_titles: list[str]) -> bool:

@@ -36,6 +36,9 @@ class RuntimeSettings(BaseSettings):
     playwright_headless: bool = False
     playwright_trace_enabled: bool = True
     playwright_display: str | None = Field(default=None, alias="DISPLAY")
+    stagehand_enabled: bool = False
+    stagehand_cache_dir: Path | None = None
+    stagehand_local_chrome_path: Path | None = None
     linkedin_email: str | None = None
     linkedin_password: SecretStr | None = None
     linkedin_storage_state_path: Path | None = None
@@ -181,6 +184,12 @@ class RuntimeSettings(BaseSettings):
         return self.linkedin_storage_state_path or self.data_dir / "linkedin" / "storage-state.json"
 
     @property
+    def resolved_stagehand_cache_dir(self) -> Path:
+        """Return the cache directory used by the local Stagehand binary."""
+
+        return self.stagehand_cache_dir or self.data_dir / "stagehand-cache"
+
+    @property
     def resolved_linkedin_artifacts_dir(self) -> Path:
         """Return the directory used to store LinkedIn search screenshots."""
 
@@ -210,6 +219,7 @@ def initialize_runtime_environment(settings: RuntimeSettings) -> None:
     settings.resolved_panel_storage_dir.mkdir(parents=True, exist_ok=True)
     settings.resolved_linkedin_storage_state_path.parent.mkdir(parents=True, exist_ok=True)
     settings.resolved_linkedin_artifacts_dir.mkdir(parents=True, exist_ok=True)
+    settings.resolved_stagehand_cache_dir.mkdir(parents=True, exist_ok=True)
 
     sqlite_path = sqlite_path_from_url(settings.resolved_database_url)
     if sqlite_path is None:
