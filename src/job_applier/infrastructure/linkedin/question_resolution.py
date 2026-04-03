@@ -1026,22 +1026,6 @@ class LinkedInAnswerResolver:
         adapted_field = self._adapt_field_for_validation_feedback(field, normalized_validation)
         candidates: list[ResolvedFieldValue] = []
 
-        city_profile_value = settings.profile.city if _looks_like_city_field(field) else None
-        city_lookup_query = _derive_city_lookup_query(
-            previous_answer or current_value or city_profile_value or ""
-        )
-        if city_lookup_query is not None and _looks_like_city_field(field):
-            candidates.append(
-                ResolvedFieldValue(
-                    value=city_lookup_query,
-                    answer_source=AnswerSource.PROFILE_SNAPSHOT,
-                    fill_strategy=FillStrategy.DETERMINISTIC,
-                    ambiguity_flag=True,
-                    confidence=0.82,
-                    reasoning="city_lookup_query",
-                )
-            )
-
         if adapted_field != field:
             adapted_resolution = await self.resolve(adapted_field, settings, posting=posting)
             if adapted_resolution is not None:
@@ -1734,24 +1718,6 @@ def _looks_like_language_proficiency_question(field: EasyApplyField) -> bool:
             "comfort",
         )
     )
-
-
-def _looks_like_city_field(field: EasyApplyField) -> bool:
-    if field.question_type is QuestionType.CITY:
-        return True
-    return normalize_key(field.normalized_key) in {"city", "current_city", "location_city"}
-
-
-def _derive_city_lookup_query(value: str) -> str | None:
-    stripped_value = value.strip()
-    if not stripped_value:
-        return None
-    city_candidate = re.split(r"\s[-,/]\s|,|/|-", stripped_value, maxsplit=1)[0].strip()
-    if not city_candidate:
-        return None
-    if city_candidate.isupper():
-        return city_candidate.title()
-    return city_candidate
 
 
 def _pick_conservative_language_proficiency_option(options: tuple[str, ...]) -> str | None:

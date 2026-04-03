@@ -1259,12 +1259,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "regional formats can still represent the intended location."
                     ),
                     (
-                        "If this field is asking for city or location and the full regional "
-                        "string is rejected, prefer a shorter city-centered query first, then "
-                        "choose the closest visible suggestion."
-                        if field.question_type is QuestionType.CITY
-                        else "Only shorten or reformulate the query when that helps surface a "
-                        "valid chooser option for the same intended value."
+                        "The intended value may contain richer profile context or formatting "
+                        "than the UI chooser expects. If the current text is rejected, you may "
+                        "reformulate it into a shorter UI-friendly query only when it still "
+                        "points to the same underlying answer."
                     ),
                     (
                         "Use ArrowDown or ArrowUp only when they help reveal or highlight a "

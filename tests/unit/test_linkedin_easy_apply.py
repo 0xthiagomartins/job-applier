@@ -701,7 +701,7 @@ def test_answer_resolver_reinterprets_invalid_numeric_feedback_for_ambiguous_exp
     assert answer.reasoning == "plausible_profile_inference"
 
 
-def test_answer_resolver_uses_city_lookup_query_for_invalid_location_combobox() -> None:
+def test_answer_resolver_keeps_profile_value_for_invalid_location_combobox() -> None:
     settings = build_user_agent_settings().model_copy(
         update={
             "profile": build_user_agent_settings().profile.model_copy(
@@ -733,8 +733,9 @@ def test_answer_resolver_uses_city_lookup_query_for_invalid_location_combobox() 
     )
 
     assert answer is not None
-    assert answer.value == "Sao Paulo"
-    assert answer.reasoning == "city_lookup_query"
+    assert answer.value == "SAO PAULO - SP BRASIL"
+    assert answer.answer_source is AnswerSource.PROFILE_SNAPSHOT
+    assert answer.fill_strategy is FillStrategy.DETERMINISTIC
 
 
 def test_answer_resolver_maps_inferred_years_to_numeric_option() -> None:
