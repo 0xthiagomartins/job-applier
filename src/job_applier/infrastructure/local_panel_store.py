@@ -173,6 +173,8 @@ class LocalPanelSettingsStore:
                 default_responses={
                     "work_authorization": "Yes",
                     "visa_sponsorship": "No",
+                    "are_you_willing_to_relocate": "Yes",
+                    "willing_to_relocate": "Yes",
                 },
                 cv_path=str(copied_cv_path) if copied_cv_path else None,
                 cv_filename=cv_path.name if cv_path else None,

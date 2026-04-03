@@ -12,6 +12,7 @@ from typing import Protocol
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from playwright.async_api import BrowserContext, Page, async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import SecretStr
 
 from job_applier.application.agent_execution import JobFetcher
@@ -34,6 +35,7 @@ from job_applier.observability import (
     append_output_jsonl,
     append_timeline_event,
     update_progress_snapshot,
+    update_summary_snapshot,
 )
 from job_applier.settings import RuntimeSettings
 
@@ -62,6 +64,7 @@ class LinkedInSearchCriteria:
     seniority: tuple[SeniorityLevel, ...]
     easy_apply_only: bool
     max_pages: int
+    debug_target_job_url: str | None = None
     ai_api_key: SecretStr | None = None
     ai_model: str = "o3-mini"
 
@@ -76,6 +79,7 @@ class LinkedInSearchCriteria:
             "seniority": [item.value for item in self.seniority],
             "easy_apply_only": self.easy_apply_only,
             "max_pages": self.max_pages,
+            "debug_target_job_url": self.debug_target_job_url,
         }
 
 
@@ -126,7 +130,8 @@ def build_search_criteria(
         workplace_types=settings.search.workplace_types,
         seniority=settings.search.seniority,
         easy_apply_only=settings.search.easy_apply_only,
-        max_pages=max(1, runtime_settings.linkedin_max_search_pages),
+        max_pages=runtime_settings.resolved_linkedin_max_search_pages,
+        debug_target_job_url=runtime_settings.resolved_linkedin_debug_target_job_url,
         ai_api_key=settings.ai.api_key,
         ai_model=settings.ai.model,
     )
@@ -378,9 +383,12 @@ class PlaywrightLinkedInJobsClient:
         context: BrowserContext,
         criteria: LinkedInSearchCriteria,
     ) -> list[LinkedInCollectedJob]:
+        run_dir = self._build_run_dir()
+        if criteria.debug_target_job_url:
+            return [await self._fetch_debug_target_job(context, criteria, run_dir=run_dir)]
+
         page = await context.new_page()
         page.set_default_timeout(self._runtime_settings.linkedin_default_timeout_ms)
-        run_dir = self._build_run_dir()
 
         try:
             await self._open_search(page, criteria, run_dir=run_dir)
@@ -394,13 +402,21 @@ class PlaywrightLinkedInJobsClient:
                         page,
                         reason="search_results_pagination",
                     )
-                    await page.goto(
-                        build_paginated_search_url(search_url, page_index=page_index),
-                        wait_until="domcontentloaded",
+                    target_page_url = build_paginated_search_url(
+                        search_url,
+                        page_index=page_index,
+                    )
+                    await self._goto_paginated_results_page(
+                        page,
+                        target_page_url=target_page_url,
+                        page_index=page_index + 1,
                     )
                 await self._ensure_authenticated_page(page)
                 await self._capture_screenshot(page, run_dir / f"results-page-{page_index + 1}.png")
-                page_collection = await self._collect_listing_cards_from_results_page(page)
+                page_collection = await self._collect_listing_cards_from_results_page(
+                    page,
+                    page_index=page_index + 1,
+                )
                 listings = list(page_collection.listings)
                 duplicate_listing_count = sum(
                     1 for listing in listings if listing.url in seen_job_urls
@@ -455,7 +471,21 @@ class PlaywrightLinkedInJobsClient:
                             "url": listing.url,
                         },
                     )
-                    jobs.append(await self._load_job_details(context, listing))
+                    detailed_listing = await self._load_job_details(context, listing)
+                    jobs.append(detailed_listing)
+                    update_progress_snapshot(
+                        {
+                            "current_stage": "job_detail_loaded",
+                            "current_job": {
+                                "external_job_id": detailed_listing.external_job_id,
+                                "title": detailed_listing.title,
+                                "company_name": detailed_listing.company_name,
+                                "url": detailed_listing.url,
+                            },
+                            "jobs_seen": len(jobs),
+                        },
+                    )
+                    update_summary_snapshot({"jobs_seen": len(jobs)})
             else:
                 append_output_jsonl(
                     "run.log",
@@ -479,6 +509,83 @@ class PlaywrightLinkedInJobsClient:
             return jobs
         finally:
             await page.close()
+
+    async def _fetch_debug_target_job(
+        self,
+        context: BrowserContext,
+        criteria: LinkedInSearchCriteria,
+        *,
+        run_dir: Path,
+    ) -> LinkedInCollectedJob:
+        target_url = criteria.debug_target_job_url
+        if target_url is None:
+            msg = "LinkedIn debug target job URL is required for direct job debugging."
+            raise LinkedInSearchError(msg)
+
+        append_output_jsonl(
+            "run.log",
+            {
+                "source": "linkedin_search",
+                "kind": "debug_target_job_started",
+                "target_job_url": target_url,
+            },
+        )
+        append_timeline_event(
+            "linkedin_debug_target_job_started",
+            {
+                "target_job_url": target_url,
+            },
+        )
+        update_progress_snapshot(
+            {
+                "current_stage": "job_detail_loading",
+                "current_job": {
+                    "external_job_id": self._extract_job_id_from_url(target_url),
+                    "title": "LinkedIn debug target",
+                    "company_name": "LinkedIn debug target",
+                    "url": target_url,
+                },
+                "search_target_url": target_url,
+                "search_page_index": 1,
+            },
+        )
+        detailed_listing = await self._load_job_details(
+            context,
+            LinkedInCollectedJob(
+                external_job_id=self._extract_job_id_from_url(target_url),
+                url=target_url,
+                title="LinkedIn debug target",
+                company_name="LinkedIn debug target",
+                location=None,
+                description_raw="",
+                easy_apply=True,
+            ),
+        )
+        update_progress_snapshot(
+            {
+                "current_stage": "job_detail_loaded",
+                "current_job": {
+                    "external_job_id": detailed_listing.external_job_id,
+                    "title": detailed_listing.title,
+                    "company_name": detailed_listing.company_name,
+                    "url": detailed_listing.url,
+                },
+                "jobs_seen": 1,
+            },
+        )
+        update_summary_snapshot({"jobs_seen": 1})
+        await self._capture_debug_target_artifact(context, target_url=target_url, run_dir=run_dir)
+        append_timeline_event(
+            "linkedin_debug_target_job_loaded",
+            {
+                "external_job_id": detailed_listing.external_job_id,
+                "title": detailed_listing.title,
+                "company_name": detailed_listing.company_name,
+                "url": detailed_listing.url,
+                "easy_apply": detailed_listing.easy_apply,
+            },
+        )
+        return detailed_listing
 
     async def _open_search(
         self,
@@ -553,6 +660,57 @@ class PlaywrightLinkedInJobsClient:
         )
         await self._capture_screenshot(page, run_dir / "search-results-ready.png")
         return
+
+    async def _goto_paginated_results_page(
+        self,
+        page: Page,
+        *,
+        target_page_url: str,
+        page_index: int,
+    ) -> None:
+        timeout_ms = max(self._runtime_settings.linkedin_default_timeout_ms, 30_000)
+
+        for attempt_index in range(2):
+            try:
+                await page.goto(
+                    target_page_url,
+                    wait_until="domcontentloaded",
+                    timeout=timeout_ms,
+                )
+                return
+            except PlaywrightTimeoutError:
+                append_output_jsonl(
+                    "run.log",
+                    {
+                        "source": "linkedin_search",
+                        "kind": "search_pagination_navigation_timeout",
+                        "page_index": page_index,
+                        "attempt_index": attempt_index,
+                        "target_page_url": target_page_url,
+                        "current_url": page.url,
+                        "timeout_ms": timeout_ms,
+                    },
+                )
+                if await self._results_page_navigation_succeeded(
+                    page,
+                    target_page_url=target_page_url,
+                ):
+                    return
+                if attempt_index >= 1:
+                    raise
+                await page.wait_for_timeout(1_250)
+
+    async def _results_page_navigation_succeeded(
+        self,
+        page: Page,
+        *,
+        target_page_url: str,
+    ) -> bool:
+        current_params = dict(parse_qsl(urlparse(page.url).query, keep_blank_values=True))
+        target_params = dict(parse_qsl(urlparse(target_page_url).query, keep_blank_values=True))
+        if current_params.get("start", "0") != target_params.get("start", "0"):
+            return False
+        return await self._wait_for_extractable_search_cards(page, attempts=2)
 
     async def _complete_search_with_browser_agent(
         self,
@@ -894,6 +1052,8 @@ class PlaywrightLinkedInJobsClient:
     async def _collect_listing_cards_from_results_page(
         self,
         page: Page,
+        *,
+        page_index: int,
     ) -> LinkedInResultsPageCollection:
         collected_by_url: dict[str, LinkedInCollectedJob] = {}
         stale_rounds = 0
@@ -920,7 +1080,9 @@ class PlaywrightLinkedInJobsClient:
                 {
                     "source": "linkedin_search",
                     "kind": "results_page_collection_round",
+                    "page_index": page_index,
                     "round_index": completed_rounds,
+                    "url": page.url,
                     "visible_listing_count": last_visible_listing_count,
                     "unique_listing_count": len(collected_by_url),
                     "new_listing_count": new_listing_count,
@@ -1062,9 +1224,31 @@ class PlaywrightLinkedInJobsClient:
                     "[data-job-detail-container] .jobs-box__html-content",
                     "main",
                   ]);
+                  const title = firstText([
+                    ".job-details-jobs-unified-top-card__job-title",
+                    ".jobs-unified-top-card h1",
+                    ".jobs-unified-top-card__job-title",
+                    "h1",
+                  ]);
+                  const companyName = firstText([
+                    ".job-details-jobs-unified-top-card__company-name a",
+                    ".job-details-jobs-unified-top-card__company-name",
+                    ".jobs-unified-top-card__company-name a",
+                    ".jobs-unified-top-card__company-name",
+                  ]);
+                  const location = firstText([
+                    ".job-details-jobs-unified-top-card__primary-description-container",
+                    ".jobs-unified-top-card__primary-description",
+                    ".jobs-unified-top-card__bullet",
+                  ]);
                   const bodyText = document.body ? document.body.innerText : "";
 
+                  const documentTitle = (document.title || "").split("|")[0].trim();
+
                   return {
+                    title: title || documentTitle,
+                    company_name: companyName,
+                    location,
                     description_raw: description,
                     metadata_text: bodyText,
                     easy_apply: /easy apply/i.test(bodyText),
@@ -1090,15 +1274,36 @@ class PlaywrightLinkedInJobsClient:
         return LinkedInCollectedJob(
             external_job_id=listing.external_job_id,
             url=listing.url,
-            title=listing.title,
-            company_name=listing.company_name,
-            location=listing.location,
+            title=str(detail_payload.get("title") or "").strip() or listing.title,
+            company_name=str(detail_payload.get("company_name") or "").strip()
+            or listing.company_name,
+            location=str(detail_payload.get("location") or "").strip() or listing.location,
             description_raw=description_raw or listing.description_raw,
             easy_apply=listing.easy_apply or bool(detail_payload["easy_apply"]),
             metadata_text=f"{listing.metadata_text} {detail_text}".strip(),
             workplace_type=infer_workplace_type(detail_text) or listing.workplace_type,
             seniority=infer_seniority(detail_text) or listing.seniority,
         )
+
+    async def _capture_debug_target_artifact(
+        self,
+        context: BrowserContext,
+        *,
+        target_url: str,
+        run_dir: Path,
+    ) -> None:
+        detail_page = await context.new_page()
+        try:
+            await self._pause_before_navigation(detail_page, reason="debug_target_job_artifact")
+            await detail_page.goto(target_url, wait_until="domcontentloaded")
+            await self._ensure_authenticated_page(detail_page)
+            await self._capture_screenshot(detail_page, run_dir / "debug-target-job.png")
+        finally:
+            await detail_page.close()
+
+    def _extract_job_id_from_url(self, url: str) -> str | None:
+        match = re.search(r"/jobs/view/(\d+)", url)
+        return match.group(1) if match else None
 
     async def _ensure_authenticated_page(self, page: Page) -> None:
         session_manager = self._get_session_manager()

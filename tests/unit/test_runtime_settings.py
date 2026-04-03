@@ -48,6 +48,18 @@ def test_runtime_settings_test_mode_enables_cheaper_single_job_execution() -> No
     assert settings.resolved_agent_test_minimum_score_threshold == 0.5
 
 
+def test_runtime_settings_debug_target_forces_zero_score_threshold_in_test_mode() -> None:
+    settings = RuntimeSettings(
+        agent_test_mode=True,
+        linkedin_debug_target_job_url=TypeAdapter(AnyUrl).validate_python(
+            "https://www.linkedin.com/jobs/view/1234567890/"
+        ),
+        agent_test_minimum_score_threshold=0.5,
+    )
+
+    assert settings.resolved_agent_test_minimum_score_threshold == 0.0
+
+
 def test_runtime_settings_normalize_playwright_mcp_root_url() -> None:
     url_adapter = TypeAdapter(AnyUrl)
     settings = RuntimeSettings(

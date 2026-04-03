@@ -40,6 +40,7 @@ class RuntimeSettings(BaseSettings):
     linkedin_password: SecretStr | None = None
     linkedin_storage_state_path: Path | None = None
     linkedin_artifacts_dir: Path | None = None
+    linkedin_debug_target_job_url: AnyUrl | None = None
     linkedin_max_search_pages: int = 4
     linkedin_default_timeout_ms: int = 15_000
     linkedin_login_timeout_seconds: int = 120
@@ -57,7 +58,7 @@ class RuntimeSettings(BaseSettings):
     bootstrap_profile_name: str | None = None
     bootstrap_profile_email: str | None = None
     bootstrap_profile_phone: str | None = None
-    bootstrap_profile_city: str = "Sao Paulo"
+    bootstrap_profile_city: str = "SAO PAULO - SP BRASIL"
     bootstrap_profile_linkedin_url: AnyUrl | None = None
     bootstrap_profile_github_url: AnyUrl | None = None
     bootstrap_profile_portfolio_url: AnyUrl | None = None
@@ -138,6 +139,8 @@ class RuntimeSettings(BaseSettings):
 
         if not self.agent_test_mode:
             return None
+        if self.resolved_linkedin_debug_target_job_url is not None:
+            return 0.0
         if self.agent_test_minimum_score_threshold is None:
             return None
         return min(1.0, max(0.0, self.agent_test_minimum_score_threshold))
@@ -163,6 +166,15 @@ class RuntimeSettings(BaseSettings):
         return max(2, self.browser_agent_stall_threshold)
 
     @property
+    def resolved_linkedin_max_search_pages(self) -> int:
+        """Return the effective LinkedIn pagination depth for the current runtime mode."""
+
+        max_pages = max(1, self.linkedin_max_search_pages)
+        if self.agent_test_mode:
+            return min(max_pages, 2)
+        return max_pages
+
+    @property
     def resolved_linkedin_storage_state_path(self) -> Path:
         """Return the storage-state path used to reuse LinkedIn sessions."""
 
@@ -173,6 +185,14 @@ class RuntimeSettings(BaseSettings):
         """Return the directory used to store LinkedIn search screenshots."""
 
         return self.linkedin_artifacts_dir or self.data_dir / "artifacts" / "linkedin"
+
+    @property
+    def resolved_linkedin_debug_target_job_url(self) -> str | None:
+        """Return an optional LinkedIn job URL used to bypass search during fast debugging."""
+
+        if self.linkedin_debug_target_job_url is None:
+            return None
+        return str(self.linkedin_debug_target_job_url)
 
 
 @lru_cache(maxsize=1)

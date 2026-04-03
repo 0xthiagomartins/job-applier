@@ -116,7 +116,9 @@ For deeper agent debugging, the last-run bundle now also keeps machine-oriented 
 - `browser-agent/task-trace.jsonl`: snapshot -> action -> result trace for multi-step browser tasks
 - `browser-agent/single-action-trace.jsonl`: focused micro-action traces used inside Easy Apply
 
-For low-cost manual debugging, you can enable `JOB_APPLIER_AGENT_TEST_MODE=true`. In this mode the app processes only 1 selected job per run, disables OpenAI HTTP retries, and keeps the richer browser-agent traces so we can refine prompts without falling back to brittle heuristics.
+For low-cost manual debugging, you can enable `JOB_APPLIER_AGENT_TEST_MODE=true`. In this mode the app processes only 1 selected job per run, disables OpenAI HTTP retries, and keeps the richer browser-agent traces so we can refine prompts without falling back to brittle heuristics. If you need to force one near-match through the pipeline while debugging the apply flow, set `JOB_APPLIER_AGENT_TEST_MINIMUM_SCORE_THRESHOLD` too.
+
+For immediate iteration on a single problematic job, set `JOB_APPLIER_LINKEDIN_DEBUG_TARGET_JOB_URL=https://www.linkedin.com/jobs/view/...`. In that mode the agent bypasses the search pages and opens the target job directly, which is much faster when we are polishing the Easy Apply agent. When `JOB_APPLIER_AGENT_TEST_MODE=true`, this direct-target mode also relaxes the score threshold to `0.0` automatically so the debug run reaches `Easy Apply` instead of being blocked by ranking.
 
 ## Quality commands
 

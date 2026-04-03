@@ -280,6 +280,34 @@ def update_progress_snapshot(
     )
 
 
+def update_summary_snapshot(
+    payload: Mapping[str, object],
+    *,
+    output_dir: Path | None = None,
+) -> None:
+    """Merge live execution counters into `summary.json` while a run is still active."""
+
+    target = _resolve_output_path("summary.json", output_dir=output_dir)
+    if target is None:
+        return
+    existing: dict[str, Any] = {}
+    if target.exists():
+        try:
+            existing_payload = json.loads(target.read_text(encoding="utf-8"))
+            if isinstance(existing_payload, dict):
+                existing = existing_payload
+        except json.JSONDecodeError:
+            existing = {}
+    merged = {
+        **existing,
+        **_sanitize_for_logs(dict(payload)),
+    }
+    target.write_text(
+        json.dumps(merged, indent=2, ensure_ascii=True, default=_json_default),
+        encoding="utf-8",
+    )
+
+
 def append_timeline_event(
     event_type: str,
     payload: Mapping[str, object] | None = None,

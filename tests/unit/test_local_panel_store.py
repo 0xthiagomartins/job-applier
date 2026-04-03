@@ -29,12 +29,13 @@ def test_local_panel_store_bootstraps_profile_and_copies_cv(tmp_path: Path) -> N
 
     assert document.profile.name == "Thiago Martins"
     assert document.profile.email == "thiago@example.com"
-    assert document.profile.city == "Sao Paulo"
+    assert document.profile.city == "SAO PAULO - SP BRASIL"
     assert document.profile.cv_filename == "Thiago Martins - CV 2026.pdf"
     assert copied_cv_path.exists()
     assert copied_cv_path.read_bytes() == b"fake-cv-content"
     assert copied_cv_path.parent == tmp_path / "panel" / "cv"
     assert document.preferences.keywords == ("python", "automation")
+    assert document.profile.default_responses["are_you_willing_to_relocate"] == "Yes"
     assert document.ai.api_key is not None
     assert document.ai.api_key.get_secret_value() == "sk-test-12345"
 

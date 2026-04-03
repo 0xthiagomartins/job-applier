@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import SecretStr
@@ -17,7 +18,11 @@ from job_applier.infrastructure import (
     LocalExecutionStore,
     LocalPanelSettingsStore,
 )
-from job_applier.observability import configure_logging
+from job_applier.observability import (
+    configure_logging,
+    reset_run_output,
+    update_summary_snapshot,
+)
 from job_applier.settings import RuntimeSettings
 
 
@@ -60,6 +65,38 @@ def test_run_output_keeps_only_the_latest_execution_bundle(tmp_path: Path) -> No
     timeline = (output_dir / "timeline.jsonl").read_text(encoding="utf-8")
     assert '"event_type": "execution_bundle_reset"' in timeline
     assert '"event_type": "config_loaded"' in timeline
+
+
+def test_update_summary_snapshot_merges_live_counters(tmp_path: Path) -> None:
+    output_dir = tmp_path / "artifacts" / "last-run"
+    started_at = datetime.now(UTC)
+    reset_run_output(
+        output_dir,
+        execution_id="exec-1",
+        origin="manual",
+        started_at=started_at,
+    )
+
+    update_summary_snapshot(
+        {
+            "jobs_seen": 17,
+            "jobs_selected": 2,
+            "successful_submissions": 1,
+            "error_count": 1,
+            "last_error": "temporary failure",
+        },
+        output_dir=output_dir,
+    )
+
+    payload = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert payload["execution_id"] == "exec-1"
+    assert payload["origin"] == "manual"
+    assert payload["status"] == "running"
+    assert payload["jobs_seen"] == 17
+    assert payload["jobs_selected"] == 2
+    assert payload["successful_submissions"] == 1
+    assert payload["error_count"] == 1
+    assert payload["last_error"] == "temporary failure"
 
 
 def build_ready_panel_store(root_dir: Path) -> LocalPanelSettingsStore:
