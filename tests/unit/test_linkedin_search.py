@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import cast
 
@@ -17,7 +18,13 @@ from job_applier.application.config import (
     UserAgentSettings,
     UserProfileConfig,
 )
-from job_applier.domain import Platform, ScheduleFrequency, SeniorityLevel, WorkplaceType
+from job_applier.domain import (
+    JobPosting,
+    Platform,
+    ScheduleFrequency,
+    SeniorityLevel,
+    WorkplaceType,
+)
 from job_applier.infrastructure.linkedin.browser_agent import BrowserTaskAssessment
 from job_applier.infrastructure.linkedin.search import (
     LinkedInCollectedJob,
@@ -184,6 +191,61 @@ def test_linkedin_job_fetcher_persists_and_deduplicates_by_external_id(tmp_path:
     assert len(stored) == 1
     assert stored[0].external_job_id == "job-001"
     assert stored[0].title == "Automation Engineer Updated"
+
+
+def test_linkedin_job_fetcher_streams_incrementally_and_can_stop_early(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'linkedin-search-incremental.db').resolve()}"
+    upgrade_to_head(database_url)
+
+    runtime_settings = RuntimeSettings(data_dir=tmp_path)
+    repository = SqliteJobPostingRepository(create_session_factory(database_url))
+    settings = build_user_agent_settings()
+
+    class FakeIncrementalLinkedInJobsClient:
+        async def fetch_jobs(self, criteria: LinkedInSearchCriteria) -> list[LinkedInCollectedJob]:
+            del criteria
+            raise AssertionError("batch fetch should not run when incremental streaming exists")
+
+        async def stream_jobs(
+            self,
+            criteria: LinkedInSearchCriteria,
+            on_job: Callable[[LinkedInCollectedJob], Awaitable[bool]],
+        ) -> None:
+            assert criteria.location == "Remote"
+            should_continue = await on_job(
+                LinkedInCollectedJob(
+                    external_job_id="job-001",
+                    url="https://www.linkedin.com/jobs/view/job-001",
+                    title="Automation Engineer",
+                    company_name="Acme",
+                    location="Remote",
+                    description_raw="Build browser automation.",
+                    easy_apply=True,
+                    metadata_text="Remote | Mid-Senior level | Easy Apply",
+                )
+            )
+            assert should_continue is False
+
+    fetcher = LinkedInJobFetcher(
+        client=FakeIncrementalLinkedInJobsClient(),
+        runtime_settings=runtime_settings,
+        job_repository=repository,
+    )
+    forwarded_titles: list[str] = []
+
+    async def scenario() -> int:
+        return await fetcher.fetch_incremental(
+            settings,
+            lambda posting: _collect_posting_and_stop(posting, forwarded_titles),
+        )
+
+    jobs_seen = asyncio.run(scenario())
+    stored = repository.list()
+
+    assert jobs_seen == 1
+    assert forwarded_titles == ["Automation Engineer"]
+    assert len(stored) == 1
+    assert stored[0].external_job_id == "job-001"
 
 
 def test_wait_for_search_surface_returns_after_first_complete_assessment(tmp_path: Path) -> None:
@@ -685,6 +747,11 @@ def test_load_job_details_with_resilience_falls_back_to_listing_after_retries(
         assert recovered == listing
 
     asyncio.run(scenario())
+
+
+async def _collect_posting_and_stop(posting: JobPosting, forwarded_titles: list[str]) -> bool:
+    forwarded_titles.append(posting.title)
+    return False
 
 
 def build_user_agent_settings() -> UserAgentSettings:

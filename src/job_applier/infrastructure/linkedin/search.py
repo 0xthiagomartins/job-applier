@@ -5,10 +5,11 @@ from __future__ import annotations
 import logging
 import random
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from playwright.async_api import BrowserContext, Page, async_playwright
@@ -115,6 +116,18 @@ class LinkedInJobsClient(Protocol):
 
     async def fetch_jobs(self, criteria: LinkedInSearchCriteria) -> list[LinkedInCollectedJob]:
         """Return structured jobs captured from LinkedIn."""
+
+
+@runtime_checkable
+class IncrementalLinkedInJobsClient(Protocol):
+    """Optional boundary that can emit collected jobs incrementally."""
+
+    async def stream_jobs(
+        self,
+        criteria: LinkedInSearchCriteria,
+        on_job: Callable[[LinkedInCollectedJob], Awaitable[bool]],
+    ) -> None:
+        """Call ``on_job`` for each collected job until exhaustion or stop request."""
 
 
 def build_search_criteria(
@@ -480,6 +493,71 @@ class LinkedInJobFetcher(JobFetcher):
         logger.info("linkedin_search_completed", extra={"jobs_seen": len(persisted_jobs)})
         return persisted_jobs
 
+    async def fetch_incremental(
+        self,
+        settings: UserAgentSettings,
+        on_job: Callable[[JobPosting], Awaitable[bool]],
+    ) -> int:
+        """Persist jobs incrementally and hand them to the orchestrator immediately."""
+
+        criteria = build_search_criteria(settings, self._runtime_settings)
+        logger.info("linkedin_search_started", extra=criteria.to_log_payload())
+
+        seen_keys: set[str] = set()
+        persisted_count = 0
+
+        async def persist_and_forward(collected_job: LinkedInCollectedJob) -> bool:
+            nonlocal persisted_count
+
+            try:
+                posting = self._parser.parse(collected_job)
+            except ValueError:
+                logger.exception(
+                    "linkedin_job_parse_failed",
+                    extra={
+                        "external_job_id": collected_job.external_job_id,
+                        "url": collected_job.url,
+                    },
+                )
+                return True
+
+            dedupe_key = posting.external_job_id or posting.url
+            if dedupe_key in seen_keys:
+                return True
+            seen_keys.add(dedupe_key)
+
+            existing = None
+            if posting.external_job_id:
+                existing = self._job_repository.find_by_external_job_id(
+                    platform=posting.platform.value,
+                    external_job_id=posting.external_job_id,
+                )
+            if existing is not None:
+                posting = replace(posting, id=existing.id)
+
+            saved_posting = self._job_repository.save(posting)
+            persisted_count += 1
+            logger.info(
+                "linkedin_job_captured",
+                extra={
+                    "job_posting_id": str(saved_posting.id),
+                    "external_job_id": saved_posting.external_job_id,
+                    "company_name": saved_posting.company_name,
+                    "title": saved_posting.title,
+                    "easy_apply": saved_posting.easy_apply,
+                    "incremental": True,
+                },
+            )
+            return await on_job(saved_posting)
+
+        if isinstance(self._client, IncrementalLinkedInJobsClient):
+            await self._client.stream_jobs(criteria, persist_and_forward)
+            logger.info("linkedin_search_completed", extra={"jobs_seen": persisted_count})
+            return persisted_count
+
+        persisted_jobs = await self.fetch(settings)
+        return len(persisted_jobs)
+
 
 class PlaywrightLinkedInJobsClient:
     """Use Playwright to search LinkedIn Jobs and capture structured postings."""
@@ -499,6 +577,35 @@ class PlaywrightLinkedInJobsClient:
                     context = await session_manager.create_authenticated_context(browser)
                     try:
                         return await self._fetch_jobs_once(context, criteria)
+                    except LinkedInAuthError:
+                        session_manager.clear_saved_state()
+                        if attempt == 1:
+                            raise
+                    finally:
+                        await context.close()
+            finally:
+                await browser.close()
+        msg = "LinkedIn search exhausted all authentication retries."
+        raise LinkedInSearchError(msg)
+
+    async def stream_jobs(
+        self,
+        criteria: LinkedInSearchCriteria,
+        on_job: Callable[[LinkedInCollectedJob], Awaitable[bool]],
+    ) -> None:
+        """Capture jobs incrementally and forward them as soon as each detail page loads."""
+
+        async with async_playwright() as playwright:
+            session_manager = self._create_session_manager(criteria)
+            browser = await playwright.chromium.launch(
+                headless=self._runtime_settings.playwright_headless,
+            )
+            try:
+                for attempt in range(2):
+                    context = await session_manager.create_authenticated_context(browser)
+                    try:
+                        await self._fetch_jobs_once(context, criteria, on_job=on_job)
+                        return
                     except LinkedInAuthError:
                         session_manager.clear_saved_state()
                         if attempt == 1:
@@ -565,10 +672,15 @@ class PlaywrightLinkedInJobsClient:
         self,
         context: BrowserContext,
         criteria: LinkedInSearchCriteria,
+        *,
+        on_job: Callable[[LinkedInCollectedJob], Awaitable[bool]] | None = None,
     ) -> list[LinkedInCollectedJob]:
         run_dir = self._build_run_dir()
         if criteria.debug_target_job_url:
-            return [await self._fetch_debug_target_job(context, criteria, run_dir=run_dir)]
+            debug_job = await self._fetch_debug_target_job(context, criteria, run_dir=run_dir)
+            if on_job is not None:
+                await on_job(debug_job)
+            return [debug_job]
 
         page = await context.new_page()
         page.set_default_timeout(self._runtime_settings.linkedin_default_timeout_ms)
@@ -672,6 +784,28 @@ class PlaywrightLinkedInJobsClient:
                         },
                     )
                     update_summary_snapshot({"jobs_seen": len(jobs)})
+                    if on_job is not None:
+                        should_continue = await on_job(detailed_listing)
+                        if not should_continue:
+                            append_output_jsonl(
+                                "run.log",
+                                {
+                                    "source": "linkedin_search",
+                                    "kind": "incremental_stop_requested",
+                                    "jobs_collected": len(jobs),
+                                    "page_index": page_index + 1,
+                                    "job_url": detailed_listing.url,
+                                },
+                            )
+                            append_timeline_event(
+                                "linkedin_search_incremental_stop_requested",
+                                {
+                                    "jobs_collected": len(jobs),
+                                    "page_index": page_index + 1,
+                                    "job_url": detailed_listing.url,
+                                },
+                            )
+                            return jobs
             else:
                 append_output_jsonl(
                     "run.log",

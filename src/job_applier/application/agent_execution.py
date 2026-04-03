@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict
@@ -91,6 +92,22 @@ class JobFetcher(Protocol):
 
     async def fetch(self, settings: UserAgentSettings) -> list[JobPosting]:
         """Return recently found jobs according to the user settings."""
+
+
+@runtime_checkable
+class IncrementalJobFetcher(Protocol):
+    """Optional fetcher contract that yields persisted jobs incrementally."""
+
+    async def fetch_incremental(
+        self,
+        settings: UserAgentSettings,
+        on_job: Callable[[JobPosting], Awaitable[bool]],
+    ) -> int:
+        """Persist jobs incrementally and call ``on_job`` for each unique posting.
+
+        Return the total number of unique persisted jobs seen during the run.
+        Returning ``False`` from ``on_job`` asks the fetcher to stop early.
+        """
 
 
 class JobScorer(Protocol):
@@ -448,53 +465,17 @@ class AgentExecutionOrchestrator:
             },
         )
         append_timeline_event("fetch_jobs_started")
-
-        try:
-            jobs = await self._job_fetcher.fetch(settings)
-        except Exception as exc:  # noqa: BLE001
-            return self._finalize_fatal_error(
-                summary=summary,
-                snapshot=snapshot,
-                stage="fetch_jobs",
-                error=exc,
-            )
-
-        summary = summary.model_copy(update={"jobs_seen": len(jobs)})
-        self._execution_store.save_execution(summary)
-        self._persist_run_summary(summary)
-        self._emit_event(
-            execution_id=execution_id,
-            event_type=ExecutionEventType.STEP_REACHED,
-            payload={
-                "stage": "fetch_jobs",
-                "jobs_seen": len(jobs),
-            },
-        )
-        update_progress_snapshot(
-            {
-                "status": "running",
-                "current_stage": "jobs_fetched",
-                "jobs_seen": len(jobs),
-                "jobs_selected": 0,
-                "successful_submissions": 0,
-                "error_count": 0,
-                "current_job": None,
-            },
-        )
-        append_timeline_event(
-            "jobs_fetched",
-            {
-                "execution_id": str(execution_id),
-                "jobs_seen": len(jobs),
-            },
-        )
-
         latest_error: str | None = None
         error_count = 0
+        jobs: list[JobPosting] = []
+        jobs_seen = 0
         jobs_selected = 0
         successful_submissions = 0
+        fetch_stage_emitted = False
 
-        for posting in jobs:
+        async def process_posting(posting: JobPosting) -> bool:
+            nonlocal summary, latest_error, error_count, jobs_selected, successful_submissions
+
             current_job = {
                 "job_posting_id": str(posting.id),
                 "company_name": posting.company_name,
@@ -506,7 +487,7 @@ class AgentExecutionOrchestrator:
                     "status": "running",
                     "current_stage": "score_job",
                     "current_job": current_job,
-                    "jobs_seen": len(jobs),
+                    "jobs_seen": jobs_seen,
                     "jobs_selected": jobs_selected,
                     "successful_submissions": successful_submissions,
                     "error_count": error_count,
@@ -544,13 +525,19 @@ class AgentExecutionOrchestrator:
                         "current_stage": "score_job_failed",
                         "current_job": current_job,
                         "last_error": latest_error,
-                        "jobs_seen": len(jobs),
+                        "jobs_seen": jobs_seen,
                         "jobs_selected": jobs_selected,
                         "successful_submissions": successful_submissions,
                         "error_count": error_count,
                     },
                 )
-                continue
+                return not self._emit_selected_job_limit_if_needed(
+                    execution_id=execution_id,
+                    jobs=jobs_seen,
+                    jobs_selected=jobs_selected,
+                    successful_submissions=successful_submissions,
+                    error_count=error_count,
+                )
 
             if not scored_job.selected:
                 self._emit_event(
@@ -568,13 +555,13 @@ class AgentExecutionOrchestrator:
                         "status": "running",
                         "current_stage": "score_rejected",
                         "current_job": {**current_job, "score": scored_job.score},
-                        "jobs_seen": len(jobs),
+                        "jobs_seen": jobs_seen,
                         "jobs_selected": jobs_selected,
                         "successful_submissions": successful_submissions,
                         "error_count": error_count,
                     },
                 )
-                continue
+                return True
 
             jobs_selected += 1
             summary = self._persist_running_summary(
@@ -589,7 +576,7 @@ class AgentExecutionOrchestrator:
                     "status": "running",
                     "current_stage": "submit_job",
                     "current_job": {**current_job, "score": scored_job.score},
-                    "jobs_seen": len(jobs),
+                    "jobs_seen": jobs_seen,
                     "jobs_selected": jobs_selected,
                     "successful_submissions": successful_submissions,
                     "error_count": error_count,
@@ -635,7 +622,7 @@ class AgentExecutionOrchestrator:
                             "submission_id": str(existing_submission.id),
                             "skip_reason": "already_applied",
                         },
-                        "jobs_seen": len(jobs),
+                        "jobs_seen": jobs_seen,
                         "jobs_selected": jobs_selected,
                         "successful_submissions": successful_submissions,
                         "error_count": error_count,
@@ -649,15 +636,13 @@ class AgentExecutionOrchestrator:
                         "reason": "already_applied",
                     },
                 )
-                if self._emit_selected_job_limit_if_needed(
+                return not self._emit_selected_job_limit_if_needed(
                     execution_id=execution_id,
-                    jobs=len(jobs),
+                    jobs=jobs_seen,
                     jobs_selected=jobs_selected,
                     successful_submissions=successful_submissions,
                     error_count=error_count,
-                ):
-                    break
-                continue
+                )
 
             try:
                 attempt = await self._job_submitter.submit(
@@ -695,21 +680,19 @@ class AgentExecutionOrchestrator:
                         "current_stage": "submit_job_failed",
                         "current_job": current_job,
                         "last_error": latest_error,
-                        "jobs_seen": len(jobs),
+                        "jobs_seen": jobs_seen,
                         "jobs_selected": jobs_selected,
                         "successful_submissions": successful_submissions,
                         "error_count": error_count,
                     },
                 )
-                if self._emit_selected_job_limit_if_needed(
+                return not self._emit_selected_job_limit_if_needed(
                     execution_id=execution_id,
-                    jobs=len(jobs),
+                    jobs=jobs_seen,
                     jobs_selected=jobs_selected,
                     successful_submissions=successful_submissions,
                     error_count=error_count,
-                ):
-                    break
-                continue
+                )
             submission = attempt.submission
 
             if submission.status is SubmissionStatus.SKIPPED:
@@ -737,21 +720,19 @@ class AgentExecutionOrchestrator:
                         "status": "running",
                         "current_stage": "submit_skipped",
                         "current_job": {**current_job, "submission_id": str(submission.id)},
-                        "jobs_seen": len(jobs),
+                        "jobs_seen": jobs_seen,
                         "jobs_selected": jobs_selected,
                         "successful_submissions": successful_submissions,
                         "error_count": error_count,
                     },
                 )
-                if self._emit_selected_job_limit_if_needed(
+                return not self._emit_selected_job_limit_if_needed(
                     execution_id=execution_id,
-                    jobs=len(jobs),
+                    jobs=jobs_seen,
                     jobs_selected=jobs_selected,
                     successful_submissions=successful_submissions,
                     error_count=error_count,
-                ):
-                    break
-                continue
+                )
 
             if submission.status is SubmissionStatus.FAILED:
                 latest_error = submission.notes or "Submission failed."
@@ -788,21 +769,19 @@ class AgentExecutionOrchestrator:
                         "current_stage": "submit_failed",
                         "current_job": {**current_job, "submission_id": str(submission.id)},
                         "last_error": latest_error,
-                        "jobs_seen": len(jobs),
+                        "jobs_seen": jobs_seen,
                         "jobs_selected": jobs_selected,
                         "successful_submissions": successful_submissions,
                         "error_count": error_count,
                     },
                 )
-                if self._emit_selected_job_limit_if_needed(
+                return not self._emit_selected_job_limit_if_needed(
                     execution_id=execution_id,
-                    jobs=len(jobs),
+                    jobs=jobs_seen,
                     jobs_selected=jobs_selected,
                     successful_submissions=successful_submissions,
                     error_count=error_count,
-                ):
-                    break
-                continue
+                )
 
             record = attempt.successful_record or create_successful_submission_record(
                 submission,
@@ -843,21 +822,146 @@ class AgentExecutionOrchestrator:
                     "status": "running",
                     "current_stage": "submission_completed",
                     "current_job": {**current_job, "submission_id": str(record.submission.id)},
-                    "jobs_seen": len(jobs),
+                    "jobs_seen": jobs_seen,
                     "jobs_selected": jobs_selected,
                     "successful_submissions": successful_submissions,
                     "error_count": error_count,
                 },
             )
-
-            if self._emit_selected_job_limit_if_needed(
+            return not self._emit_selected_job_limit_if_needed(
                 execution_id=execution_id,
-                jobs=len(jobs),
+                jobs=jobs_seen,
                 jobs_selected=jobs_selected,
                 successful_submissions=successful_submissions,
                 error_count=error_count,
-            ):
-                break
+            )
+
+        if isinstance(self._job_fetcher, IncrementalJobFetcher):
+            summary = summary.model_copy(update={"jobs_seen": 0})
+            self._execution_store.save_execution(summary)
+            self._persist_run_summary(summary)
+
+            async def process_incremental_job(posting: JobPosting) -> bool:
+                nonlocal summary, jobs_seen
+
+                jobs_seen += 1
+                summary = summary.model_copy(update={"jobs_seen": jobs_seen})
+                self._execution_store.save_execution(summary)
+                self._persist_run_summary(summary)
+                update_progress_snapshot(
+                    {
+                        "status": "running",
+                        "current_stage": "job_fetched",
+                        "current_job": {
+                            "job_posting_id": str(posting.id),
+                            "company_name": posting.company_name,
+                            "title": posting.title,
+                            "url": posting.url,
+                        },
+                        "jobs_seen": jobs_seen,
+                        "jobs_selected": jobs_selected,
+                        "successful_submissions": successful_submissions,
+                        "error_count": error_count,
+                    },
+                )
+                append_timeline_event(
+                    "job_fetched",
+                    {
+                        "job_posting_id": str(posting.id),
+                        "company_name": posting.company_name,
+                        "title": posting.title,
+                        "url": posting.url,
+                        "jobs_seen": jobs_seen,
+                    },
+                )
+                return await process_posting(posting)
+
+            try:
+                jobs_seen = await self._job_fetcher.fetch_incremental(
+                    settings,
+                    process_incremental_job,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return self._finalize_fatal_error(
+                    summary=summary.model_copy(update={"jobs_seen": jobs_seen}),
+                    snapshot=snapshot,
+                    stage="fetch_jobs",
+                    error=exc,
+                )
+        else:
+            try:
+                jobs = await self._job_fetcher.fetch(settings)
+            except Exception as exc:  # noqa: BLE001
+                return self._finalize_fatal_error(
+                    summary=summary,
+                    snapshot=snapshot,
+                    stage="fetch_jobs",
+                    error=exc,
+                )
+
+            jobs_seen = len(jobs)
+            summary = summary.model_copy(update={"jobs_seen": jobs_seen})
+            self._execution_store.save_execution(summary)
+            self._persist_run_summary(summary)
+            self._emit_event(
+                execution_id=execution_id,
+                event_type=ExecutionEventType.STEP_REACHED,
+                payload={
+                    "stage": "fetch_jobs",
+                    "jobs_seen": jobs_seen,
+                },
+            )
+            update_progress_snapshot(
+                {
+                    "status": "running",
+                    "current_stage": "jobs_fetched",
+                    "jobs_seen": jobs_seen,
+                    "jobs_selected": jobs_selected,
+                    "successful_submissions": successful_submissions,
+                    "error_count": error_count,
+                    "current_job": None,
+                },
+            )
+            append_timeline_event(
+                "jobs_fetched",
+                {
+                    "execution_id": str(execution_id),
+                    "jobs_seen": jobs_seen,
+                },
+            )
+            fetch_stage_emitted = True
+            for posting in jobs:
+                should_continue = await process_posting(posting)
+                if not should_continue:
+                    break
+
+        if not fetch_stage_emitted:
+            self._emit_event(
+                execution_id=execution_id,
+                event_type=ExecutionEventType.STEP_REACHED,
+                payload={
+                    "stage": "fetch_jobs",
+                    "jobs_seen": jobs_seen,
+                },
+            )
+            update_progress_snapshot(
+                {
+                    "status": "running",
+                    "current_stage": "jobs_fetched",
+                    "jobs_seen": jobs_seen,
+                    "jobs_selected": jobs_selected,
+                    "successful_submissions": successful_submissions,
+                    "error_count": error_count,
+                    "current_job": None,
+                },
+            )
+            append_timeline_event(
+                "jobs_fetched",
+                {
+                    "execution_id": str(execution_id),
+                    "jobs_seen": jobs_seen,
+                },
+            )
 
         final_summary = summary.model_copy(
             update={
