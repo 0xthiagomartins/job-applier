@@ -35,6 +35,7 @@ from job_applier.infrastructure.linkedin.stagehand import (
     StagehandLinkedInError,
     StagehandLinkedInJobDetailExtractor,
     StagehandSearchResultCardExtraction,
+    StagehandSearchSurfaceExtraction,
     resolve_stagehand_model_name,
 )
 from job_applier.observability import (
@@ -1244,6 +1245,33 @@ class PlaywrightLinkedInJobsClient:
                     summary="LinkedIn job cards are already visible on the results page.",
                     evidence=("job_cards_visible",),
                 )
+            stagehand_assessment = await self._maybe_assess_search_surface_with_stagehand(
+                page,
+                criteria=criteria,
+            )
+            if stagehand_assessment is not None:
+                last_assessment = stagehand_assessment
+                append_output_jsonl(
+                    "run.log",
+                    {
+                        "source": "linkedin_search",
+                        "kind": "search_surface_stagehand_assessment",
+                        "attempt": attempt + 1,
+                        "status": stagehand_assessment.status,
+                        "confidence": stagehand_assessment.confidence,
+                        "summary": stagehand_assessment.summary,
+                        "evidence": list(stagehand_assessment.evidence),
+                        "url": current_url,
+                    },
+                )
+                if stagehand_assessment.status == "complete":
+                    return stagehand_assessment
+                if stagehand_assessment.status == "blocked":
+                    msg = (
+                        stagehand_assessment.summary
+                        or "LinkedIn search is blocked on the current screen."
+                    )
+                    raise LinkedInSearchError(msg)
             assessment = await self._assess_search_surface(page, criteria=criteria)
             last_assessment = assessment
             append_output_jsonl(
@@ -1281,6 +1309,12 @@ class PlaywrightLinkedInJobsClient:
     ) -> bool:
         if await self._wait_for_extractable_search_cards(page, attempts=1):
             return True
+        stagehand_assessment = await self._maybe_assess_search_surface_with_stagehand(
+            page,
+            criteria=criteria,
+        )
+        if stagehand_assessment is not None:
+            return stagehand_assessment.status == "complete"
         assessment = await self._assess_search_surface(page, criteria=criteria)
         return assessment.status == "complete"
 
@@ -1984,6 +2018,45 @@ class PlaywrightLinkedInJobsClient:
         )
         return tuple(merged_listings)
 
+    async def _maybe_assess_search_surface_with_stagehand(
+        self,
+        page: Page,
+        *,
+        criteria: LinkedInSearchCriteria,
+    ) -> BrowserTaskAssessment | None:
+        extractor = self._active_stagehand_job_detail_extractor
+        if extractor is None:
+            return None
+
+        extract_search_surface_state = getattr(extractor, "extract_search_surface_state", None)
+        if extract_search_surface_state is None:
+            return None
+
+        try:
+            extraction = await extract_search_surface_state(
+                url=page.url,
+                storage_state_path=self._runtime_settings.resolved_linkedin_storage_state_path,
+                chrome_path=self._playwright_executable_path,
+            )
+        except StagehandLinkedInError as exc:
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "linkedin_search",
+                    "kind": "stagehand_search_surface_failed",
+                    "url": page.url,
+                    "message": str(exc),
+                },
+            )
+            return None
+
+        if not isinstance(extraction, StagehandSearchSurfaceExtraction):
+            return None
+        return self._build_search_surface_assessment_from_stagehand(
+            extraction,
+            criteria=criteria,
+        )
+
     async def _capture_debug_target_artifact(
         self,
         context: BrowserContext,
@@ -2123,6 +2196,100 @@ class PlaywrightLinkedInJobsClient:
         if not location:
             return True
         return len(description) < 80
+
+    def _build_search_surface_assessment_from_stagehand(
+        self,
+        extraction: StagehandSearchSurfaceExtraction,
+        *,
+        criteria: LinkedInSearchCriteria,
+    ) -> BrowserTaskAssessment:
+        evidence: list[str] = []
+        if extraction.results_ready:
+            evidence.append("stagehand_results_ready")
+        if extraction.empty_state_visible:
+            evidence.append("stagehand_empty_state")
+        if extraction.loading:
+            evidence.append("stagehand_loading")
+        if extraction.easy_apply_filter_active:
+            evidence.append("stagehand_easy_apply_filter_active")
+        if extraction.posted_within_24h_active:
+            evidence.append("stagehand_past_24h_filter_active")
+
+        expected_filters_confirmed = True
+        if criteria.easy_apply_only and extraction.easy_apply_filter_active is False:
+            expected_filters_confirmed = False
+            evidence.append("stagehand_easy_apply_filter_inactive")
+        if criteria.posted_within_hours <= 24 and extraction.posted_within_24h_active is False:
+            expected_filters_confirmed = False
+            evidence.append("stagehand_past_24h_filter_inactive")
+
+        if extraction.blocked:
+            return BrowserTaskAssessment(
+                status="blocked",
+                confidence=0.9,
+                summary=(
+                    extraction.blocker_summary
+                    or extraction.page_summary
+                    or "Stagehand determined that the LinkedIn search surface is blocked."
+                ),
+                evidence=tuple(evidence or ["stagehand_blocked"]),
+            )
+
+        if extraction.results_ready and expected_filters_confirmed:
+            return BrowserTaskAssessment(
+                status="complete",
+                confidence=0.9,
+                summary=(
+                    extraction.page_summary
+                    or "Stagehand determined that the LinkedIn search results are ready."
+                ),
+                evidence=tuple(evidence),
+            )
+
+        if extraction.empty_state_visible and expected_filters_confirmed:
+            return BrowserTaskAssessment(
+                status="complete",
+                confidence=0.85,
+                summary=(
+                    extraction.page_summary
+                    or "Stagehand determined that the LinkedIn search page shows an empty "
+                    "results state."
+                ),
+                evidence=tuple(evidence),
+            )
+
+        if extraction.loading:
+            return BrowserTaskAssessment(
+                status="pending",
+                confidence=0.8,
+                summary=(
+                    extraction.page_summary
+                    or "Stagehand determined that the LinkedIn search surface is still loading."
+                ),
+                evidence=tuple(evidence),
+            )
+
+        if not expected_filters_confirmed:
+            return BrowserTaskAssessment(
+                status="pending",
+                confidence=0.75,
+                summary=(
+                    extraction.page_summary
+                    or "Stagehand determined that the LinkedIn search results are visible, but "
+                    "the expected filters do not appear active yet."
+                ),
+                evidence=tuple(evidence),
+            )
+
+        return BrowserTaskAssessment(
+            status="unknown",
+            confidence=0.5,
+            summary=(
+                extraction.page_summary
+                or "Stagehand could not confidently classify the LinkedIn search surface."
+            ),
+            evidence=tuple(evidence),
+        )
 
     def _listing_cards_need_semantic_repair(
         self,

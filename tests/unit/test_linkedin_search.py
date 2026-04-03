@@ -44,6 +44,7 @@ from job_applier.infrastructure.linkedin.search import (
 from job_applier.infrastructure.linkedin.stagehand import (
     StagehandJobDetailExtraction,
     StagehandSearchResultCardExtraction,
+    StagehandSearchSurfaceExtraction,
     resolve_stagehand_model_name,
 )
 from job_applier.infrastructure.sqlite import (
@@ -354,6 +355,97 @@ def test_wait_for_search_surface_short_circuits_when_job_cards_are_visible(tmp_p
         result = await client._wait_for_search_surface(cast(Page, FakePage()), criteria=criteria)
         assert result.status == "complete"
         assert "job cards" in result.summary.lower()
+
+    asyncio.run(scenario())
+
+
+def test_wait_for_search_surface_uses_stagehand_complete_assessment(tmp_path: Path) -> None:
+    runtime_settings = RuntimeSettings(data_dir=tmp_path, stagehand_enabled=True)
+    client = PlaywrightLinkedInJobsClient(runtime_settings)
+    criteria = build_search_criteria(build_user_agent_settings(), runtime_settings)
+
+    class FakePage:
+        url = "https://www.linkedin.com/jobs/search/?keywords=python"
+
+        async def wait_for_timeout(self, milliseconds: int) -> None:
+            raise AssertionError("The search surface should not wait after Stagehand completes.")
+
+    async def scenario() -> None:
+        async def fake_has_cards(page: object, *, attempts: int = 3) -> bool:
+            del page, attempts
+            return False
+
+        async def fake_stagehand_assess(
+            page: object,
+            *,
+            criteria: LinkedInSearchCriteria,
+        ) -> BrowserTaskAssessment | None:
+            del page, criteria
+            return BrowserTaskAssessment(
+                status="complete",
+                confidence=0.91,
+                summary="Stagehand says the results surface is ready.",
+                evidence=("stagehand_results_ready",),
+            )
+
+        async def fail_assessment(
+            page: object,
+            criteria: LinkedInSearchCriteria,
+        ) -> BrowserTaskAssessment:
+            del page, criteria
+            raise AssertionError("Browser assessment should not run after Stagehand completes.")
+
+        client._wait_for_extractable_search_cards = fake_has_cards  # type: ignore[method-assign]
+        client._maybe_assess_search_surface_with_stagehand = (  # type: ignore[method-assign]
+            fake_stagehand_assess
+        )
+        client._assess_search_surface = fail_assessment  # type: ignore[method-assign]
+        result = await client._wait_for_search_surface(cast(Page, FakePage()), criteria=criteria)
+        assert result.status == "complete"
+        assert "stagehand" in result.summary.lower()
+
+    asyncio.run(scenario())
+
+
+def test_search_results_ready_uses_stagehand_surface_assessment(tmp_path: Path) -> None:
+    runtime_settings = RuntimeSettings(data_dir=tmp_path, stagehand_enabled=True)
+    client = PlaywrightLinkedInJobsClient(runtime_settings)
+    criteria = build_search_criteria(build_user_agent_settings(), runtime_settings)
+
+    class FakePage:
+        url = "https://www.linkedin.com/jobs/search/?keywords=python"
+
+    async def scenario() -> None:
+        async def fake_has_cards(page: object, *, attempts: int = 3) -> bool:
+            del page, attempts
+            return False
+
+        async def fake_stagehand_assess(
+            page: object,
+            *,
+            criteria: LinkedInSearchCriteria,
+        ) -> BrowserTaskAssessment | None:
+            del page, criteria
+            return BrowserTaskAssessment(
+                status="complete",
+                confidence=0.87,
+                summary="Results ready according to Stagehand.",
+                evidence=("stagehand_results_ready",),
+            )
+
+        async def fail_assessment(
+            page: object,
+            criteria: LinkedInSearchCriteria,
+        ) -> BrowserTaskAssessment:
+            del page, criteria
+            raise AssertionError("Browser assessment should not run after Stagehand completes.")
+
+        client._wait_for_extractable_search_cards = fake_has_cards  # type: ignore[method-assign]
+        client._maybe_assess_search_surface_with_stagehand = (  # type: ignore[method-assign]
+            fake_stagehand_assess
+        )
+        client._assess_search_surface = fail_assessment  # type: ignore[method-assign]
+        assert await client._search_results_ready(cast(Page, FakePage()), criteria=criteria) is True
 
     asyncio.run(scenario())
 
@@ -991,6 +1083,31 @@ def test_stagehand_results_repair_is_skipped_for_clean_cards(tmp_path: Path) -> 
 
     assert called["value"] is False
     assert repaired_cards == (clean_listing,)
+
+
+def test_build_search_surface_assessment_from_stagehand_marks_pending_when_filters_inactive() -> (
+    None
+):
+    runtime_settings = RuntimeSettings()
+    client = PlaywrightLinkedInJobsClient(runtime_settings)
+    criteria = build_search_criteria(build_user_agent_settings(), runtime_settings)
+
+    assessment = client._build_search_surface_assessment_from_stagehand(
+        StagehandSearchSurfaceExtraction(
+            page_summary="Results are visible but Easy Apply looks inactive.",
+            results_ready=True,
+            loading=False,
+            empty_state_visible=False,
+            blocked=False,
+            blocker_summary=None,
+            easy_apply_filter_active=False,
+            posted_within_24h_active=True,
+        ),
+        criteria=criteria,
+    )
+
+    assert assessment.status == "pending"
+    assert "inactive" in " ".join(assessment.evidence)
 
 
 async def _collect_posting_and_stop(posting: JobPosting, forwarded_titles: list[str]) -> bool:

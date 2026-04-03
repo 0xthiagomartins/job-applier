@@ -77,6 +77,31 @@ _SEARCH_RESULTS_EXTRACT_SCHEMA: dict[str, object] = {
     "required": ["page_summary", "results"],
 }
 
+_SEARCH_SURFACE_EXTRACT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "page_summary": {"type": ["string", "null"]},
+        "results_ready": {"type": ["boolean", "null"]},
+        "loading": {"type": ["boolean", "null"]},
+        "empty_state_visible": {"type": ["boolean", "null"]},
+        "blocked": {"type": ["boolean", "null"]},
+        "blocker_summary": {"type": ["string", "null"]},
+        "easy_apply_filter_active": {"type": ["boolean", "null"]},
+        "posted_within_24h_active": {"type": ["boolean", "null"]},
+    },
+    "required": [
+        "page_summary",
+        "results_ready",
+        "loading",
+        "empty_state_visible",
+        "blocked",
+        "blocker_summary",
+        "easy_apply_filter_active",
+        "posted_within_24h_active",
+    ],
+}
+
 
 class StagehandLinkedInError(RuntimeError):
     """Raised when the Stagehand semantic extractor cannot complete one job page."""
@@ -146,6 +171,20 @@ class StagehandSearchResultCardExtraction:
             "location": self.location or "",
             "easy_apply": bool(self.easy_apply_visible),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class StagehandSearchSurfaceExtraction:
+    """Semantic interpretation of the current LinkedIn search results surface."""
+
+    page_summary: str | None
+    results_ready: bool | None
+    loading: bool | None
+    empty_state_visible: bool | None
+    blocked: bool | None
+    blocker_summary: str | None
+    easy_apply_filter_active: bool | None
+    posted_within_24h_active: bool | None
 
 
 class StagehandLinkedInJobDetailExtractor:
@@ -460,6 +499,151 @@ class StagehandLinkedInJobDetailExtractor:
                 except Exception:  # noqa: BLE001
                     logger.debug("stagehand_client_close_failed", exc_info=True)
 
+    async def extract_search_surface_state(
+        self,
+        *,
+        url: str,
+        storage_state_path: Path,
+        chrome_path: str | None = None,
+    ) -> StagehandSearchSurfaceExtraction:
+        """Return a semantic assessment of the current LinkedIn search surface."""
+
+        with _stagehand_environment(self._runtime_settings.resolved_stagehand_cache_dir):
+            client = AsyncStagehand(
+                server="local",
+                model_api_key=self._api_key.get_secret_value(),
+                local_headless=self._runtime_settings.playwright_headless,
+                local_chrome_path=chrome_path
+                or _stringify_path(self._runtime_settings.stagehand_local_chrome_path),
+                local_shutdown_on_close=True,
+            )
+            session = None
+            browser = None
+            playwright_manager = None
+            try:
+                browser_launch_options: StagehandBrowserLaunchOptions = {
+                    "headless": self._runtime_settings.playwright_headless,
+                }
+                if chrome_path:
+                    browser_launch_options["executable_path"] = chrome_path
+                elif self._runtime_settings.stagehand_local_chrome_path is not None:
+                    browser_launch_options["executable_path"] = str(
+                        self._runtime_settings.stagehand_local_chrome_path
+                    )
+                browser_config: StagehandBrowser = {
+                    "type": "local",
+                    "launch_options": browser_launch_options,
+                }
+                session = await client.sessions.start(
+                    model_name=self._model_name,
+                    browser=browser_config,
+                    self_heal=True,
+                    verbose=0,
+                    system_prompt=(
+                        "You are reading a LinkedIn jobs search page for an automation system. "
+                        "Focus only on the main jobs search surface. Ignore ads, premium "
+                        "upsells, global navigation, messaging overlays, and sidebars unless "
+                        "they block the search results."
+                    ),
+                )
+                cdp_url = session.data.cdp_url
+                if not cdp_url:
+                    msg = "Stagehand did not return a CDP URL for the local browser session."
+                    raise StagehandLinkedInError(msg)
+
+                playwright_manager = await async_playwright().start()
+                browser = await playwright_manager.chromium.connect_over_cdp(cdp_url)
+                context = _resolve_cdp_context(browser.contexts)
+                page = await _resolve_cdp_page(context)
+                await _restore_storage_state(
+                    context=context,
+                    page=page,
+                    storage_state_path=storage_state_path,
+                )
+                await session.navigate(
+                    page=page,
+                    url=url,
+                    options={
+                        "wait_until": "domcontentloaded",
+                        "timeout": float(self._runtime_settings.linkedin_default_timeout_ms),
+                    },
+                )
+                await page.wait_for_timeout(1_250)
+                extraction = await self._extract_search_surface_state(session=session, page=page)
+                result = StagehandSearchSurfaceExtraction(
+                    page_summary=_clean_text(extraction.get("page_summary")),
+                    results_ready=_coerce_bool(extraction.get("results_ready")),
+                    loading=_coerce_bool(extraction.get("loading")),
+                    empty_state_visible=_coerce_bool(extraction.get("empty_state_visible")),
+                    blocked=_coerce_bool(extraction.get("blocked")),
+                    blocker_summary=_clean_text(extraction.get("blocker_summary")),
+                    easy_apply_filter_active=_coerce_bool(
+                        extraction.get("easy_apply_filter_active")
+                    ),
+                    posted_within_24h_active=_coerce_bool(
+                        extraction.get("posted_within_24h_active")
+                    ),
+                )
+                append_output_jsonl(
+                    "stagehand/search-surface.jsonl",
+                    {
+                        "kind": "extraction_completed",
+                        "url": url,
+                        "model_name": self._model_name,
+                        "page_summary": result.page_summary,
+                        "results_ready": result.results_ready,
+                        "loading": result.loading,
+                        "empty_state_visible": result.empty_state_visible,
+                        "blocked": result.blocked,
+                        "blocker_summary": result.blocker_summary,
+                        "easy_apply_filter_active": result.easy_apply_filter_active,
+                        "posted_within_24h_active": result.posted_within_24h_active,
+                    },
+                )
+                return result
+            except StagehandLinkedInError:
+                raise
+            except StagehandError as exc:
+                append_output_jsonl(
+                    "stagehand/search-surface.jsonl",
+                    {
+                        "kind": "stagehand_error",
+                        "url": url,
+                        "message": str(exc),
+                    },
+                )
+                raise StagehandLinkedInError(str(exc)) from exc
+            except Exception as exc:  # noqa: BLE001
+                append_output_jsonl(
+                    "stagehand/search-surface.jsonl",
+                    {
+                        "kind": "unexpected_error",
+                        "url": url,
+                        "message": str(exc),
+                    },
+                )
+                raise StagehandLinkedInError(str(exc)) from exc
+            finally:
+                if session is not None:
+                    try:
+                        await session.end()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("stagehand_session_end_failed", exc_info=True)
+                if browser is not None:
+                    try:
+                        await browser.close()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("stagehand_browser_close_failed", exc_info=True)
+                if playwright_manager is not None:
+                    try:
+                        await playwright_manager.stop()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("stagehand_playwright_stop_failed", exc_info=True)
+                try:
+                    await client.close()
+                except Exception:  # noqa: BLE001
+                    logger.debug("stagehand_client_close_failed", exc_info=True)
+
     async def _observe_apply_actions(
         self,
         *,
@@ -547,6 +731,30 @@ class StagehandLinkedInJobDetailExtractor:
         result = response.data.result
         if not isinstance(result, dict):
             msg = "Stagehand returned an invalid search-results extraction payload."
+            raise StagehandLinkedInError(msg)
+        return result
+
+    async def _extract_search_surface_state(
+        self,
+        *,
+        session: Any,
+        page: Page,
+    ) -> dict[str, object]:
+        response = await session.extract(
+            page=page,
+            instruction=(
+                "Assess the current LinkedIn jobs search surface. Decide whether the main "
+                "search results area is ready for extraction, still loading, blocked by an "
+                "unexpected screen, or showing a legitimate empty-results state. Also infer "
+                "whether the Easy Apply and Past 24 hours filters appear active on the current "
+                "results surface when that can be determined confidently."
+            ),
+            schema=_SEARCH_SURFACE_EXTRACT_SCHEMA,
+            options={"timeout": float(self._runtime_settings.linkedin_default_timeout_ms)},
+        )
+        result = response.data.result
+        if not isinstance(result, dict):
+            msg = "Stagehand returned an invalid search-surface extraction payload."
             raise StagehandLinkedInError(msg)
         return result
 
