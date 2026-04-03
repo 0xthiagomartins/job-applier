@@ -43,6 +43,7 @@ from job_applier.infrastructure.linkedin.search import (
 )
 from job_applier.infrastructure.linkedin.stagehand import (
     StagehandJobDetailExtraction,
+    StagehandSearchResultCardExtraction,
     resolve_stagehand_model_name,
 )
 from job_applier.infrastructure.sqlite import (
@@ -884,6 +885,112 @@ def test_stagehand_enrichment_is_skipped_for_clean_payloads(tmp_path: Path) -> N
 
     assert called["value"] is False
     assert payload["company_name"] == "Example Corp"
+
+
+def test_stagehand_results_repair_enriches_noisy_listing_cards(tmp_path: Path) -> None:
+    runtime_settings = RuntimeSettings(data_dir=tmp_path, stagehand_enabled=True)
+
+    class FakeStagehandExtractor:
+        async def extract_search_results_page(
+            self,
+            *,
+            url: str,
+            storage_state_path: Path,
+            chrome_path: str | None = None,
+        ) -> tuple[StagehandSearchResultCardExtraction, ...]:
+            del storage_state_path, chrome_path
+            assert url == "https://www.linkedin.com/jobs/search/?keywords=python"
+            return (
+                StagehandSearchResultCardExtraction(
+                    url="https://www.linkedin.com/jobs/view/1234567890/",
+                    title="Senior Python Engineer",
+                    company_name="Example Corp",
+                    location="Sao Paulo, SP, Brazil",
+                    easy_apply_visible=True,
+                ),
+            )
+
+    client = PlaywrightLinkedInJobsClient(
+        runtime_settings,
+        stagehand_job_detail_extractor=FakeStagehandExtractor(),  # type: ignore[arg-type]
+    )
+    repaired_cards = asyncio.run(
+        client._maybe_repair_listing_cards_with_stagehand(
+            page=cast(
+                Page,
+                type(
+                    "FakePage", (), {"url": "https://www.linkedin.com/jobs/search/?keywords=python"}
+                )(),
+            ),
+            listings=(
+                LinkedInCollectedJob(
+                    external_job_id="1234567890",
+                    url="https://www.linkedin.com/jobs/view/1234567890/",
+                    title="LinkedIn",
+                    company_name="Save",
+                    location=None,
+                    description_raw="",
+                    easy_apply=False,
+                    metadata_text="Save | Apply | Premium",
+                ),
+            ),
+            page_index=1,
+        )
+    )
+
+    assert len(repaired_cards) == 1
+    assert repaired_cards[0].title == "Senior Python Engineer"
+    assert repaired_cards[0].company_name == "Example Corp"
+    assert repaired_cards[0].location == "Sao Paulo, SP, Brazil"
+    assert repaired_cards[0].easy_apply is True
+
+
+def test_stagehand_results_repair_is_skipped_for_clean_cards(tmp_path: Path) -> None:
+    runtime_settings = RuntimeSettings(data_dir=tmp_path, stagehand_enabled=True)
+    called = {"value": False}
+
+    class FakeStagehandExtractor:
+        async def extract_search_results_page(
+            self,
+            *,
+            url: str,
+            storage_state_path: Path,
+            chrome_path: str | None = None,
+        ) -> tuple[StagehandSearchResultCardExtraction, ...]:
+            del url, storage_state_path, chrome_path
+            called["value"] = True
+            return ()
+
+    client = PlaywrightLinkedInJobsClient(
+        runtime_settings,
+        stagehand_job_detail_extractor=FakeStagehandExtractor(),  # type: ignore[arg-type]
+    )
+    clean_listing = LinkedInCollectedJob(
+        external_job_id="1234567890",
+        url="https://www.linkedin.com/jobs/view/1234567890/",
+        title="Senior Python Engineer",
+        company_name="Example Corp",
+        location="Sao Paulo, SP, Brazil",
+        description_raw="Build resilient Python services.",
+        easy_apply=True,
+        metadata_text="Senior Python Engineer | Example Corp | Sao Paulo, SP, Brazil",
+    )
+
+    repaired_cards = asyncio.run(
+        client._maybe_repair_listing_cards_with_stagehand(
+            page=cast(
+                Page,
+                type(
+                    "FakePage", (), {"url": "https://www.linkedin.com/jobs/search/?keywords=python"}
+                )(),
+            ),
+            listings=(clean_listing,),
+            page_index=1,
+        )
+    )
+
+    assert called["value"] is False
+    assert repaired_cards == (clean_listing,)
 
 
 async def _collect_posting_and_stop(posting: JobPosting, forwarded_titles: list[str]) -> bool:

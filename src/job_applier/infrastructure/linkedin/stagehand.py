@@ -47,6 +47,36 @@ _JOB_DETAIL_EXTRACT_SCHEMA: dict[str, object] = {
     ],
 }
 
+_SEARCH_RESULTS_EXTRACT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "page_summary": {"type": ["string", "null"]},
+        "results": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "url": {"type": ["string", "null"]},
+                    "title": {"type": ["string", "null"]},
+                    "company_name": {"type": ["string", "null"]},
+                    "location": {"type": ["string", "null"]},
+                    "easy_apply_visible": {"type": ["boolean", "null"]},
+                },
+                "required": [
+                    "url",
+                    "title",
+                    "company_name",
+                    "location",
+                    "easy_apply_visible",
+                ],
+            },
+        },
+    },
+    "required": ["page_summary", "results"],
+}
+
 
 class StagehandLinkedInError(RuntimeError):
     """Raised when the Stagehand semantic extractor cannot complete one job page."""
@@ -93,6 +123,28 @@ class StagehandJobDetailExtraction:
                 }
                 for item in self.observed_apply_actions
             ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class StagehandSearchResultCardExtraction:
+    """One LinkedIn search result card extracted semantically through Stagehand."""
+
+    url: str
+    title: str | None
+    company_name: str | None
+    location: str | None
+    easy_apply_visible: bool | None
+
+    def to_listing_patch(self) -> dict[str, object]:
+        """Return a conservative patch that can enrich an existing listing card."""
+
+        return {
+            "url": self.url,
+            "title": self.title or "",
+            "company_name": self.company_name or "",
+            "location": self.location or "",
+            "easy_apply": bool(self.easy_apply_visible),
         }
 
 
@@ -259,6 +311,155 @@ class StagehandLinkedInJobDetailExtractor:
                 except Exception:  # noqa: BLE001
                     logger.debug("stagehand_client_close_failed", exc_info=True)
 
+    async def extract_search_results_page(
+        self,
+        *,
+        url: str,
+        storage_state_path: Path,
+        chrome_path: str | None = None,
+    ) -> tuple[StagehandSearchResultCardExtraction, ...]:
+        """Return visible LinkedIn search result cards with cleaner semantics."""
+
+        with _stagehand_environment(self._runtime_settings.resolved_stagehand_cache_dir):
+            client = AsyncStagehand(
+                server="local",
+                model_api_key=self._api_key.get_secret_value(),
+                local_headless=self._runtime_settings.playwright_headless,
+                local_chrome_path=chrome_path
+                or _stringify_path(self._runtime_settings.stagehand_local_chrome_path),
+                local_shutdown_on_close=True,
+            )
+            session = None
+            browser = None
+            playwright_manager = None
+            try:
+                browser_launch_options: StagehandBrowserLaunchOptions = {
+                    "headless": self._runtime_settings.playwright_headless,
+                }
+                if chrome_path:
+                    browser_launch_options["executable_path"] = chrome_path
+                elif self._runtime_settings.stagehand_local_chrome_path is not None:
+                    browser_launch_options["executable_path"] = str(
+                        self._runtime_settings.stagehand_local_chrome_path
+                    )
+                browser_config: StagehandBrowser = {
+                    "type": "local",
+                    "launch_options": browser_launch_options,
+                }
+                session = await client.sessions.start(
+                    model_name=self._model_name,
+                    browser=browser_config,
+                    self_heal=True,
+                    verbose=0,
+                    system_prompt=(
+                        "You are reading a LinkedIn jobs search results page for an automation "
+                        "system. Focus only on the main search results list. Ignore premium "
+                        "upsells, job recommendations outside the main list, sidebars, banners, "
+                        "ads, recruiter promos, and global navigation."
+                    ),
+                )
+                cdp_url = session.data.cdp_url
+                if not cdp_url:
+                    msg = "Stagehand did not return a CDP URL for the local browser session."
+                    raise StagehandLinkedInError(msg)
+
+                playwright_manager = await async_playwright().start()
+                browser = await playwright_manager.chromium.connect_over_cdp(cdp_url)
+                context = _resolve_cdp_context(browser.contexts)
+                page = await _resolve_cdp_page(context)
+                await _restore_storage_state(
+                    context=context,
+                    page=page,
+                    storage_state_path=storage_state_path,
+                )
+                await session.navigate(
+                    page=page,
+                    url=url,
+                    options={
+                        "wait_until": "domcontentloaded",
+                        "timeout": float(self._runtime_settings.linkedin_default_timeout_ms),
+                    },
+                )
+                await page.wait_for_timeout(1_250)
+                extraction = await self._extract_search_results_page(session=session, page=page)
+                raw_results = extraction.get("results")
+                results = raw_results if isinstance(raw_results, list) else []
+                cards = tuple(
+                    StagehandSearchResultCardExtraction(
+                        url=normalized_url,
+                        title=_clean_text(item.get("title")),
+                        company_name=_clean_text(item.get("company_name")),
+                        location=_clean_text(item.get("location")),
+                        easy_apply_visible=_coerce_bool(item.get("easy_apply_visible")),
+                    )
+                    for item in results
+                    if isinstance(item, dict)
+                    and (normalized_url := _normalize_linkedin_job_url(item.get("url"))) is not None
+                )
+                append_output_jsonl(
+                    "stagehand/search-results.jsonl",
+                    {
+                        "kind": "extraction_completed",
+                        "url": url,
+                        "model_name": self._model_name,
+                        "page_summary": _clean_text(extraction.get("page_summary")),
+                        "card_count": len(cards),
+                        "cards": [
+                            {
+                                "url": item.url,
+                                "title": item.title,
+                                "company_name": item.company_name,
+                                "location": item.location,
+                                "easy_apply_visible": item.easy_apply_visible,
+                            }
+                            for item in cards
+                        ],
+                    },
+                )
+                return cards
+            except StagehandLinkedInError:
+                raise
+            except StagehandError as exc:
+                append_output_jsonl(
+                    "stagehand/search-results.jsonl",
+                    {
+                        "kind": "stagehand_error",
+                        "url": url,
+                        "message": str(exc),
+                    },
+                )
+                raise StagehandLinkedInError(str(exc)) from exc
+            except Exception as exc:  # noqa: BLE001
+                append_output_jsonl(
+                    "stagehand/search-results.jsonl",
+                    {
+                        "kind": "unexpected_error",
+                        "url": url,
+                        "message": str(exc),
+                    },
+                )
+                raise StagehandLinkedInError(str(exc)) from exc
+            finally:
+                if session is not None:
+                    try:
+                        await session.end()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("stagehand_session_end_failed", exc_info=True)
+                if browser is not None:
+                    try:
+                        await browser.close()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("stagehand_browser_close_failed", exc_info=True)
+                if playwright_manager is not None:
+                    try:
+                        await playwright_manager.stop()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("stagehand_playwright_stop_failed", exc_info=True)
+                try:
+                    await client.close()
+                except Exception:  # noqa: BLE001
+                    logger.debug("stagehand_client_close_failed", exc_info=True)
+
     async def _observe_apply_actions(
         self,
         *,
@@ -322,6 +523,30 @@ class StagehandLinkedInJobDetailExtractor:
         result = response.data.result
         if not isinstance(result, dict):
             msg = "Stagehand returned an invalid job-detail extraction payload."
+            raise StagehandLinkedInError(msg)
+        return result
+
+    async def _extract_search_results_page(
+        self,
+        *,
+        session: Any,
+        page: Page,
+    ) -> dict[str, object]:
+        response = await session.extract(
+            page=page,
+            instruction=(
+                "Extract the visible job result cards from the main LinkedIn jobs search results "
+                "list. Ignore sidebars, premium banners, recruiter promotions, global navigation, "
+                "and any content outside the central results list. Return only real job cards that "
+                "a candidate could open from this results page, with their canonical job URL when "
+                "visible."
+            ),
+            schema=_SEARCH_RESULTS_EXTRACT_SCHEMA,
+            options={"timeout": float(self._runtime_settings.linkedin_default_timeout_ms)},
+        )
+        result = response.data.result
+        if not isinstance(result, dict):
+            msg = "Stagehand returned an invalid search-results extraction payload."
             raise StagehandLinkedInError(msg)
         return result
 
@@ -406,6 +631,13 @@ def _stringify_path(value: Path | None) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _normalize_linkedin_job_url(value: object) -> str | None:
+    raw = _clean_text(value)
+    if raw is None or "/jobs/view/" not in raw:
+        return None
+    return raw.split("?", maxsplit=1)[0]
 
 
 @contextmanager

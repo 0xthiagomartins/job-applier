@@ -34,6 +34,7 @@ from job_applier.infrastructure.linkedin.browser_agent import (
 from job_applier.infrastructure.linkedin.stagehand import (
     StagehandLinkedInError,
     StagehandLinkedInJobDetailExtractor,
+    StagehandSearchResultCardExtraction,
     resolve_stagehand_model_name,
 )
 from job_applier.observability import (
@@ -287,6 +288,22 @@ def _looks_like_non_company_line(value: str) -> bool:
             "temporary",
         )
     )
+
+
+def _looks_like_noisy_listing_card(listing: LinkedInCollectedJob) -> bool:
+    title = _collapse_text(listing.title)
+    company_name = _collapse_text(listing.company_name)
+    location = _collapse_text(listing.location)
+    metadata = _collapse_text(listing.metadata_text)
+    if _looks_like_placeholder_label(title):
+        return True
+    if len(title.split()) < 2 and len(metadata) > 40:
+        return True
+    if not company_name or _looks_like_non_company_line(company_name):
+        return True
+    if not location:
+        return True
+    return False
 
 
 def merge_job_detail_payload(
@@ -1507,8 +1524,15 @@ class PlaywrightLinkedInJobsClient:
                 break
             await page.wait_for_timeout(650 + min(round_index, 4) * 120)
 
+        listings = tuple(collected_by_url.values())
+        listings = await self._maybe_repair_listing_cards_with_stagehand(
+            page=page,
+            listings=listings,
+            page_index=page_index,
+        )
+
         return LinkedInResultsPageCollection(
-            listings=tuple(collected_by_url.values()),
+            listings=listings,
             rounds=completed_rounds,
             visible_listing_count=last_visible_listing_count,
             stale_rounds=stale_rounds,
@@ -1854,6 +1878,112 @@ class PlaywrightLinkedInJobsClient:
         )
         return listing
 
+    async def _maybe_repair_listing_cards_with_stagehand(
+        self,
+        *,
+        page: Page,
+        listings: tuple[LinkedInCollectedJob, ...],
+        page_index: int,
+    ) -> tuple[LinkedInCollectedJob, ...]:
+        extractor = self._active_stagehand_job_detail_extractor
+        if extractor is None or not listings:
+            return listings
+        if not self._listing_cards_need_semantic_repair(listings):
+            return listings
+
+        extract_search_results_page = getattr(extractor, "extract_search_results_page", None)
+        if extract_search_results_page is None:
+            return listings
+
+        try:
+            stagehand_cards = await extract_search_results_page(
+                url=page.url,
+                storage_state_path=self._runtime_settings.resolved_linkedin_storage_state_path,
+                chrome_path=self._playwright_executable_path,
+            )
+        except StagehandLinkedInError as exc:
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "linkedin_search",
+                    "kind": "stagehand_results_page_failed",
+                    "page_index": page_index,
+                    "url": page.url,
+                    "message": str(exc),
+                },
+            )
+            append_timeline_event(
+                "linkedin_search_results_stagehand_failed",
+                {
+                    "page_index": page_index,
+                    "url": page.url,
+                    "message": str(exc),
+                },
+            )
+            return listings
+
+        repaired_cards_by_url = {
+            card.url: card
+            for card in stagehand_cards
+            if isinstance(card, StagehandSearchResultCardExtraction)
+        }
+        if not repaired_cards_by_url:
+            return listings
+
+        merged_listings: list[LinkedInCollectedJob] = []
+        repaired_count = 0
+        for listing in listings:
+            repair = repaired_cards_by_url.get(listing.url)
+            if repair is None:
+                merged_listings.append(listing)
+                continue
+            repaired_listing = LinkedInCollectedJob(
+                external_job_id=(
+                    listing.external_job_id or self._extract_job_id_from_url(repair.url)
+                ),
+                url=repair.url,
+                title=_collapse_text(repair.title) or listing.title,
+                company_name=_collapse_text(repair.company_name) or listing.company_name,
+                location=_collapse_text(repair.location) or listing.location,
+                description_raw=listing.description_raw,
+                easy_apply=(
+                    repair.easy_apply_visible
+                    if repair.easy_apply_visible is not None
+                    else listing.easy_apply
+                ),
+                metadata_text=listing.metadata_text,
+                workplace_type=listing.workplace_type,
+                seniority=listing.seniority,
+            )
+            if repaired_listing != listing:
+                repaired_count += 1
+            merged_listings.append(repaired_listing)
+
+        if repaired_count == 0:
+            return listings
+
+        append_output_jsonl(
+            "run.log",
+            {
+                "source": "linkedin_search",
+                "kind": "stagehand_results_page_applied",
+                "page_index": page_index,
+                "url": page.url,
+                "repaired_count": repaired_count,
+                "card_count": len(merged_listings),
+            },
+        )
+        append_timeline_event(
+            "linkedin_search_results_stagehand_applied",
+            {
+                "page_index": page_index,
+                "url": page.url,
+                "repaired_count": repaired_count,
+                "card_count": len(merged_listings),
+            },
+        )
+        return tuple(merged_listings)
+
     async def _capture_debug_target_artifact(
         self,
         context: BrowserContext,
@@ -1993,6 +2123,15 @@ class PlaywrightLinkedInJobsClient:
         if not location:
             return True
         return len(description) < 80
+
+    def _listing_cards_need_semantic_repair(
+        self,
+        listings: tuple[LinkedInCollectedJob, ...],
+    ) -> bool:
+        if not listings:
+            return False
+        noisy_count = sum(1 for listing in listings if _looks_like_noisy_listing_card(listing))
+        return noisy_count > 0
 
     def _extract_job_id_from_url(self, url: str) -> str | None:
         match = re.search(r"/jobs/view/(\d+)", url)
