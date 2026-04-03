@@ -46,6 +46,7 @@ LINKEDIN_JOBS_SEARCH_URL = "https://www.linkedin.com/jobs/search/"
 RESULTS_PER_PAGE = 25
 RESULTS_PAGE_MAX_SCROLL_ROUNDS = 12
 RESULTS_PAGE_STALE_SCROLL_ROUNDS = 2
+_DETAIL_PLACEHOLDER_TOKENS = frozenset({"linkedin debug target", "linkedin", "job search"})
 
 
 class LinkedInSearchError(RuntimeError):
@@ -195,6 +196,188 @@ def infer_seniority(text: str) -> SeniorityLevel | None:
     if "intern" in lowered:
         return SeniorityLevel.INTERN
     return None
+
+
+def _collapse_text(value: object) -> str:
+    collapsed = re.sub(r"\s+", " ", str(value or "")).strip()
+    parts = collapsed.split(" ")
+    if len(parts) >= 4 and len(parts) % 2 == 0:
+        midpoint = len(parts) // 2
+        if parts[:midpoint] == parts[midpoint:]:
+            return " ".join(parts[:midpoint])
+    return collapsed
+
+
+def _looks_like_placeholder_label(value: str) -> bool:
+    normalized = _collapse_text(value).lower()
+    return not normalized or normalized in _DETAIL_PLACEHOLDER_TOKENS
+
+
+def _looks_like_location_line(value: str) -> bool:
+    normalized = _collapse_text(value).lower()
+    if not normalized:
+        return False
+    return any(
+        token in normalized
+        for token in (
+            "remote",
+            "hybrid",
+            "on-site",
+            "onsite",
+            "sao paulo",
+            "são paulo",
+            "brasil",
+            "brazil",
+            "argentina",
+            "mexico",
+            "colombia",
+            "united states",
+            "new york",
+            "london",
+            "berlin",
+        )
+    )
+
+
+def _looks_like_non_company_line(value: str) -> bool:
+    normalized = _collapse_text(value).lower()
+    if not normalized:
+        return True
+    if _looks_like_location_line(normalized):
+        return True
+    return any(
+        token in normalized
+        for token in (
+            "applicant",
+            "candidate",
+            "há ",
+            "hour ago",
+            "hours ago",
+            "day ago",
+            "days ago",
+            "week ago",
+            "weeks ago",
+            "promoted",
+            "premium",
+            "search smarter",
+            "free trial",
+            "continue with premium",
+            "easy apply",
+            "reposted",
+            "full-time",
+            "contract",
+            "temporary",
+        )
+    )
+
+
+def merge_job_detail_payload(
+    listing: LinkedInCollectedJob,
+    detail_payload: dict[str, object],
+) -> LinkedInCollectedJob:
+    """Merge raw detail-page extraction into a normalized collected listing."""
+
+    raw_top_card_lines = detail_payload.get("top_card_lines")
+    top_card_lines_source = (
+        raw_top_card_lines if isinstance(raw_top_card_lines, (list, tuple)) else ()
+    )
+    top_card_lines = tuple(
+        line for line in (_collapse_text(item) for item in top_card_lines_source) if line
+    )
+    raw_company_candidates = detail_payload.get("company_candidates")
+    company_candidates_source = (
+        raw_company_candidates if isinstance(raw_company_candidates, (list, tuple)) else ()
+    )
+    company_candidates = tuple(
+        candidate
+        for candidate in (_collapse_text(item) for item in company_candidates_source)
+        if candidate
+    )
+    raw_title_candidates = detail_payload.get("title_candidates")
+    title_candidates_source = (
+        raw_title_candidates if isinstance(raw_title_candidates, (list, tuple)) else ()
+    )
+    title_candidates = tuple(
+        candidate
+        for candidate in (_collapse_text(item) for item in title_candidates_source)
+        if candidate
+    )
+
+    normalized_listing_title = _collapse_text(listing.title)
+    normalized_listing_company = _collapse_text(listing.company_name)
+
+    title = next(
+        (
+            candidate
+            for candidate in (
+                _collapse_text(detail_payload.get("structured_title")),
+                _collapse_text(detail_payload.get("title")),
+                *title_candidates,
+                normalized_listing_title,
+            )
+            if candidate and not _looks_like_placeholder_label(candidate)
+        ),
+        normalized_listing_title or "LinkedIn job",
+    )
+
+    title_line_index = next(
+        (
+            index
+            for index, candidate in enumerate(top_card_lines)
+            if _collapse_text(candidate).lower() == title.lower()
+        ),
+        None,
+    )
+    top_card_lines_after_title = (
+        top_card_lines[title_line_index + 1 :] if title_line_index is not None else top_card_lines
+    )
+
+    company_name = ""
+    for candidate in (
+        _collapse_text(detail_payload.get("structured_company_name")),
+        _collapse_text(detail_payload.get("company_name")),
+        *company_candidates,
+        *top_card_lines_after_title,
+        *top_card_lines,
+        normalized_listing_company,
+    ):
+        if not candidate or _looks_like_placeholder_label(candidate):
+            continue
+        if candidate == title:
+            continue
+        if _looks_like_non_company_line(candidate):
+            continue
+        company_name = candidate
+        break
+
+    location = next(
+        (
+            candidate
+            for candidate in (
+                _collapse_text(detail_payload.get("location")),
+                *top_card_lines,
+                _collapse_text(listing.location),
+            )
+            if candidate and _looks_like_location_line(candidate)
+        ),
+        _collapse_text(listing.location),
+    )
+
+    detail_text = _collapse_text(detail_payload.get("metadata_text"))
+    description_raw = _collapse_text(detail_payload.get("description_raw"))
+
+    return LinkedInCollectedJob(
+        external_job_id=listing.external_job_id,
+        url=listing.url,
+        title=title,
+        company_name=company_name or normalized_listing_company or "LinkedIn company",
+        location=location or listing.location,
+        description_raw=description_raw or listing.description_raw,
+        easy_apply=listing.easy_apply or bool(detail_payload.get("easy_apply")),
+        metadata_text=f"{listing.metadata_text} {detail_text}".strip(),
+        workplace_type=infer_workplace_type(detail_text) or listing.workplace_type,
+        seniority=infer_seniority(detail_text) or listing.seniority,
+    )
 
 
 class LinkedInJobParser:
@@ -471,7 +654,10 @@ class PlaywrightLinkedInJobsClient:
                             "url": listing.url,
                         },
                     )
-                    detailed_listing = await self._load_job_details(context, listing)
+                    detailed_listing = await self._load_job_details_with_resilience(
+                        context,
+                        listing,
+                    )
                     jobs.append(detailed_listing)
                     update_progress_snapshot(
                         {
@@ -549,7 +735,7 @@ class PlaywrightLinkedInJobsClient:
                 "search_page_index": 1,
             },
         )
-        detailed_listing = await self._load_job_details(
+        detailed_listing = await self._load_job_details_with_resilience(
             context,
             LinkedInCollectedJob(
                 external_job_id=self._extract_job_id_from_url(target_url),
@@ -1010,6 +1196,23 @@ class PlaywrightLinkedInJobsClient:
         payloads = await page.locator("a[href*='/jobs/view/']").evaluate_all(
             """
             (nodes) => {
+              const cleanLabel = (value) => (value || "")
+                .replace(/\\s+/g, " ")
+                .replace(/\\s+with verification$/i, "")
+                .trim();
+              const firstTextWithin = (container, selectors) => {
+                if (!container) {
+                  return "";
+                }
+                for (const selector of selectors) {
+                  const element = container.querySelector(selector);
+                  const text = cleanLabel(element?.innerText || element?.textContent || "");
+                  if (text) {
+                    return text;
+                  }
+                }
+                return "";
+              };
               const seen = new Set();
               const items = [];
 
@@ -1020,15 +1223,58 @@ class PlaywrightLinkedInJobsClient:
                 }
                 seen.add(href);
 
-                const container = node.closest("li") || node.closest("div");
+                const container = (
+                  node.closest(".job-card-container")
+                  || node.closest("[data-job-id]")
+                  || node.closest("li")
+                  || node.closest("div")
+                );
                 const lines = (container?.innerText || node.innerText || "")
                   .split("\\n")
-                  .map((item) => item.trim())
+                  .map((item) => cleanLabel(item))
                   .filter(Boolean);
 
-                const title = lines[0] || node.textContent?.trim() || "";
-                const companyName = lines[1] || "";
-                const location = lines[2] || null;
+                const title = cleanLabel(
+                  firstTextWithin(container, [
+                    ".job-card-list__title",
+                    ".artdeco-entity-lockup__title",
+                    ".job-card-container__link",
+                    "strong",
+                  ]) || lines[0] || node.textContent || ""
+                );
+                const companyLine = lines.find((line, index) => {
+                  if (index === 0 || cleanLabel(line) === title) {
+                    return false;
+                  }
+                  return !(
+                    /easy apply|applicants?|day[s]? ago|week[s]? ago|hour[s]? ago/i.test(line)
+                    || /with verification/i.test(line)
+                  );
+                }) || "";
+                const companyName = cleanLabel(
+                  firstTextWithin(container, [
+                    ".artdeco-entity-lockup__subtitle span",
+                    ".artdeco-entity-lockup__subtitle",
+                    ".job-card-container__primary-description",
+                    ".job-card-container__company-name",
+                  ]) || companyLine
+                );
+                const locationLine = lines.find((line, index) => {
+                  if (cleanLabel(line) === title || cleanLabel(line) === companyName) {
+                    return false;
+                  }
+                  return (
+                    /remote|hybrid|on-site|onsite|brazil|brasil/i.test(line)
+                    || /sao paulo|são paulo|latam|argentina|mexico|colombia/i.test(line)
+                  );
+                }) || "";
+                const location = cleanLabel(
+                  firstTextWithin(container, [
+                    ".job-card-container__metadata-item",
+                    ".artdeco-entity-lockup__caption",
+                    ".job-card-container__footer-item",
+                  ]) || locationLine
+                ) || null;
                 const externalMatch = href.match(/\\/jobs\\/view\\/(\\d+)/);
 
                 items.push({
@@ -1205,9 +1451,58 @@ class PlaywrightLinkedInJobsClient:
             await self._pause_before_navigation(detail_page, reason="job_detail_open")
             await detail_page.goto(listing.url, wait_until="domcontentloaded")
             await self._ensure_authenticated_page(detail_page)
+            await self._prepare_job_detail_page(detail_page)
             detail_payload = await detail_page.evaluate(
                 """
                 () => {
+                  const extractStructuredJobPosting = () => {
+                    const scripts = Array.from(
+                      document.querySelectorAll('script[type="application/ld+json"]')
+                    );
+                    const flatten = (value) => {
+                      if (!value) return [];
+                      if (Array.isArray(value)) return value.flatMap(flatten);
+                      if (typeof value === "object" && Array.isArray(value["@graph"])) {
+                        return value["@graph"].flatMap(flatten);
+                      }
+                      return [value];
+                    };
+                    for (const script of scripts) {
+                      try {
+                        const raw = JSON.parse(script.textContent || "");
+                        for (const item of flatten(raw)) {
+                          if (!item || typeof item !== "object") continue;
+                          const typeValue = item["@type"];
+                          const types = Array.isArray(typeValue) ? typeValue : [typeValue];
+                          if (!types.includes("JobPosting")) continue;
+                          const organization = item.hiringOrganization || {};
+                          const jobLocation = item.jobLocation || {};
+                          const address = jobLocation.address || {};
+                          return {
+                            structured_title: (item.title || "").trim(),
+                            structured_company_name: (
+                              organization.name
+                              || item.directApplyCompany
+                              || ""
+                            ).trim(),
+                            structured_location: (
+                              address.addressLocality
+                              || address.addressRegion
+                              || address.addressCountry
+                              || ""
+                            ).trim(),
+                          };
+                        }
+                      } catch (error) {
+                        continue;
+                      }
+                    }
+                    return {
+                      structured_title: "",
+                      structured_company_name: "",
+                      structured_location: "",
+                    };
+                  };
                   const firstText = (selectors) => {
                     for (const selector of selectors) {
                       const element = document.querySelector(selector);
@@ -1216,6 +1511,30 @@ class PlaywrightLinkedInJobsClient:
                       }
                     }
                     return "";
+                  };
+                  const collectTexts = (selectors) => {
+                    const values = [];
+                    for (const selector of selectors) {
+                      const nodes = document.querySelectorAll(selector);
+                      for (const node of nodes) {
+                        const text = (node.innerText || node.textContent || "")
+                          .replace(/\\s+/g, " ")
+                          .trim();
+                        if (text && !values.includes(text)) {
+                          values.push(text);
+                        }
+                      }
+                    }
+                    return values;
+                  };
+                  const firstNode = (selectors) => {
+                    for (const selector of selectors) {
+                      const node = document.querySelector(selector);
+                      if (node) {
+                        return node;
+                      }
+                    }
+                    return null;
                   };
 
                   const description = firstText([
@@ -1236,6 +1555,28 @@ class PlaywrightLinkedInJobsClient:
                     ".jobs-unified-top-card__company-name a",
                     ".jobs-unified-top-card__company-name",
                   ]);
+                  const topCard = firstNode([
+                    ".job-details-jobs-unified-top-card",
+                    ".jobs-unified-top-card",
+                    ".job-details-jobs-unified-top-card__container--two-pane",
+                    ".job-details-jobs-unified-top-card__container",
+                    ".jobs-search__job-details--container",
+                    "main",
+                  ]);
+                  const topCardLines = (topCard?.innerText || "")
+                    .split("\\n")
+                    .map((item) => item.replace(/\\s+/g, " ").trim())
+                    .filter(Boolean);
+                  const companyCandidates = collectTexts([
+                    ".job-details-jobs-unified-top-card__company-name a",
+                    ".job-details-jobs-unified-top-card__company-name",
+                    ".jobs-unified-top-card__company-name a",
+                    ".jobs-unified-top-card__company-name",
+                    ".job-details-jobs-unified-top-card__primary-description-container a",
+                    ".job-details-jobs-unified-top-card__primary-description-container span",
+                    ".jobs-unified-top-card__primary-description a",
+                    ".jobs-unified-top-card__primary-description span",
+                  ]);
                   const location = firstText([
                     ".job-details-jobs-unified-top-card__primary-description-container",
                     ".jobs-unified-top-card__primary-description",
@@ -1244,11 +1585,17 @@ class PlaywrightLinkedInJobsClient:
                   const bodyText = document.body ? document.body.innerText : "";
 
                   const documentTitle = (document.title || "").split("|")[0].trim();
+                  const structuredJob = extractStructuredJobPosting();
 
                   return {
                     title: title || documentTitle,
+                    structured_title: structuredJob.structured_title,
+                    title_candidates: [title, documentTitle, ...topCardLines.slice(0, 2)],
                     company_name: companyName,
-                    location,
+                    structured_company_name: structuredJob.structured_company_name,
+                    company_candidates: companyCandidates,
+                    location: location || structuredJob.structured_location,
+                    top_card_lines: topCardLines,
                     description_raw: description,
                     metadata_text: bodyText,
                     easy_apply: /easy apply/i.test(bodyText),
@@ -1260,8 +1607,9 @@ class PlaywrightLinkedInJobsClient:
                 "linkedin_job_detail_loaded",
                 {
                     "external_job_id": listing.external_job_id,
-                    "title": listing.title,
-                    "company_name": listing.company_name,
+                    "title": str(detail_payload.get("title") or "").strip() or listing.title,
+                    "company_name": str(detail_payload.get("company_name") or "").strip()
+                    or listing.company_name,
                     "url": listing.url,
                     "description_length": len(str(detail_payload["description_raw"] or "")),
                 },
@@ -1269,21 +1617,68 @@ class PlaywrightLinkedInJobsClient:
         finally:
             await detail_page.close()
 
-        detail_text = str(detail_payload["metadata_text"])
-        description_raw = str(detail_payload["description_raw"])
-        return LinkedInCollectedJob(
-            external_job_id=listing.external_job_id,
-            url=listing.url,
-            title=str(detail_payload.get("title") or "").strip() or listing.title,
-            company_name=str(detail_payload.get("company_name") or "").strip()
-            or listing.company_name,
-            location=str(detail_payload.get("location") or "").strip() or listing.location,
-            description_raw=description_raw or listing.description_raw,
-            easy_apply=listing.easy_apply or bool(detail_payload["easy_apply"]),
-            metadata_text=f"{listing.metadata_text} {detail_text}".strip(),
-            workplace_type=infer_workplace_type(detail_text) or listing.workplace_type,
-            seniority=infer_seniority(detail_text) or listing.seniority,
+        return merge_job_detail_payload(listing, detail_payload)
+
+    async def _load_job_details_with_resilience(
+        self,
+        context: BrowserContext,
+        listing: LinkedInCollectedJob,
+    ) -> LinkedInCollectedJob:
+        last_error: str | None = None
+        for attempt_index in range(2):
+            try:
+                return await self._load_job_details(context, listing)
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+                append_output_jsonl(
+                    "run.log",
+                    {
+                        "source": "linkedin_search",
+                        "kind": "job_detail_load_failed",
+                        "attempt_index": attempt_index,
+                        "external_job_id": listing.external_job_id,
+                        "title": listing.title,
+                        "company_name": listing.company_name,
+                        "url": listing.url,
+                        "message": last_error,
+                    },
+                )
+                append_timeline_event(
+                    "linkedin_job_detail_load_failed",
+                    {
+                        "attempt_index": attempt_index,
+                        "external_job_id": listing.external_job_id,
+                        "title": listing.title,
+                        "company_name": listing.company_name,
+                        "url": listing.url,
+                        "message": last_error,
+                    },
+                )
+                if attempt_index == 0:
+                    continue
+        logger.warning(
+            "linkedin_job_detail_fallback_to_listing",
+            extra={
+                "external_job_id": listing.external_job_id,
+                "title": listing.title,
+                "company_name": listing.company_name,
+                "url": listing.url,
+                "last_error": last_error,
+            },
         )
+        append_output_jsonl(
+            "run.log",
+            {
+                "source": "linkedin_search",
+                "kind": "job_detail_fallback_to_listing",
+                "external_job_id": listing.external_job_id,
+                "title": listing.title,
+                "company_name": listing.company_name,
+                "url": listing.url,
+                "message": last_error,
+            },
+        )
+        return listing
 
     async def _capture_debug_target_artifact(
         self,
@@ -1297,6 +1692,7 @@ class PlaywrightLinkedInJobsClient:
             await self._pause_before_navigation(detail_page, reason="debug_target_job_artifact")
             await detail_page.goto(target_url, wait_until="domcontentloaded")
             await self._ensure_authenticated_page(detail_page)
+            await self._prepare_job_detail_page(detail_page)
             await self._capture_screenshot(detail_page, run_dir / "debug-target-job.png")
         finally:
             await detail_page.close()
@@ -1332,6 +1728,21 @@ class PlaywrightLinkedInJobsClient:
         )
         logger.info("linkedin_navigation_delay", extra={"reason": reason, "delay_ms": delay_ms})
         await page.wait_for_timeout(delay_ms)
+
+    async def _prepare_job_detail_page(self, page: Page) -> None:
+        for selector in (
+            ".job-details-jobs-unified-top-card__job-title",
+            ".jobs-unified-top-card__job-title",
+            ".jobs-unified-top-card h1",
+            "h1",
+        ):
+            try:
+                await page.wait_for_selector(selector, state="visible", timeout=2_000)
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        await page.evaluate("window.scrollTo({ top: 0, behavior: 'instant' })")
+        await page.wait_for_timeout(300)
 
 
 def _workplace_option_name(workplace_type: WorkplaceType) -> str:

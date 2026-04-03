@@ -32,6 +32,7 @@ from job_applier.infrastructure.linkedin.search import (
     build_search_results_url,
     infer_seniority,
     infer_workplace_type,
+    merge_job_detail_payload,
 )
 from job_applier.infrastructure.sqlite import (
     SqliteJobPostingRepository,
@@ -538,6 +539,150 @@ def test_fetch_jobs_once_bypasses_search_when_debug_target_job_url_is_set(tmp_pa
         assert jobs[0].url == "https://www.linkedin.com/jobs/view/1234567890/"
         assert jobs[0].title == "Senior Python Engineer"
         assert jobs[0].easy_apply is True
+
+    asyncio.run(scenario())
+
+
+def test_merge_job_detail_payload_recovers_company_from_top_card_lines() -> None:
+    listing = LinkedInCollectedJob(
+        external_job_id="1234567890",
+        url="https://www.linkedin.com/jobs/view/1234567890/",
+        title="LinkedIn debug target",
+        company_name="LinkedIn debug target",
+        location=None,
+        description_raw="",
+        easy_apply=True,
+    )
+
+    merged = merge_job_detail_payload(
+        listing,
+        {
+            "title": "Product Manager",
+            "company_name": "",
+            "location": "",
+            "description_raw": "Lead product strategy.",
+            "metadata_text": "Product Manager Example Corp Sao Paulo, SP, Brazil",
+            "easy_apply": True,
+            "title_candidates": ["Product Manager", "Product Manager"],
+            "company_candidates": [],
+            "top_card_lines": (
+                "Product Manager",
+                "Example Corp",
+                "Sao Paulo, SP, Brazil",
+                "3 days ago",
+                "Over 100 applicants",
+            ),
+        },
+    )
+
+    assert merged.title == "Product Manager"
+    assert merged.company_name == "Example Corp"
+    assert merged.location == "Sao Paulo, SP, Brazil"
+
+
+def test_merge_job_detail_payload_ignores_premium_banner_when_recovering_company() -> None:
+    listing = LinkedInCollectedJob(
+        external_job_id="1234567890",
+        url="https://www.linkedin.com/jobs/view/1234567890/",
+        title="LinkedIn debug target",
+        company_name="LinkedIn debug target",
+        location=None,
+        description_raw="",
+        easy_apply=True,
+    )
+
+    merged = merge_job_detail_payload(
+        listing,
+        {
+            "title": "Product Manager",
+            "company_name": "",
+            "location": "",
+            "description_raw": "Lead product strategy.",
+            "metadata_text": "Product Manager Example Corp Sao Paulo, SP, Brazil",
+            "easy_apply": True,
+            "title_candidates": ["Product Manager"],
+            "company_candidates": [],
+            "top_card_lines": (
+                "Job search smarter with Premium",
+                "Product Manager",
+                "Example Corp",
+                "Sao Paulo, SP, Brazil",
+            ),
+        },
+    )
+
+    assert merged.company_name == "Example Corp"
+
+
+def test_merge_job_detail_payload_prefers_structured_job_posting_company() -> None:
+    listing = LinkedInCollectedJob(
+        external_job_id="1234567890",
+        url="https://www.linkedin.com/jobs/view/1234567890/",
+        title="LinkedIn debug target",
+        company_name="LinkedIn debug target",
+        location=None,
+        description_raw="",
+        easy_apply=True,
+    )
+
+    merged = merge_job_detail_payload(
+        listing,
+        {
+            "structured_title": "Product Manager",
+            "structured_company_name": "Payfy",
+            "title": "Product Manager",
+            "company_name": "",
+            "location": "",
+            "description_raw": "Lead product strategy.",
+            "metadata_text": "Product Manager Sao Paulo, SP, Brazil",
+            "easy_apply": True,
+            "title_candidates": ["Product Manager"],
+            "company_candidates": ["Message hiring managers with InMail"],
+            "top_card_lines": (
+                "Job search smarter with Premium",
+                "Product Manager",
+                "Message hiring managers with InMail",
+            ),
+        },
+    )
+
+    assert merged.company_name == "Payfy"
+
+
+def test_load_job_details_with_resilience_falls_back_to_listing_after_retries(
+    tmp_path: Path,
+) -> None:
+    runtime_settings = RuntimeSettings(data_dir=tmp_path)
+    client = PlaywrightLinkedInJobsClient(runtime_settings)
+    listing = LinkedInCollectedJob(
+        external_job_id="1234567890",
+        url="https://www.linkedin.com/jobs/view/1234567890/",
+        title="Senior Python Engineer",
+        company_name="Acme",
+        location="Remote",
+        description_raw="Easy Apply",
+        easy_apply=True,
+    )
+    attempts = {"count": 0}
+
+    async def scenario() -> None:
+        async def failing_loader(
+            context: BrowserContext,
+            current_listing: LinkedInCollectedJob,
+        ) -> LinkedInCollectedJob:
+            del context, current_listing
+            attempts["count"] += 1
+            raise PlaywrightTimeoutError("timed out")
+
+        client._load_job_details = failing_loader  # type: ignore[assignment]
+
+        recovered = await client._load_job_details_with_resilience(
+            cast(BrowserContext, object()),
+            listing,
+        )
+
+        assert attempts["count"] == 2
+        assert recovered == listing
 
     asyncio.run(scenario())
 
