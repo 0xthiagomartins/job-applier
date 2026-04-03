@@ -286,6 +286,7 @@ class AgentExecutionOrchestrator:
         job_submitter: JobSubmitter | None = None,
         output_dir: Path | None = None,
         max_selected_jobs_per_run: int | None = None,
+        test_minimum_score_threshold: float | None = None,
     ) -> None:
         self._panel_store = panel_store
         self._execution_store = execution_store
@@ -297,6 +298,11 @@ class AgentExecutionOrchestrator:
         self._output_dir = output_dir
         self._max_selected_jobs_per_run = (
             max(1, max_selected_jobs_per_run) if max_selected_jobs_per_run is not None else None
+        )
+        self._test_minimum_score_threshold = (
+            min(1.0, max(0.0, test_minimum_score_threshold))
+            if test_minimum_score_threshold is not None
+            else None
         )
 
     async def run_execution(self, *, origin: ExecutionOrigin) -> ExecutionRunSummary:
@@ -367,6 +373,36 @@ class AgentExecutionOrchestrator:
             )
             logger.exception("agent_execution_failed", extra={"execution_id": str(execution_id)})
             return summary
+
+        if self._test_minimum_score_threshold is not None:
+            original_threshold = settings.search.minimum_score_threshold
+            settings = settings.model_copy(
+                update={
+                    "search": settings.search.model_copy(
+                        update={
+                            "minimum_score_threshold": self._test_minimum_score_threshold,
+                        }
+                    )
+                }
+            )
+            append_timeline_event(
+                "test_mode_score_threshold_override_applied",
+                {
+                    "execution_id": str(execution_id),
+                    "original_threshold": original_threshold,
+                    "effective_threshold": self._test_minimum_score_threshold,
+                },
+            )
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "agent_execution",
+                    "kind": "test_mode_score_threshold_override_applied",
+                    "execution_id": str(execution_id),
+                    "original_threshold": original_threshold,
+                    "effective_threshold": self._test_minimum_score_threshold,
+                },
+            )
 
         update_progress_snapshot(
             {
@@ -482,6 +518,13 @@ class AgentExecutionOrchestrator:
             except Exception as exc:  # noqa: BLE001
                 latest_error = str(exc)
                 error_count += 1
+                summary = self._persist_running_summary(
+                    summary,
+                    jobs_selected=jobs_selected,
+                    successful_submissions=successful_submissions,
+                    error_count=error_count,
+                    last_error=latest_error,
+                )
                 self._emit_event(
                     execution_id=execution_id,
                     event_type=ExecutionEventType.EXECUTION_FAILED,
@@ -534,6 +577,13 @@ class AgentExecutionOrchestrator:
                 continue
 
             jobs_selected += 1
+            summary = self._persist_running_summary(
+                summary,
+                jobs_selected=jobs_selected,
+                successful_submissions=successful_submissions,
+                error_count=error_count,
+                last_error=latest_error,
+            )
             update_progress_snapshot(
                 {
                     "status": "running",
@@ -619,6 +669,13 @@ class AgentExecutionOrchestrator:
             except Exception as exc:  # noqa: BLE001
                 latest_error = str(exc)
                 error_count += 1
+                summary = self._persist_running_summary(
+                    summary,
+                    jobs_selected=jobs_selected,
+                    successful_submissions=successful_submissions,
+                    error_count=error_count,
+                    last_error=latest_error,
+                )
                 self._emit_event(
                     execution_id=execution_id,
                     event_type=ExecutionEventType.EXECUTION_FAILED,
@@ -699,6 +756,13 @@ class AgentExecutionOrchestrator:
             if submission.status is SubmissionStatus.FAILED:
                 latest_error = submission.notes or "Submission failed."
                 error_count += 1
+                summary = self._persist_running_summary(
+                    summary,
+                    jobs_selected=jobs_selected,
+                    successful_submissions=successful_submissions,
+                    error_count=error_count,
+                    last_error=latest_error,
+                )
                 self._emit_event(
                     execution_id=execution_id,
                     event_type=ExecutionEventType.EXECUTION_FAILED,
@@ -746,6 +810,13 @@ class AgentExecutionOrchestrator:
             )
             self._successful_submission_store.save(record)
             successful_submissions += 1
+            summary = self._persist_running_summary(
+                summary,
+                jobs_selected=jobs_selected,
+                successful_submissions=successful_submissions,
+                error_count=error_count,
+                last_error=latest_error,
+            )
             self._emit_event(
                 execution_id=execution_id,
                 submission_id=record.submission.id,
@@ -1013,3 +1084,25 @@ class AgentExecutionOrchestrator:
         if self._output_dir is None:
             return
         write_output_json("summary.json", summary.model_dump(mode="json"))
+
+    def _persist_running_summary(
+        self,
+        summary: ExecutionRunSummary,
+        *,
+        jobs_selected: int,
+        successful_submissions: int,
+        error_count: int,
+        last_error: str | None,
+    ) -> ExecutionRunSummary:
+        running_summary = summary.model_copy(
+            update={
+                "status": AgentExecutionStatus.RUNNING,
+                "jobs_selected": jobs_selected,
+                "successful_submissions": successful_submissions,
+                "error_count": error_count,
+                "last_error": last_error,
+            },
+        )
+        self._execution_store.save_execution(running_summary)
+        self._persist_run_summary(running_summary)
+        return running_summary

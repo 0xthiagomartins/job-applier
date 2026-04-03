@@ -1,10 +1,12 @@
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from uuid import uuid4
 
 import pytest
 from playwright.async_api import Locator, Page, async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import AnyUrl, SecretStr, TypeAdapter
 
 from job_applier.application.config import (
@@ -40,12 +42,17 @@ from job_applier.infrastructure.linkedin.browser_agent import (
     OpenAIResponsesBrowserAgent,
 )
 from job_applier.infrastructure.linkedin.easy_apply import (
+    ControlValidationState,
     EasyApplyStep,
+    LinkedInEasyApplyError,
     PlaywrightLinkedInEasyApplyExecutor,
     TextFieldInteractionState,
     _pick_option_index,
     _pick_resume_option_index,
     _step_surface_changed,
+)
+from job_applier.infrastructure.linkedin.question_resolution import (
+    field_has_meaningful_current_value,
 )
 from job_applier.settings import RuntimeSettings
 
@@ -218,6 +225,20 @@ def test_question_classifier_assigns_phone_country_code_key_for_portuguese_label
     assert classification.matched_rule == "phone_country_code"
 
 
+def test_question_classifier_recognizes_binary_language_comfort_question() -> None:
+    classifier = LinkedInQuestionClassifier()
+
+    classification = classifier.classify(
+        question_raw="Você se sente confortável trabalhando em um ambiente onde se fala inglês?",
+        control_kind="text",
+        input_type="text",
+        options=(),
+    )
+
+    assert classification.question_type is QuestionType.YES_NO_GENERIC
+    assert classification.matched_rule == "yes_no_generic"
+
+
 def test_pick_option_index_skips_placeholder_entries() -> None:
     options = ("Select an option", "Yes", "No")
 
@@ -231,6 +252,22 @@ def test_pick_option_index_matches_localized_yes_no_options() -> None:
 
     assert _pick_option_index(options, preferred="Yes") == 1
     assert _pick_option_index(options, preferred="No") == 2
+
+
+def test_prefilled_placeholder_select_is_not_treated_as_preserved() -> None:
+    field = EasyApplyField(
+        question_raw="English proficiency",
+        normalized_key="english_proficiency",
+        question_type=QuestionType.UNKNOWN,
+        control_kind="select",
+        input_type="select",
+        required=True,
+        prefilled=True,
+        current_value="Select an option",
+        options=("Select an option", "Basic", "Advanced"),
+    )
+
+    assert field_has_meaningful_current_value(field) is False
 
 
 def test_answer_resolver_respects_priority_chain_and_prefilled_fields() -> None:
@@ -341,6 +378,132 @@ def test_answer_resolver_uses_ai_for_ambiguous_questions() -> None:
     assert answer.fill_strategy is FillStrategy.AUTOFILL_AI
     assert answer.ambiguity_flag is True
     assert answer.reasoning == "matched user preference"
+
+
+def test_answer_resolver_uses_binary_guardrail_for_language_comfort_question() -> None:
+    settings = build_user_agent_settings()
+    posting = build_posting()
+    resolver = LinkedInAnswerResolver(
+        ambiguous_answer_generator=NoopGenerator(),
+    )
+    field = EasyApplyField(
+        question_raw="Você se sente confortável trabalhando em um ambiente onde se fala inglês?",
+        normalized_key="english_comfort",
+        question_type=QuestionType.YES_NO_GENERIC,
+        control_kind="text",
+        input_type="text",
+    )
+
+    answer = asyncio.run(resolver.resolve(field, settings, posting=posting))
+
+    assert answer is not None
+    assert answer.value == "Yes"
+    assert answer.reasoning == "typed_guardrail_binary"
+
+
+def test_answer_resolver_rejects_target_company_as_current_employer_answer() -> None:
+    settings = build_user_agent_settings()
+    posting = build_posting()
+
+    class TargetCompanyGenerator:
+        async def generate(
+            self,
+            *,
+            field: EasyApplyField,
+            settings: UserAgentSettings,
+            posting: JobPosting,
+        ) -> GeneratedAnswer | None:
+            del field, settings, posting
+            return GeneratedAnswer(
+                value="Acme",
+                confidence=0.74,
+                reasoning="guessed_from_target_company",
+            )
+
+    resolver = LinkedInAnswerResolver(
+        ambiguous_answer_generator=TargetCompanyGenerator(),
+    )
+    field = EasyApplyField(
+        question_raw="Confirm the name of the company where you work",
+        normalized_key="confirm_current_company_name",
+        question_type=QuestionType.FREE_TEXT_GENERIC,
+        control_kind="text",
+        input_type="text",
+    )
+
+    answer = asyncio.run(resolver.resolve(field, settings, posting=posting))
+
+    assert answer is not None
+    assert answer.value == "Freelancer"
+    assert answer.answer_source is AnswerSource.BEST_EFFORT_AUTOFILL
+    assert answer.reasoning == "guardrail_unknown_current_employer"
+
+
+def test_answer_resolver_uses_conservative_guardrail_for_language_proficiency_options() -> None:
+    settings = build_user_agent_settings()
+    posting = build_posting()
+    resolver = LinkedInAnswerResolver(
+        ambiguous_answer_generator=NoopGenerator(),
+    )
+    field = EasyApplyField(
+        question_raw="English proficiency",
+        normalized_key="english_proficiency",
+        question_type=QuestionType.UNKNOWN,
+        control_kind="select",
+        input_type="select",
+        options=("Select an option", "Beginner", "Intermediate II", "Advanced"),
+    )
+
+    answer = asyncio.run(resolver.resolve(field, settings, posting=posting))
+
+    assert answer is not None
+    assert answer.value == "Intermediate II"
+    assert answer.answer_source is AnswerSource.BEST_EFFORT_AUTOFILL
+    assert answer.reasoning == "guardrail_conservative_language_proficiency"
+
+
+def test_answer_resolver_uses_opt_out_for_sensitive_questions_when_available() -> None:
+    settings = build_user_agent_settings()
+    posting = build_posting()
+    resolver = LinkedInAnswerResolver(
+        ambiguous_answer_generator=NoopGenerator(),
+    )
+    field = EasyApplyField(
+        question_raw="Gender identity",
+        normalized_key="gender_identity",
+        question_type=QuestionType.UNKNOWN,
+        control_kind="select",
+        input_type="select",
+        options=("Select an option", "Woman", "Man", "Prefer not to say"),
+    )
+
+    answer = asyncio.run(resolver.resolve(field, settings, posting=posting))
+
+    assert answer is not None
+    assert answer.value == "Prefer not to say"
+    assert answer.answer_source is AnswerSource.BEST_EFFORT_AUTOFILL
+    assert answer.fill_strategy is FillStrategy.BEST_EFFORT
+    assert answer.reasoning == "sensitive_question_opt_out"
+
+
+def test_answer_resolver_leaves_sensitive_questions_unanswered_without_opt_out() -> None:
+    settings = build_user_agent_settings()
+    posting = build_posting()
+    resolver = LinkedInAnswerResolver(
+        ambiguous_answer_generator=SuccessfulGenerator(),
+    )
+    field = EasyApplyField(
+        question_raw="Do you identify as a person with disability?",
+        normalized_key="person_with_disability",
+        question_type=QuestionType.UNKNOWN,
+        control_kind="radio",
+        input_type="radio",
+        options=("Yes", "No"),
+    )
+
+    answer = asyncio.run(resolver.resolve(field, settings, posting=posting))
+
+    assert answer is None
 
 
 def test_answer_resolver_resolves_phone_country_code_for_brazilian_profile() -> None:
@@ -625,6 +788,25 @@ def test_inspect_text_field_interaction_detects_nearby_combobox_options() -> Non
                 assert state.needs_agentic_follow_up is True
             finally:
                 await browser.close()
+
+    asyncio.run(scenario())
+
+
+def test_inspect_text_field_interaction_raises_domain_error_on_locator_timeout() -> None:
+    async def scenario() -> None:
+        executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
+
+        class SlowLocator:
+            async def evaluate(
+                self,
+                expression: str,
+                timeout: int | None = None,
+            ) -> dict[str, object]:
+                del expression, timeout
+                raise PlaywrightTimeoutError("locator inspection timed out")
+
+        with pytest.raises(LinkedInEasyApplyError, match="Timed out while inspecting"):
+            await executor._inspect_text_field_interaction(cast(Locator, SlowLocator()))
 
     asyncio.run(scenario())
 
@@ -927,6 +1109,250 @@ def test_retry_invalid_fields_uses_fresh_answer_resolution_for_remediation() -> 
     asyncio.run(scenario())
 
 
+def test_retry_invalid_field_prefers_fresh_resolution_when_selection_is_required() -> None:
+    async def scenario() -> None:
+        settings = build_user_agent_settings()
+        posting = build_posting()
+        field = EasyApplyField(
+            question_raw=(
+                "Você se sente confortável trabalhando em um ambiente onde se fala inglês?"
+            ),
+            normalized_key="english_comfort",
+            question_type=QuestionType.YES_NO_GENERIC,
+            control_kind="text",
+            input_type="text",
+            required=True,
+        )
+        step = EasyApplyStep(step_index=0, total_steps=1, fields=(field,))
+        captured: dict[str, str] = {}
+
+        class FakeResolver:
+            async def resolve(
+                self,
+                field: EasyApplyField,
+                settings: UserAgentSettings,
+                *,
+                posting: JobPosting,
+            ) -> ResolvedFieldValue | None:
+                del field, settings, posting
+                return ResolvedFieldValue(
+                    value="Yes",
+                    answer_source=AnswerSource.AI,
+                    fill_strategy=FillStrategy.AUTOFILL_AI,
+                    ambiguity_flag=True,
+                    confidence=0.72,
+                    reasoning="selection_required_refresh",
+                )
+
+        class ExecutorDouble(PlaywrightLinkedInEasyApplyExecutor):
+            def __init__(self) -> None:
+                pass
+
+            async def _easy_apply_modal_visible(self, page: Page) -> bool:
+                del page
+                return True
+
+            async def _extract_step(
+                self,
+                page: Page,
+                *,
+                last_known_step_index: int,
+                last_known_total_steps: int,
+            ) -> EasyApplyStep:
+                del page, last_known_step_index, last_known_total_steps
+                return step
+
+            async def _easy_apply_root(self, page: Page) -> Locator:
+                del page
+                return cast(Locator, object())
+
+            async def _find_control_locator(
+                self,
+                root: Locator,
+                easy_apply_field: EasyApplyField,
+            ) -> Locator | None:
+                del root, easy_apply_field
+                return cast(Locator, object())
+
+            async def _inspect_text_field_interaction(
+                self,
+                locator: Locator,
+            ) -> TextFieldInteractionState:
+                del locator
+                return TextFieldInteractionState(
+                    current_value="",
+                    focused=True,
+                    role="combobox",
+                    aria_autocomplete="list",
+                    aria_expanded=False,
+                    has_popup_binding=False,
+                    active_descendant=None,
+                    visible_option_count=0,
+                    invalid=True,
+                    validation_message="Please make a selection",
+                )
+
+            async def _complete_text_field_interaction(
+                self,
+                *,
+                page: Page,
+                field: EasyApplyField,
+                target_value: str,
+                settings: UserAgentSettings,
+            ) -> str:
+                del page, field, settings
+                captured["target_value"] = target_value
+                return target_value
+
+        executor = ExecutorDouble()
+        executor._answer_resolver = cast(LinkedInAnswerResolver, FakeResolver())
+        executor._runtime_settings = cast(
+            RuntimeSettings,
+            SimpleNamespace(linkedin_field_interaction_timeout_seconds=1),
+        )
+
+        await executor._retry_invalid_fields_after_primary_action(
+            page=cast(Page, object()),
+            settings=settings,
+            posting=posting,
+            execution_id=uuid4(),
+            submission_id=uuid4(),
+            execution_events=[],
+            previous_step=step,
+            step_answers=(
+                ApplicationAnswer(
+                    submission_id=uuid4(),
+                    step_index=0,
+                    question_raw=field.question_raw,
+                    question_type=field.question_type,
+                    normalized_key=field.normalized_key,
+                    answer_raw="Sim, me sinto confortável em ambientes profissionais.",
+                    answer_source=AnswerSource.AI,
+                    fill_strategy=FillStrategy.AUTOFILL_AI,
+                    ambiguity_flag=True,
+                ),
+            ),
+        )
+
+        assert captured["target_value"] == "Yes"
+
+    asyncio.run(scenario())
+
+
+def test_retry_invalid_select_field_reapplies_visible_option_with_fresh_resolution() -> None:
+    async def scenario() -> None:
+        settings = build_user_agent_settings()
+        posting = build_posting()
+        field = EasyApplyField(
+            question_raw="English proficiency",
+            normalized_key="english_proficiency",
+            question_type=QuestionType.UNKNOWN,
+            control_kind="select",
+            input_type="select",
+            required=True,
+            options=("Select an option", "Basic", "Intermediate II", "Advanced"),
+        )
+        step = EasyApplyStep(step_index=0, total_steps=1, fields=(field,))
+        captured: dict[str, str] = {}
+
+        class FakeResolver:
+            async def resolve(
+                self,
+                field: EasyApplyField,
+                settings: UserAgentSettings,
+                *,
+                posting: JobPosting,
+            ) -> ResolvedFieldValue | None:
+                del field, settings, posting
+                return ResolvedFieldValue(
+                    value="Intermediate II",
+                    answer_source=AnswerSource.AI,
+                    fill_strategy=FillStrategy.AUTOFILL_AI,
+                    ambiguity_flag=True,
+                    confidence=0.71,
+                    reasoning="conservative_language_choice",
+                )
+
+        class ExecutorDouble(PlaywrightLinkedInEasyApplyExecutor):
+            def __init__(self) -> None:
+                pass
+
+            async def _easy_apply_modal_visible(self, page: Page) -> bool:
+                del page
+                return True
+
+            async def _extract_step(
+                self,
+                page: Page,
+                *,
+                last_known_step_index: int,
+                last_known_total_steps: int,
+            ) -> EasyApplyStep:
+                del page, last_known_step_index, last_known_total_steps
+                return step
+
+            async def _easy_apply_root(self, page: Page) -> Locator:
+                del page
+                return cast(Locator, object())
+
+            async def _find_control_locator(
+                self,
+                root: Locator,
+                easy_apply_field: EasyApplyField,
+            ) -> Locator | None:
+                del root, easy_apply_field
+                return cast(Locator, object())
+
+            async def _inspect_control_validation_state(
+                self,
+                locator: Locator,
+            ) -> ControlValidationState:
+                del locator
+                return ControlValidationState(
+                    invalid=True,
+                    validation_message="Please select an option",
+                    current_value="Select an option",
+                )
+
+            async def _apply_field_value(
+                self,
+                page: Page,
+                root: Locator,
+                field: EasyApplyField,
+                resolution: ResolvedFieldValue,
+                settings: UserAgentSettings,
+                *,
+                submission_cv_path: Path | None,
+            ) -> str | None:
+                del page, root, field, settings, submission_cv_path
+                captured["value"] = resolution.value
+                captured["reasoning"] = resolution.reasoning or ""
+                return resolution.value
+
+        executor = ExecutorDouble()
+        executor._answer_resolver = cast(LinkedInAnswerResolver, FakeResolver())
+        executor._runtime_settings = cast(
+            RuntimeSettings,
+            SimpleNamespace(linkedin_field_interaction_timeout_seconds=1),
+        )
+
+        await executor._retry_invalid_fields_after_primary_action(
+            page=cast(Page, object()),
+            settings=settings,
+            posting=posting,
+            execution_id=uuid4(),
+            submission_id=uuid4(),
+            execution_events=[],
+            previous_step=step,
+            step_answers=(),
+        )
+
+        assert captured["value"] == "Intermediate II"
+        assert captured["reasoning"] == "conservative_language_choice"
+
+    asyncio.run(scenario())
+
+
 def test_step_surface_changed_detects_new_fields_without_counter_change() -> None:
     previous_step = EasyApplyStep(
         step_index=0,
@@ -962,6 +1388,208 @@ def test_step_surface_changed_detects_new_fields_without_counter_change() -> Non
     )
 
     assert _step_surface_changed(previous_step, current_step) is True
+
+
+def test_set_checkbox_state_falls_back_to_clickable_label_surface() -> None:
+    async def scenario() -> None:
+        executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
+
+        class EmptyLocator:
+            async def count(self) -> int:
+                return 0
+
+        class CheckboxLocator:
+            def __init__(self) -> None:
+                self.checked = False
+
+            async def is_checked(self) -> bool:
+                return self.checked
+
+            async def check(self, timeout: int | None = None) -> None:
+                del timeout
+                raise RuntimeError("input surface intercepted")
+
+            async def uncheck(self, timeout: int | None = None) -> None:
+                del timeout
+                raise RuntimeError("input surface intercepted")
+
+            async def get_attribute(self, name: str) -> str | None:
+                if name == "id":
+                    return "consent"
+                return None
+
+            def locator(self, selector: str) -> EmptyLocator:
+                del selector
+                return EmptyLocator()
+
+            async def evaluate(
+                self,
+                expression: str,
+                payload: dict[str, object],
+            ) -> bool:
+                del expression
+                self.checked = bool(payload["desiredChecked"])
+                return self.checked
+
+        class LabelLocator:
+            def __init__(self, checkbox: CheckboxLocator) -> None:
+                self._checkbox = checkbox
+
+            async def click(self, timeout: int | None = None) -> None:
+                del timeout
+                self._checkbox.checked = not self._checkbox.checked
+
+        class LabelQuery:
+            def __init__(self, checkbox: CheckboxLocator) -> None:
+                self.first = LabelLocator(checkbox)
+                self._checkbox = checkbox
+
+            async def count(self) -> int:
+                return 1
+
+        class RootLocator:
+            def __init__(self, checkbox: CheckboxLocator) -> None:
+                self._checkbox = checkbox
+
+            def locator(self, selector: str) -> LabelQuery:
+                assert selector == 'label[for="consent"]'
+                return LabelQuery(self._checkbox)
+
+        checkbox = CheckboxLocator()
+        root = RootLocator(checkbox)
+
+        checked = await executor._set_checkbox_state(
+            cast(Locator, root),
+            cast(Locator, checkbox),
+            desired_checked=True,
+        )
+        unchecked = await executor._set_checkbox_state(
+            cast(Locator, root),
+            cast(Locator, checkbox),
+            desired_checked=False,
+        )
+
+        assert checked is True
+        assert unchecked is True
+        assert checkbox.checked is False
+
+    asyncio.run(scenario())
+
+
+def test_apply_field_value_uses_agentic_checkbox_fallback_when_direct_toggle_fails() -> None:
+    async def scenario() -> None:
+        executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
+        settings = build_user_agent_settings()
+        field = EasyApplyField(
+            question_raw="I consent to the processing of my data",
+            normalized_key="consent_processing_data",
+            question_type=QuestionType.UNKNOWN,
+            control_kind="checkbox",
+            input_type="checkbox",
+        )
+        resolution = ResolvedFieldValue(
+            value="Yes",
+            answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
+            fill_strategy=FillStrategy.BEST_EFFORT,
+        )
+        checkbox = cast(Locator, object())
+
+        async def fake_find_control_locator(
+            root: Locator,
+            easy_apply_field: EasyApplyField,
+        ) -> Locator:
+            del root, easy_apply_field
+            return checkbox
+
+        async def fake_set_checkbox_state(
+            root: Locator,
+            locator: Locator,
+            *,
+            desired_checked: bool,
+        ) -> bool:
+            del root, locator, desired_checked
+            return False
+
+        async def fake_complete_checkbox_interaction(
+            *,
+            page: Page,
+            field: EasyApplyField,
+            settings: UserAgentSettings,
+            desired_checked: bool,
+        ) -> bool:
+            del page, field, settings
+            return desired_checked
+
+        executor.__dict__["_find_control_locator"] = fake_find_control_locator
+        executor.__dict__["_set_checkbox_state"] = fake_set_checkbox_state
+        executor.__dict__["_complete_checkbox_interaction"] = fake_complete_checkbox_interaction
+
+        applied = await executor._apply_field_value(
+            cast(Page, object()),
+            cast(Locator, object()),
+            field,
+            resolution,
+            settings,
+            submission_cv_path=None,
+        )
+
+        assert applied == "Yes"
+
+    asyncio.run(scenario())
+
+
+def test_apply_field_value_uses_agentic_radio_fallback_when_direct_selection_fails() -> None:
+    async def scenario() -> None:
+        executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
+        settings = build_user_agent_settings()
+        field = EasyApplyField(
+            question_raw="English comfort",
+            normalized_key="english_comfort",
+            question_type=QuestionType.YES_NO_GENERIC,
+            control_kind="radio",
+            input_type="radio",
+            options=("Yes", "No"),
+        )
+        resolution = ResolvedFieldValue(
+            value="Yes",
+            answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
+            fill_strategy=FillStrategy.BEST_EFFORT,
+        )
+
+        async def fake_check_radio_option(
+            root: Locator,
+            easy_apply_field: EasyApplyField,
+            option: str,
+        ) -> bool:
+            del root, easy_apply_field, option
+            return False
+
+        async def fake_complete_radio_interaction(
+            *,
+            page: Page,
+            field: EasyApplyField,
+            option_index: int,
+            option_label: str,
+            settings: UserAgentSettings,
+        ) -> bool:
+            del page, field, option_index, settings
+            return option_label == "Yes"
+
+        executor.__dict__["_check_radio_option"] = fake_check_radio_option
+        executor.__dict__["_complete_radio_interaction"] = fake_complete_radio_interaction
+
+        applied = await executor._apply_field_value(
+            cast(Page, object()),
+            cast(Locator, object()),
+            field,
+            resolution,
+            settings,
+            submission_cv_path=None,
+        )
+
+        assert applied == "Yes"
+
+    asyncio.run(scenario())
 
 
 class SuccessfulGenerator:

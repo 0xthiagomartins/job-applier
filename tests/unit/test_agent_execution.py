@@ -1,6 +1,7 @@
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from job_applier.application.agent_execution import (
@@ -302,6 +303,71 @@ def test_orchestrator_test_limit_stops_after_first_selected_job(tmp_path: Path) 
     )
 
 
+def test_orchestrator_can_override_score_threshold_in_test_mode(tmp_path: Path) -> None:
+    panel_store = build_ready_panel_store(tmp_path / "panel")
+    execution_store = LocalExecutionStore(root_dir=tmp_path / "executions")
+    submission_store = InMemorySuccessfulSubmissionStore()
+
+    posting = JobPosting(
+        platform=Platform.LINKEDIN,
+        url="https://www.linkedin.com/jobs/view/test-threshold",
+        title="Automation Engineer",
+        company_name="Acme",
+        description_raw="Python automation with FastAPI.",
+    )
+
+    class FakeFetcher(JobFetcher):
+        async def fetch(self, settings):
+            del settings
+            return [posting]
+
+    class ThresholdAwareScorer(JobScorer):
+        async def score(self, settings, posting):
+            selected = settings.search.minimum_score_threshold <= 0.5
+            score = 0.5
+            reason = (
+                "accepted in test mode override" if selected else "Rejected with score 0.50 < 0.55"
+            )
+            return ScoredJobPosting(
+                posting=posting,
+                selected=selected,
+                score=score,
+                reason=reason,
+            )
+
+    class FakeSubmitter(JobSubmitter):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def submit(self, settings, posting, *, execution_id, origin):
+            del settings, execution_id
+            self.calls.append(posting.title)
+            return SubmissionAttempt(
+                submission=ApplicationSubmission(
+                    job_posting_id=posting.id,
+                    execution_origin=origin,
+                ),
+            )
+
+    submitter = FakeSubmitter()
+    orchestrator = AgentExecutionOrchestrator(
+        panel_store=panel_store,
+        execution_store=execution_store,
+        successful_submission_store=submission_store,
+        job_fetcher=FakeFetcher(),
+        job_scorer=ThresholdAwareScorer(),
+        job_submitter=submitter,
+        test_minimum_score_threshold=0.5,
+    )
+
+    summary = asyncio.run(orchestrator.run_execution(origin=ExecutionOrigin.MANUAL))
+    assert summary.status is AgentExecutionStatus.COMPLETED
+    assert summary.jobs_seen == 1
+    assert summary.jobs_selected == 1
+    assert summary.successful_submissions == 1
+    assert submitter.calls == ["Automation Engineer"]
+
+
 def test_orchestrator_skips_already_applied_jobs_before_submit(tmp_path: Path) -> None:
     panel_store = build_ready_panel_store(tmp_path / "panel")
     execution_store = LocalExecutionStore(root_dir=tmp_path / "executions")
@@ -404,6 +470,98 @@ def test_orchestrator_skips_already_applied_jobs_before_submit(tmp_path: Path) -
         event["event_type"] == ExecutionEventType.JOB_PROCESSED.value
         and '"status": "skipped"' in event["payload_json"]
         for event in events
+    )
+
+
+def test_orchestrator_persists_running_summary_updates_during_execution(tmp_path: Path) -> None:
+    panel_store = build_ready_panel_store(tmp_path / "panel")
+    execution_store = LocalExecutionStore(root_dir=tmp_path / "executions")
+    submission_store = InMemorySuccessfulSubmissionStore()
+
+    postings = [
+        JobPosting(
+            platform=Platform.LINKEDIN,
+            url="https://www.linkedin.com/jobs/view/1",
+            title="Python Engineer",
+            company_name="Acme",
+            description_raw="Python automation.",
+        ),
+        JobPosting(
+            platform=Platform.LINKEDIN,
+            url="https://www.linkedin.com/jobs/view/2",
+            title="Automation Engineer",
+            company_name="Beta",
+            description_raw="Workflow automation.",
+        ),
+    ]
+
+    class FakeFetcher(JobFetcher):
+        async def fetch(self, settings):
+            del settings
+            return postings
+
+    class FakeScorer(JobScorer):
+        async def score(self, settings, posting):
+            del settings
+            return ScoredJobPosting(posting=posting, selected=True, score=0.91, reason="accepted")
+
+    class FakeSubmitter(JobSubmitter):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def submit(self, settings, posting, *, execution_id, origin):
+            del settings, posting, execution_id
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("submit failure on second posting")
+            return SubmissionAttempt(
+                submission=ApplicationSubmission(
+                    job_posting_id=postings[0].id,
+                    execution_origin=origin,
+                ),
+            )
+
+    class RecordingOrchestrator(AgentExecutionOrchestrator):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.persisted_summaries: list[ExecutionRunSummary] = []
+
+        def _persist_run_summary(self, summary: ExecutionRunSummary) -> None:
+            self.persisted_summaries.append(summary)
+
+    orchestrator = RecordingOrchestrator(
+        panel_store=panel_store,
+        execution_store=execution_store,
+        successful_submission_store=submission_store,
+        job_fetcher=FakeFetcher(),
+        job_scorer=FakeScorer(),
+        job_submitter=FakeSubmitter(),
+    )
+
+    summary = asyncio.run(orchestrator.run_execution(origin=ExecutionOrigin.MANUAL))
+
+    assert summary.status is AgentExecutionStatus.COMPLETED
+    assert any(
+        persisted.status is AgentExecutionStatus.RUNNING
+        and persisted.jobs_selected == 1
+        and persisted.successful_submissions == 0
+        and persisted.error_count == 0
+        for persisted in orchestrator.persisted_summaries
+    )
+    assert any(
+        persisted.status is AgentExecutionStatus.RUNNING
+        and persisted.jobs_selected == 1
+        and persisted.successful_submissions == 1
+        and persisted.error_count == 0
+        for persisted in orchestrator.persisted_summaries
+    )
+    assert any(
+        persisted.status is AgentExecutionStatus.RUNNING
+        and persisted.jobs_selected == 2
+        and persisted.successful_submissions == 1
+        and persisted.error_count == 1
+        and persisted.last_error == "submit failure on second posting"
+        for persisted in orchestrator.persisted_summaries
     )
 
 

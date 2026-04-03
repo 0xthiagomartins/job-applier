@@ -16,7 +16,15 @@ from pathlib import Path
 from typing import Protocol
 from uuid import UUID, uuid4
 
-from playwright.async_api import BrowserContext, Locator, Page, async_playwright
+from playwright.async_api import (
+    BrowserContext,
+    Locator,
+    Page,
+    async_playwright,
+)
+from playwright.async_api import (
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 from job_applier.application.agent_execution import JobSubmitter, SubmissionAttempt
 from job_applier.application.config import UserAgentSettings
@@ -42,9 +50,11 @@ from job_applier.domain.entities import (
     utc_now,
 )
 from job_applier.domain.enums import (
+    AnswerSource,
     ArtifactType,
     ExecutionEventType,
     ExecutionOrigin,
+    FillStrategy,
     QuestionType,
     SubmissionStatus,
 )
@@ -67,6 +77,7 @@ from job_applier.infrastructure.linkedin.question_resolution import (
     ResolvedFieldValue,
     _profile_first_name,
     _profile_last_name,
+    field_has_meaningful_current_value,
     normalize_text,
 )
 from job_applier.infrastructure.linkedin.recruiter_connect import (
@@ -82,6 +93,8 @@ from job_applier.observability import (
 from job_applier.settings import RuntimeSettings
 
 logger = logging.getLogger(__name__)
+
+_FIELD_STATE_INSPECTION_TIMEOUT_MS = 5_000
 
 
 class LinkedInEasyApplyError(RuntimeError):
@@ -158,6 +171,15 @@ class TextFieldInteractionState:
                 )
             )
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ControlValidationState:
+    """Validation snapshot for non-text Easy Apply controls."""
+
+    invalid: bool
+    validation_message: str | None = None
+    current_value: str = ""
 
 
 def _field_debug_summary(field: EasyApplyField) -> dict[str, object]:
@@ -915,7 +937,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
             if resolution is None:
                 stage = (
                     "easy_apply_field_preserved"
-                    if field.prefilled and field.current_value.strip()
+                    if field.prefilled and field_has_meaningful_current_value(field)
                     else "easy_apply_field_unresolved"
                 )
                 self._record_event(
@@ -1076,6 +1098,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
             case "select":
                 if field.question_type is QuestionType.RESUME_UPLOAD:
                     return await self._apply_resume_choice_field(
+                        page=page,
                         root=root,
                         field=field,
                         settings=settings,
@@ -1099,6 +1122,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
             case "checkbox":
                 if field.question_type is QuestionType.RESUME_UPLOAD:
                     return await self._apply_resume_choice_field(
+                        page=page,
                         root=root,
                         field=field,
                         settings=settings,
@@ -1108,16 +1132,25 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 if locator is None:
                     return None
                 should_check = normalize_text(resolution.value) in {"yes", "true", "1"}
-                if (await locator.is_checked()) == should_check:
+                if await self._set_checkbox_state(
+                    root,
+                    locator,
+                    desired_checked=should_check,
+                ):
                     return "Yes" if should_check else "No"
-                if should_check:
-                    await locator.check()
-                    return "Yes"
-                await locator.uncheck()
-                return "No"
+                if await self._complete_checkbox_interaction(
+                    page=page,
+                    field=field,
+                    settings=settings,
+                    desired_checked=should_check,
+                ):
+                    return "Yes" if should_check else "No"
+                msg = "Could not set the LinkedIn Easy Apply checkbox to the requested state."
+                raise LinkedInEasyApplyError(msg)
             case "radio":
                 if field.question_type is QuestionType.RESUME_UPLOAD:
                     return await self._apply_resume_choice_field(
+                        page=page,
                         root=root,
                         field=field,
                         settings=settings,
@@ -1128,6 +1161,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     return None
                 option = field.options[option_index]
                 if await self._check_radio_option(root, field, option):
+                    return option
+                if await self._complete_radio_interaction(
+                    page=page,
+                    field=field,
+                    option_index=option_index,
+                    option_label=option,
+                    settings=settings,
+                ):
                     return option
                 return None
             case "file":
@@ -1189,6 +1230,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         f"Visible chooser options: {', '.join(state.visible_option_texts)!r}."
                         if state.visible_option_texts
                         else "No explicit chooser options are visible right now."
+                    ),
+                    (
+                        "The current validation says this field requires a selection. Treat "
+                        "this control like a chooser or autocomplete even if it visually "
+                        "resembles a plain text input."
+                        if state.validation_message
+                        and "selection" in normalize_text(state.validation_message)
+                        else "The current validation does not explicitly require a selection."
                     ),
                     (
                         "Do not replace the field with an unrelated value. "
@@ -1314,8 +1363,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
         return final_state.current_value or target_value
 
     async def _inspect_text_field_interaction(self, locator: Locator) -> TextFieldInteractionState:
-        payload = await locator.evaluate(
-            """
+        try:
+            payload = await locator.evaluate(
+                """
             (node) => {
               const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
               const isVisible = (candidate) => {
@@ -1582,8 +1632,15 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 validation_message: combinedValidationTexts[0] || "",
               };
             }
-            """
-        )
+                """,
+                timeout=_FIELD_STATE_INSPECTION_TIMEOUT_MS,
+            )
+        except PlaywrightTimeoutError as exc:
+            msg = (
+                "Timed out while inspecting the current LinkedIn Easy Apply field after a "
+                "browser action."
+            )
+            raise LinkedInEasyApplyError(msg) from exc
         return TextFieldInteractionState(
             current_value=str(payload.get("current_value") or "").strip(),
             focused=bool(payload.get("focused")),
@@ -1608,6 +1665,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
     async def _apply_resume_choice_field(
         self,
         *,
+        page: Page,
         root: Locator,
         field: EasyApplyField,
         settings: UserAgentSettings,
@@ -1626,10 +1684,28 @@ class PlaywrightLinkedInEasyApplyExecutor:
             case "radio":
                 if await self._check_radio_option_by_index(root, field, option_index=option_index):
                     return target_cv_name
+                if await self._complete_radio_interaction(
+                    page=page,
+                    field=field,
+                    option_index=option_index,
+                    option_label=target_cv_name,
+                    settings=settings,
+                ):
+                    return target_cv_name
             case "checkbox":
                 locator = await self._find_control_locator(root, field)
-                if locator is not None:
-                    await locator.check()
+                if locator is not None and await self._set_checkbox_state(
+                    root,
+                    locator,
+                    desired_checked=True,
+                ):
+                    return target_cv_name
+                if await self._complete_checkbox_interaction(
+                    page=page,
+                    field=field,
+                    settings=settings,
+                    desired_checked=True,
+                ):
                     return target_cv_name
             case "select":
                 locator = await self._find_control_locator(root, field)
@@ -1656,29 +1732,40 @@ class PlaywrightLinkedInEasyApplyExecutor:
         *,
         option_index: int,
     ) -> bool:
+        option_locator = await self._resolve_radio_option_locator(
+            root,
+            field,
+            option_index=option_index,
+        )
+        if option_locator is not None:
+            if await _radio_option_is_checked(option_locator):
+                return True
+            if await self._activate_radio_option(root, option_locator):
+                return True
+        return False
+
+    async def _resolve_radio_option_locator(
+        self,
+        root: Locator,
+        field: EasyApplyField,
+        *,
+        option_index: int,
+    ) -> Locator | None:
         option_ref = (
             field.option_refs[option_index] if len(field.option_refs) > option_index else None
         )
         if option_ref:
             locator = root.locator(_attribute_selector("data-job-applier-option-ref", option_ref))
             if await locator.count():
-                option_locator = locator.first
-                if await _radio_option_is_checked(option_locator):
-                    return True
-                if await self._activate_radio_option(root, option_locator):
-                    return True
+                return locator.first
 
         if field.name:
             group = root.locator(
                 f'input[type="radio"]{_attribute_selector("name", field.name)}',
             )
             if await group.count() > option_index:
-                option_locator = group.nth(option_index)
-                if await _radio_option_is_checked(option_locator):
-                    return True
-                if await self._activate_radio_option(root, option_locator):
-                    return True
-        return False
+                return group.nth(option_index)
+        return None
 
     async def _activate_radio_option(self, root: Locator, locator: Locator) -> bool:
         try:
@@ -1717,6 +1804,192 @@ class PlaywrightLinkedInEasyApplyExecutor:
         if bool(activated):
             await asyncio.sleep(0.15)
         return await _radio_option_is_checked(locator)
+
+    async def _set_checkbox_state(
+        self,
+        root: Locator,
+        locator: Locator,
+        *,
+        desired_checked: bool,
+    ) -> bool:
+        if await _checkbox_option_is_checked(locator) == desired_checked:
+            return True
+
+        try:
+            if desired_checked:
+                await locator.check(timeout=2_000)
+            else:
+                await locator.uncheck(timeout=2_000)
+        except Exception:  # noqa: BLE001
+            pass
+        else:
+            if await _checkbox_option_is_checked(locator) == desired_checked:
+                return True
+
+        input_id = await locator.get_attribute("id")
+        if input_id:
+            label = root.locator(f'label[for="{input_id}"]')
+            if await label.count():
+                try:
+                    await label.first.click(timeout=2_000)
+                except Exception:  # noqa: BLE001
+                    pass
+                if await _checkbox_option_is_checked(locator) == desired_checked:
+                    return True
+
+        wrapping_label = locator.locator("xpath=ancestor::label[1]")
+        if await wrapping_label.count():
+            try:
+                await wrapping_label.first.click(timeout=2_000)
+            except Exception:  # noqa: BLE001
+                pass
+            if await _checkbox_option_is_checked(locator) == desired_checked:
+                return True
+
+        try:
+            toggled = await locator.evaluate(
+                """
+                ({ node, desiredChecked }) => {
+                  if (!(node instanceof HTMLInputElement)) {
+                    return false;
+                  }
+                  if (node.checked === desiredChecked) {
+                    return true;
+                  }
+                  const label = node.labels?.[0] || node.closest("label");
+                  if (label instanceof HTMLElement) {
+                    label.click();
+                  } else {
+                    node.click();
+                  }
+                  return node.checked === desiredChecked;
+                }
+                """,
+                {"desiredChecked": desired_checked},
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        if bool(toggled):
+            await asyncio.sleep(0.15)
+        return await _checkbox_option_is_checked(locator) == desired_checked
+
+    async def _complete_checkbox_interaction(
+        self,
+        *,
+        page: Page,
+        field: EasyApplyField,
+        settings: UserAgentSettings,
+        desired_checked: bool,
+    ) -> bool:
+        browser_agent = self._create_browser_agent(settings)
+        recent_actions: list[dict[str, object]] = []
+        desired_state = "checked" if desired_checked else "unchecked"
+
+        for attempt_index in range(4):
+            root = await self._easy_apply_root(page)
+            locator = await self._find_control_locator(root, field)
+            if locator is None:
+                return False
+            if await _checkbox_option_is_checked(locator) == desired_checked:
+                return True
+            focus_locator = await self._field_interaction_focus_locator(root, field) or locator
+            try:
+                action = await browser_agent.perform_single_task_action(
+                    page=page,
+                    available_values={},
+                    goal=(
+                        "Set the current LinkedIn Easy Apply checkbox to the requested state "
+                        "without advancing, dismissing, or submitting the form."
+                    ),
+                    task_name="linkedin_easy_apply_finalize_checkbox",
+                    extra_rules=(
+                        f"The checkbox question is {field.question_raw!r}.",
+                        f"The requested final state is {desired_state!r}.",
+                        "The correct surface may be a visible label, consent row, or clickable "
+                        "card instead of the raw hidden input.",
+                        "Do not interact with unrelated controls and do not advance the form.",
+                    ),
+                    allowed_action_types=("click", "press", "scroll", "wait", "done", "fail"),
+                    recent_actions=recent_actions,
+                    step_index=attempt_index,
+                    focus_locator=focus_locator,
+                    priority_locator=focus_locator,
+                )
+            except BrowserAutomationError:
+                return False
+            recent_actions.append(
+                {
+                    "step_index": attempt_index,
+                    "task_name": "linkedin_easy_apply_finalize_checkbox",
+                    "action_type": action.action_type,
+                    "action_intent": action.action_intent,
+                    "reasoning": action.reasoning,
+                }
+            )
+            await page.wait_for_timeout(150)
+        return False
+
+    async def _complete_radio_interaction(
+        self,
+        *,
+        page: Page,
+        field: EasyApplyField,
+        option_index: int,
+        option_label: str,
+        settings: UserAgentSettings,
+    ) -> bool:
+        browser_agent = self._create_browser_agent(settings)
+        recent_actions: list[dict[str, object]] = []
+
+        for attempt_index in range(4):
+            root = await self._easy_apply_root(page)
+            option_locator = await self._resolve_radio_option_locator(
+                root,
+                field,
+                option_index=option_index,
+            )
+            if option_locator is None:
+                return False
+            if await _radio_option_is_checked(option_locator):
+                return True
+            focus_locator = (
+                await self._field_interaction_focus_locator(root, field) or option_locator
+            )
+            try:
+                action = await browser_agent.perform_single_task_action(
+                    page=page,
+                    available_values={},
+                    goal=(
+                        "Select the requested LinkedIn Easy Apply radio option without advancing, "
+                        "dismissing, or submitting the form."
+                    ),
+                    task_name="linkedin_easy_apply_finalize_radio",
+                    extra_rules=(
+                        f"The radio question is {field.question_raw!r}.",
+                        f"The option that must end up selected is {option_label!r}.",
+                        "The visible clickable surface may be the option row or label instead of "
+                        "the raw radio input element.",
+                        "Do not interact with unrelated controls and do not advance the form.",
+                    ),
+                    allowed_action_types=("click", "press", "scroll", "wait", "done", "fail"),
+                    recent_actions=recent_actions,
+                    step_index=attempt_index,
+                    focus_locator=focus_locator,
+                    priority_locator=focus_locator,
+                )
+            except BrowserAutomationError:
+                return False
+            recent_actions.append(
+                {
+                    "step_index": attempt_index,
+                    "task_name": "linkedin_easy_apply_finalize_radio",
+                    "action_type": action.action_type,
+                    "action_intent": action.action_intent,
+                    "reasoning": action.reasoning,
+                }
+            )
+            await page.wait_for_timeout(150)
+        return False
 
     async def _find_control_locator(self, root: Locator, field: EasyApplyField) -> Locator | None:
         if field.dom_ref:
@@ -2622,26 +2895,122 @@ class PlaywrightLinkedInEasyApplyExecutor:
         return None
 
     async def _control_has_invalid_state(self, locator: Locator) -> bool:
+        return (await self._inspect_control_validation_state(locator)).invalid
+
+    async def _inspect_control_validation_state(self, locator: Locator) -> ControlValidationState:
         try:
-            return bool(
-                await locator.evaluate(
-                    """
-                    (node) => {
-                      if (!node || node.nodeType !== 1) {
-                        return false;
-                      }
-                      const ariaInvalid = node.getAttribute("aria-invalid") === "true";
-                      const invalidPseudoClass =
-                        typeof node.matches === "function" ? node.matches(":invalid") : false;
-                      const nativeValidity =
-                        typeof node.checkValidity === "function" ? node.checkValidity() : true;
-                      return ariaInvalid || invalidPseudoClass || !nativeValidity;
+            payload = await locator.evaluate(
+                """
+                (node) => {
+                  const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                  const isVisible = (candidate) => {
+                    if (!candidate || candidate.nodeType !== 1) {
+                      return false;
                     }
-                    """
-                )
+                    const style = window.getComputedStyle(candidate);
+                    const rect = candidate.getBoundingClientRect();
+                    return (
+                      rect.width > 0
+                      && rect.height > 0
+                      && style.visibility !== "hidden"
+                      && style.display !== "none"
+                    );
+                  };
+                  const fieldRect = node.getBoundingClientRect();
+                  const overlapsHorizontally = (candidateRect) => {
+                    const overlap = Math.min(fieldRect.right, candidateRect.right)
+                      - Math.max(fieldRect.left, candidateRect.left);
+                    return overlap > Math.min(fieldRect.width, candidateRect.width) * 0.25;
+                  };
+                  const validationTexts = [];
+                  const seenValidationTexts = new Set();
+                  const pushValidationText = (candidate) => {
+                    if (!candidate || candidate.nodeType !== 1 || !isVisible(candidate)) {
+                      return;
+                    }
+                    const text = collapse(candidate.innerText || candidate.textContent || "");
+                    if (!text || seenValidationTexts.has(text) || text.length > 180) {
+                      return;
+                    }
+                    const rect = candidate.getBoundingClientRect();
+                    const verticalGap = rect.top - fieldRect.bottom;
+                    if (verticalGap < -8 || verticalGap > 120 || !overlapsHorizontally(rect)) {
+                      return;
+                    }
+                    seenValidationTexts.add(text);
+                    validationTexts.push(text);
+                  };
+                  const splitIds = (value) =>
+                    collapse(value)
+                      .split(/\\s+/)
+                      .map((item) => item.trim())
+                      .filter(Boolean);
+                  for (const attributeName of ["aria-errormessage", "aria-describedby"]) {
+                    for (const id of splitIds(node.getAttribute(attributeName))) {
+                      pushValidationText(document.getElementById(id));
+                    }
+                  }
+                  const scope = node.closest(
+                    [
+                      ".fb-form-element",
+                      ".jobs-easy-apply-form-section__grouping",
+                      ".jobs-easy-apply-form-element",
+                      "[role='group']",
+                      "fieldset",
+                      "section",
+                      "form",
+                    ].join(", ")
+                  );
+                  if (scope) {
+                    for (const candidate of scope.querySelectorAll(
+                      [
+                        "[role='alert']",
+                        "[aria-live='assertive']",
+                        "[aria-live='polite']",
+                        ".artdeco-inline-feedback__message",
+                        ".fb-dash-form-element__error-message",
+                        "[data-test-form-element-error-messages]",
+                      ].join(", ")
+                    )) {
+                      pushValidationText(candidate);
+                    }
+                  }
+                  const ariaInvalid = node.getAttribute("aria-invalid") === "true";
+                  const invalidPseudoClass =
+                    typeof node.matches === "function" ? node.matches(":invalid") : false;
+                  const nativeValidity =
+                    typeof node.checkValidity === "function" ? node.checkValidity() : true;
+                  const validationMessage = collapse(node.validationMessage || "");
+                  const combinedValidationTexts = [validationMessage, ...validationTexts]
+                    .filter(Boolean);
+                  return {
+                    invalid: ariaInvalid || invalidPseudoClass || !nativeValidity
+                      || combinedValidationTexts.length > 0,
+                    validation_message: combinedValidationTexts[0] || "",
+                    current_value: collapse(
+                      node.value
+                      || node.textContent
+                      || node.getAttribute("value")
+                      || ""
+                    ),
+                  };
+                }
+                """,
+                timeout=_FIELD_STATE_INSPECTION_TIMEOUT_MS,
             )
+        except PlaywrightTimeoutError as exc:
+            msg = (
+                "Timed out while inspecting the validation state of the current LinkedIn "
+                "Easy Apply control."
+            )
+            raise LinkedInEasyApplyError(msg) from exc
         except Exception:  # noqa: BLE001
-            return False
+            return ControlValidationState(invalid=False)
+        return ControlValidationState(
+            invalid=bool(payload.get("invalid")),
+            validation_message=str(payload.get("validation_message") or "").strip() or None,
+            current_value=str(payload.get("current_value") or "").strip(),
+        )
 
     async def _retry_invalid_fields_after_primary_action(
         self,
@@ -2666,33 +3035,47 @@ class PlaywrightLinkedInEasyApplyExecutor:
             return
 
         answer_by_key = {
-            answer.normalized_key: answer.answer_raw
-            for answer in step_answers
-            if answer.answer_raw.strip()
+            answer.normalized_key: answer for answer in step_answers if answer.answer_raw.strip()
         }
-        root = await self._easy_apply_root(page)
 
         for field in current_step.fields:
-            if field.control_kind not in {"text", "textarea"}:
-                continue
+            root = await self._easy_apply_root(page)
             locator = await self._find_control_locator(root, field)
             if locator is None:
                 continue
-            state = await self._inspect_text_field_interaction(locator)
-            if not state.invalid:
+            validation_message: str | None
+            current_value: str
+            if field.control_kind in {"text", "textarea"}:
+                text_state = await self._inspect_text_field_interaction(locator)
+                invalid = text_state.invalid
+                validation_message = text_state.validation_message
+                current_value = text_state.current_value
+            else:
+                control_state = await self._inspect_control_validation_state(locator)
+                invalid = control_state.invalid
+                validation_message = control_state.validation_message
+                current_value = control_state.current_value
+            if not invalid:
                 continue
 
-            resolved_retry = None
-            if not answer_by_key.get(field.normalized_key):
-                resolved_retry = await self._answer_resolver.resolve(
-                    field,
-                    settings,
-                    posting=posting,
-                )
+            resolved_retry = await self._answer_resolver.resolve(
+                field,
+                settings,
+                posting=posting,
+            )
+            requires_selection_retry = bool(
+                validation_message and "selection" in normalize_text(validation_message)
+            )
+            prior_answer = answer_by_key.get(field.normalized_key)
             target_value = (
-                answer_by_key.get(field.normalized_key)
+                (
+                    resolved_retry.value
+                    if requires_selection_retry and resolved_retry is not None
+                    else None
+                )
+                or (prior_answer.answer_raw if prior_answer is not None else None)
                 or (resolved_retry.value if resolved_retry is not None else None)
-                or state.current_value
+                or current_value
             )
             if not target_value.strip():
                 self._record_event(
@@ -2704,10 +3087,29 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "stage": "easy_apply_retry_invalid_field_missing_target",
                         "step_index": current_step.step_index,
                         "normalized_key": field.normalized_key,
-                        "validation_message": state.validation_message,
+                        "validation_message": validation_message,
                     },
                 )
                 continue
+            effective_resolution = resolved_retry
+            if effective_resolution is None and prior_answer is not None:
+                effective_resolution = ResolvedFieldValue(
+                    value=prior_answer.answer_raw,
+                    answer_source=prior_answer.answer_source,
+                    fill_strategy=prior_answer.fill_strategy,
+                    ambiguity_flag=prior_answer.ambiguity_flag,
+                    confidence=None,
+                    reasoning="reuse_previous_step_answer_for_invalid_field",
+                )
+            if effective_resolution is None:
+                effective_resolution = ResolvedFieldValue(
+                    value=target_value,
+                    answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
+                    fill_strategy=FillStrategy.BEST_EFFORT,
+                    ambiguity_flag=True,
+                    confidence=0.1,
+                    reasoning="retry_current_control_value",
+                )
             self._record_event(
                 execution_events,
                 execution_id=execution_id,
@@ -2717,45 +3119,64 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     "stage": "easy_apply_retry_invalid_field",
                     "step_index": current_step.step_index,
                     "normalized_key": field.normalized_key,
-                    "validation_message": state.validation_message,
+                    "control_kind": field.control_kind,
+                    "validation_message": validation_message,
                     "target_value": target_value,
-                    "answer_source": (
-                        resolved_retry.answer_source.value if resolved_retry is not None else None
-                    ),
-                    "fill_strategy": (
-                        resolved_retry.fill_strategy.value if resolved_retry is not None else None
-                    ),
-                    "confidence": (
-                        resolved_retry.confidence if resolved_retry is not None else None
-                    ),
-                    "reasoning": (resolved_retry.reasoning if resolved_retry is not None else None),
+                    "answer_source": effective_resolution.answer_source.value,
+                    "fill_strategy": effective_resolution.fill_strategy.value,
+                    "confidence": effective_resolution.confidence,
+                    "reasoning": effective_resolution.reasoning,
                 },
             )
-            try:
-                await asyncio.wait_for(
-                    self._complete_text_field_interaction(
-                        page=page,
-                        field=field,
-                        target_value=target_value,
-                        settings=settings,
-                    ),
-                    timeout=self._runtime_settings.linkedin_field_interaction_timeout_seconds,
-                )
-            except TimeoutError:
-                self._record_event(
-                    execution_events,
-                    execution_id=execution_id,
-                    submission_id=submission_id,
-                    event_type=ExecutionEventType.EXECUTION_FAILED,
-                    payload={
-                        "stage": "easy_apply_retry_invalid_field_timeout",
-                        "step_index": current_step.step_index,
-                        "normalized_key": field.normalized_key,
-                        "message": (
-                            "Timed out while the browser agent was trying to finish an "
-                            "interactive Easy Apply field."
+            if field.control_kind in {"text", "textarea"}:
+                try:
+                    await asyncio.wait_for(
+                        self._complete_text_field_interaction(
+                            page=page,
+                            field=field,
+                            target_value=target_value,
+                            settings=settings,
                         ),
-                    },
+                        timeout=self._runtime_settings.linkedin_field_interaction_timeout_seconds,
+                    )
+                except TimeoutError:
+                    self._record_event(
+                        execution_events,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
+                        event_type=ExecutionEventType.EXECUTION_FAILED,
+                        payload={
+                            "stage": "easy_apply_retry_invalid_field_timeout",
+                            "step_index": current_step.step_index,
+                            "normalized_key": field.normalized_key,
+                            "message": (
+                                "Timed out while the browser agent was trying to finish an "
+                                "interactive Easy Apply field."
+                            ),
+                        },
+                    )
+                except LinkedInEasyApplyError as exc:
+                    self._record_event(
+                        execution_events,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
+                        event_type=ExecutionEventType.EXECUTION_FAILED,
+                        payload={
+                            "stage": "easy_apply_retry_invalid_field",
+                            "step_index": current_step.step_index,
+                            "normalized_key": field.normalized_key,
+                            "message": str(exc),
+                        },
+                    )
+                continue
+            try:
+                applied_value = await self._apply_field_value(
+                    page,
+                    root,
+                    field,
+                    effective_resolution,
+                    settings,
+                    submission_cv_path=None,
                 )
             except LinkedInEasyApplyError as exc:
                 self._record_event(
@@ -2768,6 +3189,23 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "step_index": current_step.step_index,
                         "normalized_key": field.normalized_key,
                         "message": str(exc),
+                    },
+                )
+                continue
+            if applied_value is None:
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.EXECUTION_FAILED,
+                    payload={
+                        "stage": "easy_apply_retry_invalid_field",
+                        "step_index": current_step.step_index,
+                        "normalized_key": field.normalized_key,
+                        "message": (
+                            "Could not apply a new value while retrying the invalid Easy Apply "
+                            "control."
+                        ),
                     },
                 )
 
@@ -3384,6 +3822,13 @@ def _resume_option_match_score(option_text: str, filename: str) -> int:
 
 
 async def _radio_option_is_checked(locator: Locator) -> bool:
+    try:
+        return await locator.is_checked()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _checkbox_option_is_checked(locator: Locator) -> bool:
     try:
         return await locator.is_checked()
     except Exception:  # noqa: BLE001

@@ -39,6 +39,28 @@ _PLACEHOLDER_OPTION_TOKENS = frozenset(
 )
 _YES_OPTION_TOKENS = frozenset({"yes", "y", "true", "sim", "s"})
 _NO_OPTION_TOKENS = frozenset({"no", "n", "false", "nao"})
+_SENSITIVE_OPT_OUT_TOKENS = frozenset(
+    {
+        "prefer not to say",
+        "prefer not to answer",
+        "prefer not to disclose",
+        "decline to answer",
+        "decline to self identify",
+        "choose not to disclose",
+        "do not wish to answer",
+        "rather not say",
+        "not specified",
+        "undisclosed",
+        "prefiro nao informar",
+        "prefiro nao responder",
+        "prefiro nao dizer",
+        "nao desejo informar",
+        "nao desejo responder",
+        "nao quero informar",
+        "nao informado",
+        "prefiro nao me identificar",
+    }
+)
 
 STRUCTURED_OUTPUT_SCHEMA = {
     "type": "object",
@@ -95,6 +117,13 @@ def _canonical_binary_token(value: str) -> str | None:
     if normalized in _NO_OPTION_TOKENS:
         return "no"
     return None
+
+
+def field_has_meaningful_current_value(field: EasyApplyField) -> bool:
+    current_value = _non_empty_value(field.current_value)
+    if current_value is None:
+        return False
+    return normalize_text(current_value) not in _PLACEHOLDER_OPTION_TOKENS
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,7 +399,9 @@ class LinkedInQuestionClassifier:
                 confidence=0.9,
                 matched_rule="years_experience",
             )
-        if self._is_binary_option_set(meaningful_options):
+        if self._is_binary_option_set(meaningful_options) or self._looks_like_binary_question(
+            normalized
+        ):
             return QuestionClassification(
                 question_type=QuestionType.YES_NO_GENERIC,
                 normalized_key=default_key,
@@ -400,6 +431,20 @@ class LinkedInQuestionClassifier:
         canonical_tokens = {_canonical_binary_token(option) for option in options}
         canonical_values = {token for token in canonical_tokens if token is not None}
         return bool(canonical_values) and canonical_values.issubset({"yes", "no"})
+
+    def _looks_like_binary_question(self, normalized_question: str) -> bool:
+        return self._contains_any(
+            normalized_question,
+            "are you comfortable",
+            "do you feel comfortable",
+            "comfortable working",
+            "feel comfortable working",
+            "do you feel confident",
+            "voce se sente confortavel",
+            "se sente confortavel",
+            "confortavel trabalhando",
+            "confortavel em um ambiente",
+        )
 
     def _looks_like_resume_control(
         self,
@@ -576,6 +621,21 @@ class OpenAIResponsesAnswerGenerator:
             if selected_option is None:
                 return None
             answer = selected_option
+        if _answer_uses_target_employer_for_candidate_field(
+            field=field,
+            answer=answer,
+            posting=posting,
+        ):
+            logger.info(
+                "linkedin_ai_autofill_guardrail_rejected",
+                extra={
+                    "normalized_key": field.normalized_key,
+                    "question_type": field.question_type.value,
+                    "answer": answer,
+                    "reason": "target_employer_reused_as_candidate_employer",
+                },
+            )
+            return None
 
         return GeneratedAnswer(
             value=answer,
@@ -612,6 +672,12 @@ class OpenAIResponsesAnswerGenerator:
                                 "For derived technologies, infer from the closest parent stack, "
                                 "stay internally consistent, and never exceed the broader stack "
                                 "experience. Prefer modest values for newer frameworks. "
+                                "Never reuse the target job company as the candidate's current "
+                                "or previous employer unless the profile explicitly says so. "
+                                "If current employer data is missing, prefer a neutral plausible "
+                                "non-target answer such as Freelancer or Self-employed. "
+                                "For language proficiency ladders, prefer conservative middle "
+                                "options such as intermediate when exact data is missing. "
                                 "Do not invent legal, visa, or certification facts. "
                                 "Keep free-text answers concise, professional, and believable."
                             ),
@@ -735,6 +801,18 @@ class OpenAIResponsesAnswerGenerator:
                     "rather than inventing text."
                 ),
                 (
+                    "Never use the target job company as the candidate's current employer "
+                    "unless the profile explicitly confirms that fact."
+                ),
+                (
+                    "If current employer information is missing, prefer a neutral plausible "
+                    "non-target answer such as Freelancer or Self-employed."
+                ),
+                (
+                    "For language proficiency ladders, prefer conservative middle options "
+                    "such as intermediate instead of extreme claims."
+                ),
+                (
                     "For legal authorization, visa, certifications, or other compliance facts, "
                     "do not invent missing facts."
                 ),
@@ -842,7 +920,7 @@ class LinkedInAnswerResolver:
     ) -> ResolvedFieldValue | None:
         """Return the selected value for a field, preserving prefilled controls."""
 
-        if field.prefilled and field.current_value.strip():
+        if field.prefilled and field_has_meaningful_current_value(field):
             return None
 
         rule_value = self._resolve_explicit_rule_value(field, settings)
@@ -875,16 +953,36 @@ class LinkedInAnswerResolver:
         if not settings.ruleset.allow_best_effort_autofill:
             return None
 
+        if _looks_like_sensitive_demographic_question(field):
+            sensitive_opt_out = _resolve_sensitive_opt_out_answer(field)
+            if sensitive_opt_out is None:
+                return None
+            return ResolvedFieldValue(
+                value=sensitive_opt_out.value,
+                answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
+                fill_strategy=FillStrategy.BEST_EFFORT,
+                ambiguity_flag=True,
+                confidence=sensitive_opt_out.confidence,
+                reasoning=sensitive_opt_out.reasoning,
+            )
+
         ai_answer = await self._generate_ai_answer(field=field, settings=settings, posting=posting)
         if ai_answer is not None:
-            return ResolvedFieldValue(
-                value=ai_answer.value,
-                answer_source=AnswerSource.AI,
-                fill_strategy=FillStrategy.AUTOFILL_AI,
-                ambiguity_flag=True,
-                confidence=ai_answer.confidence,
-                reasoning=ai_answer.reasoning,
-            )
+            if _answer_uses_target_employer_for_candidate_field(
+                field=field,
+                answer=ai_answer.value,
+                posting=posting,
+            ):
+                ai_answer = None
+            else:
+                return ResolvedFieldValue(
+                    value=ai_answer.value,
+                    answer_source=AnswerSource.AI,
+                    fill_strategy=FillStrategy.AUTOFILL_AI,
+                    ambiguity_flag=True,
+                    confidence=ai_answer.confidence,
+                    reasoning=ai_answer.reasoning,
+                )
 
         guardrail_answer = self._resolve_guardrail_fallback(field, settings)
         if guardrail_answer is None:
@@ -1120,6 +1218,20 @@ class LinkedInAnswerResolver:
                 confidence=0.7,
                 reasoning="guardrail_phone_country_code",
             )
+        if _looks_like_current_employer_question(field):
+            return GuardrailAnswer(
+                value="Freelancer",
+                confidence=0.24,
+                reasoning="guardrail_unknown_current_employer",
+            )
+        if field.options and _looks_like_language_proficiency_question(field):
+            proficiency_option = _pick_conservative_language_proficiency_option(field.options)
+            if proficiency_option is not None:
+                return GuardrailAnswer(
+                    value=proficiency_option,
+                    confidence=0.22,
+                    reasoning="guardrail_conservative_language_proficiency",
+                )
 
         if field.options:
             preferred = "No" if _prefers_negative_answer(normalized_question) else None
@@ -1130,6 +1242,12 @@ class LinkedInAnswerResolver:
                 value=option,
                 confidence=0.3,
                 reasoning="typed_guardrail_option_pick",
+            )
+        if field.question_type is QuestionType.YES_NO_GENERIC:
+            return GuardrailAnswer(
+                value="No" if _prefers_negative_answer(normalized_question) else "Yes",
+                confidence=0.34,
+                reasoning="typed_guardrail_binary",
             )
 
         if field.control_kind == "checkbox":
@@ -1323,6 +1441,139 @@ def _prefers_negative_answer(normalized_question: str) -> bool:
             "marketing",
             "future opportunities",
         )
+    )
+
+
+def _looks_like_current_employer_question(field: EasyApplyField) -> bool:
+    normalized = normalize_text(f"{field.question_raw} {field.normalized_key}")
+    return any(
+        token in normalized
+        for token in (
+            "current company",
+            "current employer",
+            "company where you work",
+            "company you work for",
+            "empresa onde voce trabalha",
+            "empresa onde vc trabalha",
+            "empresa em que voce trabalha",
+            "empresa atual",
+            "empregador atual",
+        )
+    )
+
+
+def _answer_uses_target_employer_for_candidate_field(
+    *,
+    field: EasyApplyField,
+    answer: str,
+    posting: JobPosting,
+) -> bool:
+    if not _looks_like_current_employer_question(field):
+        return False
+    normalized_answer = normalize_text(answer)
+    normalized_company = normalize_text(posting.company_name)
+    if not normalized_answer or not normalized_company:
+        return False
+    return normalized_answer == normalized_company or normalized_company in normalized_answer
+
+
+def _looks_like_language_proficiency_question(field: EasyApplyField) -> bool:
+    normalized = normalize_text(f"{field.question_raw} {field.normalized_key}")
+    if not any(
+        token in normalized
+        for token in ("english", "ingles", "spanish", "espanhol", "language", "idioma")
+    ):
+        return False
+    return any(
+        token in normalized
+        for token in (
+            "proficiency",
+            "level",
+            "nivel",
+            "fluency",
+            "fluencia",
+            "comfortable",
+            "confortavel",
+            "comfort",
+        )
+    )
+
+
+def _pick_conservative_language_proficiency_option(options: tuple[str, ...]) -> str | None:
+    meaningful_options = [
+        option for option in options if normalize_text(option) not in _PLACEHOLDER_OPTION_TOKENS
+    ]
+    if not meaningful_options:
+        return None
+    preferred_tokens = (
+        "intermediate",
+        "intermediario",
+        "b2",
+        "b1",
+        "working proficiency",
+        "professional working proficiency",
+        "conversational",
+    )
+    for option in meaningful_options:
+        normalized_option = normalize_text(option)
+        if any(token in normalized_option for token in preferred_tokens):
+            return option
+    if len(meaningful_options) >= 3:
+        return meaningful_options[len(meaningful_options) // 2]
+    return meaningful_options[0]
+
+
+def _looks_like_sensitive_demographic_question(field: EasyApplyField) -> bool:
+    normalized = normalize_text(f"{field.question_raw} {field.normalized_key}")
+    return any(
+        token in normalized
+        for token in (
+            "gender",
+            "genero",
+            "pronoun",
+            "pronome",
+            "sexual orientation",
+            "orientacao sexual",
+            "lgbt",
+            "lgbtq",
+            "race",
+            "ethnicity",
+            "ethnic",
+            "raca",
+            "etnia",
+            "cor",
+            "disability",
+            "disabled",
+            "deficiencia",
+            "pcd",
+            "veteran",
+            "veterano",
+        )
+    )
+
+
+def _pick_sensitive_opt_out_option(options: tuple[str, ...]) -> str | None:
+    for option in options:
+        normalized_option = normalize_text(option)
+        if normalized_option in _PLACEHOLDER_OPTION_TOKENS:
+            continue
+        if normalized_option in _SENSITIVE_OPT_OUT_TOKENS:
+            return option
+        if any(token in normalized_option for token in _SENSITIVE_OPT_OUT_TOKENS):
+            return option
+    return None
+
+
+def _resolve_sensitive_opt_out_answer(field: EasyApplyField) -> GuardrailAnswer | None:
+    if not field.options:
+        return None
+    opt_out_option = _pick_sensitive_opt_out_option(field.options)
+    if opt_out_option is None:
+        return None
+    return GuardrailAnswer(
+        value=opt_out_option,
+        confidence=0.92,
+        reasoning="sensitive_question_opt_out",
     )
 
 
