@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, Protocol, cast
 from urllib import error, request
 
@@ -59,6 +59,22 @@ _SENSITIVE_OPT_OUT_TOKENS = frozenset(
         "nao quero informar",
         "nao informado",
         "prefiro nao me identificar",
+    }
+)
+_NUMERIC_VALIDATION_TOKENS = frozenset(
+    {
+        "number",
+        "numeric",
+        "decimal",
+        "integer",
+        "float",
+        "whole number",
+        "plain number",
+        "plain integer",
+        "numero",
+        "numérico",
+        "numerico",
+        "inteiro",
     }
 )
 
@@ -996,6 +1012,93 @@ class LinkedInAnswerResolver:
             reasoning=guardrail_answer.reasoning,
         )
 
+    async def resolve_with_validation_feedback(
+        self,
+        field: EasyApplyField,
+        settings: UserAgentSettings,
+        *,
+        posting: JobPosting,
+        validation_message: str | None,
+        current_value: str = "",
+        previous_answer: str | None = None,
+    ) -> ResolvedFieldValue | None:
+        normalized_validation = normalize_text(validation_message or "")
+        adapted_field = self._adapt_field_for_validation_feedback(field, normalized_validation)
+        candidates: list[ResolvedFieldValue] = []
+
+        city_profile_value = settings.profile.city if _looks_like_city_field(field) else None
+        city_lookup_query = _derive_city_lookup_query(
+            previous_answer or current_value or city_profile_value or ""
+        )
+        if city_lookup_query is not None and _looks_like_city_field(field):
+            candidates.append(
+                ResolvedFieldValue(
+                    value=city_lookup_query,
+                    answer_source=AnswerSource.PROFILE_SNAPSHOT,
+                    fill_strategy=FillStrategy.DETERMINISTIC,
+                    ambiguity_flag=True,
+                    confidence=0.82,
+                    reasoning="city_lookup_query",
+                )
+            )
+
+        if adapted_field != field:
+            adapted_resolution = await self.resolve(adapted_field, settings, posting=posting)
+            if adapted_resolution is not None:
+                candidates.append(adapted_resolution)
+
+        base_resolution = await self.resolve(field, settings, posting=posting)
+        if base_resolution is not None:
+            candidates.append(base_resolution)
+
+        for raw_value, reasoning in (
+            (previous_answer, "reuse_previous_answer_with_validation_feedback"),
+            (current_value, "reuse_current_value_with_validation_feedback"),
+        ):
+            if raw_value is None or not raw_value.strip():
+                continue
+            coerced_value = _coerce_value_for_validation_feedback(
+                raw_value,
+                validation_message=normalized_validation,
+            )
+            if coerced_value is None:
+                continue
+            candidates.append(
+                ResolvedFieldValue(
+                    value=coerced_value,
+                    answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
+                    fill_strategy=FillStrategy.BEST_EFFORT,
+                    ambiguity_flag=True,
+                    confidence=0.12,
+                    reasoning=reasoning,
+                )
+            )
+
+        for candidate in candidates:
+            coerced_candidate = _coerce_value_for_validation_feedback(
+                candidate.value,
+                validation_message=normalized_validation,
+            )
+            if coerced_candidate is None:
+                continue
+            if field.options:
+                if adapted_field.question_type is QuestionType.YEARS_EXPERIENCE and re.fullmatch(
+                    r"\d+(?:[.,]\d+)?",
+                    coerced_candidate,
+                ):
+                    selected_option = pick_numeric_option(
+                        field.options,
+                        target_value=float(coerced_candidate.replace(",", ".")),
+                    )
+                else:
+                    selected_option = pick_option(field.options, preferred=coerced_candidate)
+                if selected_option is None:
+                    continue
+                coerced_candidate = selected_option
+            return replace(candidate, value=coerced_candidate)
+
+        return None
+
     async def _generate_ai_answer(
         self,
         *,
@@ -1324,6 +1427,55 @@ class LinkedInAnswerResolver:
             )
         return None
 
+    def _adapt_field_for_validation_feedback(
+        self,
+        field: EasyApplyField,
+        normalized_validation: str,
+    ) -> EasyApplyField:
+        if not _validation_requires_numeric(normalized_validation):
+            return field
+
+        normalized_question = normalize_text(f"{field.question_raw} {field.normalized_key}")
+        adapted_question_type = field.question_type
+        if adapted_question_type in {
+            QuestionType.UNKNOWN,
+            QuestionType.YES_NO_GENERIC,
+            QuestionType.FREE_TEXT_GENERIC,
+        }:
+            if any(
+                token in normalized_question
+                for token in (
+                    "experience",
+                    "years",
+                    "anos",
+                    "automation",
+                    "framework",
+                    "langchain",
+                    "python",
+                    "sql",
+                    "java",
+                    "javascript",
+                )
+            ):
+                adapted_question_type = QuestionType.YEARS_EXPERIENCE
+            elif any(
+                token in normalized_question
+                for token in (
+                    "salary",
+                    "compensation",
+                    "pretensao",
+                    "faixa salarial",
+                    "remuneracao",
+                )
+            ):
+                adapted_question_type = QuestionType.SALARY_EXPECTATION
+
+        return replace(
+            field,
+            question_type=adapted_question_type,
+            input_type="number",
+        )
+
     def _infer_plausible_years_experience(
         self,
         field: EasyApplyField,
@@ -1444,6 +1596,91 @@ def _prefers_negative_answer(normalized_question: str) -> bool:
     )
 
 
+def _validation_requires_numeric(validation_message: str) -> bool:
+    if not validation_message:
+        return False
+    return any(token in validation_message for token in _NUMERIC_VALIDATION_TOKENS) or any(
+        token in validation_message
+        for token in (
+            "larger than",
+            "greater than",
+            "less than",
+            "at least",
+            "at most",
+            "maior que",
+            "menor que",
+            "maior ou igual",
+            "menor ou igual",
+        )
+    )
+
+
+def _validation_requires_integer(validation_message: str) -> bool:
+    if not validation_message:
+        return False
+    return any(
+        token in validation_message
+        for token in (
+            "integer",
+            "whole number",
+            "plain integer",
+            "inteiro",
+        )
+    )
+
+
+def _extract_numeric_validation_floor(
+    validation_message: str,
+) -> tuple[float | None, bool]:
+    if not validation_message:
+        return None, False
+    match = re.search(r"(-?\d+(?:[.,]\d+)?)", validation_message)
+    if match is None:
+        return None, False
+    lower_bound = float(match.group(1).replace(",", "."))
+    exclusive = any(
+        token in validation_message
+        for token in (
+            "larger than",
+            "greater than",
+            "more than",
+            "maior que",
+            ">",
+        )
+    )
+    return lower_bound, exclusive
+
+
+def _coerce_value_for_validation_feedback(
+    value: str,
+    *,
+    validation_message: str,
+) -> str | None:
+    stripped_value = value.strip()
+    if not stripped_value:
+        return None
+    if not _validation_requires_numeric(validation_message):
+        return stripped_value
+
+    numeric_match = re.search(r"-?\d+(?:[.,]\d+)?", stripped_value)
+    if numeric_match is None:
+        return None
+    numeric_value = float(numeric_match.group(0).replace(",", "."))
+    lower_bound, exclusive = _extract_numeric_validation_floor(validation_message)
+    if lower_bound is not None:
+        if exclusive and numeric_value <= lower_bound:
+            numeric_value = lower_bound + 1.0
+        elif not exclusive and numeric_value < lower_bound:
+            numeric_value = lower_bound
+    if numeric_value <= 0 and "positive" in validation_message:
+        numeric_value = 1.0
+    if _validation_requires_integer(validation_message):
+        return str(max(1, int(round(numeric_value))))
+    if numeric_value.is_integer():
+        return str(int(numeric_value))
+    return f"{numeric_value:.1f}".rstrip("0").rstrip(".")
+
+
 def _looks_like_current_employer_question(field: EasyApplyField) -> bool:
     normalized = normalize_text(f"{field.question_raw} {field.normalized_key}")
     return any(
@@ -1497,6 +1734,24 @@ def _looks_like_language_proficiency_question(field: EasyApplyField) -> bool:
             "comfort",
         )
     )
+
+
+def _looks_like_city_field(field: EasyApplyField) -> bool:
+    if field.question_type is QuestionType.CITY:
+        return True
+    return normalize_key(field.normalized_key) in {"city", "current_city", "location_city"}
+
+
+def _derive_city_lookup_query(value: str) -> str | None:
+    stripped_value = value.strip()
+    if not stripped_value:
+        return None
+    city_candidate = re.split(r"\s[-,/]\s|,|/|-", stripped_value, maxsplit=1)[0].strip()
+    if not city_candidate:
+        return None
+    if city_candidate.isupper():
+        return city_candidate.title()
+    return city_candidate
 
 
 def _pick_conservative_language_proficiency_option(options: tuple[str, ...]) -> str | None:

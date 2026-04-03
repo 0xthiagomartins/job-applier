@@ -1259,6 +1259,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "regional formats can still represent the intended location."
                     ),
                     (
+                        "If this field is asking for city or location and the full regional "
+                        "string is rejected, prefer a shorter city-centered query first, then "
+                        "choose the closest visible suggestion."
+                        if field.question_type is QuestionType.CITY
+                        else "Only shorten or reformulate the query when that helps surface a "
+                        "valid chooser option for the same intended value."
+                    ),
+                    (
                         "Use ArrowDown or ArrowUp only when they help reveal or highlight a "
                         "better visible option. Do not rely on Enter as the first confirmation "
                         "move when visible options are already present."
@@ -3058,15 +3066,18 @@ class PlaywrightLinkedInEasyApplyExecutor:
             if not invalid:
                 continue
 
-            resolved_retry = await self._answer_resolver.resolve(
+            prior_answer = answer_by_key.get(field.normalized_key)
+            resolved_retry = await self._answer_resolver.resolve_with_validation_feedback(
                 field,
                 settings,
                 posting=posting,
+                validation_message=validation_message,
+                current_value=current_value,
+                previous_answer=prior_answer.answer_raw if prior_answer is not None else None,
             )
             requires_selection_retry = bool(
                 validation_message and "selection" in normalize_text(validation_message)
             )
-            prior_answer = answer_by_key.get(field.normalized_key)
             target_value = (
                 (
                     resolved_retry.value
@@ -3130,15 +3141,33 @@ class PlaywrightLinkedInEasyApplyExecutor:
             )
             if field.control_kind in {"text", "textarea"}:
                 try:
-                    await asyncio.wait_for(
-                        self._complete_text_field_interaction(
-                            page=page,
-                            field=field,
-                            target_value=target_value,
-                            settings=settings,
+                    applied_value = await asyncio.wait_for(
+                        self._apply_field_value(
+                            page,
+                            root,
+                            field,
+                            effective_resolution,
+                            settings,
+                            submission_cv_path=None,
                         ),
                         timeout=self._runtime_settings.linkedin_field_interaction_timeout_seconds,
                     )
+                    if applied_value is None:
+                        self._record_event(
+                            execution_events,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            event_type=ExecutionEventType.EXECUTION_FAILED,
+                            payload={
+                                "stage": "easy_apply_retry_invalid_field",
+                                "step_index": current_step.step_index,
+                                "normalized_key": field.normalized_key,
+                                "message": (
+                                    "Could not apply a new value while retrying the invalid "
+                                    "Easy Apply text field."
+                                ),
+                            },
+                        )
                 except TimeoutError:
                     self._record_event(
                         execution_events,

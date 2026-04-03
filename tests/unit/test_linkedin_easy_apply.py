@@ -663,6 +663,80 @@ def test_answer_resolver_uses_plausible_profile_inference_for_related_years() ->
     assert answer.reasoning == "plausible_profile_inference"
 
 
+def test_answer_resolver_reinterprets_invalid_numeric_feedback_for_ambiguous_experience_field() -> (
+    None
+):
+    settings = build_user_agent_settings().model_copy(
+        update={
+            "profile": build_user_agent_settings().profile.model_copy(
+                update={"years_experience_by_stack": {"python": 8}}
+            )
+        }
+    )
+    posting = build_posting()
+    resolver = LinkedInAnswerResolver(
+        ambiguous_answer_generator=NoopGenerator(),
+    )
+    field = EasyApplyField(
+        question_raw="Do You have experience in robot framework?",
+        normalized_key="do_you_have_experience_in_robot_framework",
+        question_type=QuestionType.YES_NO_GENERIC,
+        control_kind="text",
+        input_type="text",
+    )
+
+    answer = asyncio.run(
+        resolver.resolve_with_validation_feedback(
+            field,
+            settings,
+            posting=posting,
+            validation_message="Enter a decimal number larger than 0.0",
+            current_value="Yes, I have worked with robot framework in automation projects.",
+            previous_answer="Yes, I have worked with robot framework in automation projects.",
+        )
+    )
+
+    assert answer is not None
+    assert answer.value == "2"
+    assert answer.reasoning == "plausible_profile_inference"
+
+
+def test_answer_resolver_uses_city_lookup_query_for_invalid_location_combobox() -> None:
+    settings = build_user_agent_settings().model_copy(
+        update={
+            "profile": build_user_agent_settings().profile.model_copy(
+                update={"city": "SAO PAULO - SP BRASIL"}
+            )
+        }
+    )
+    posting = build_posting()
+    resolver = LinkedInAnswerResolver(
+        ambiguous_answer_generator=NoopGenerator(),
+    )
+    field = EasyApplyField(
+        question_raw="Location (city)",
+        normalized_key="city",
+        question_type=QuestionType.CITY,
+        control_kind="text",
+        input_type="text",
+    )
+
+    answer = asyncio.run(
+        resolver.resolve_with_validation_feedback(
+            field,
+            settings,
+            posting=posting,
+            validation_message="Please enter a valid answer",
+            current_value="SAO PAULO - SP BRASIL",
+            previous_answer="SAO PAULO - SP BRASIL",
+        )
+    )
+
+    assert answer is not None
+    assert answer.value == "Sao Paulo"
+    assert answer.reasoning == "city_lookup_query"
+
+
 def test_answer_resolver_maps_inferred_years_to_numeric_option() -> None:
     settings = build_user_agent_settings().model_copy(
         update={
@@ -1009,14 +1083,17 @@ def test_retry_invalid_fields_uses_fresh_answer_resolution_for_remediation() -> 
         captured: dict[str, str] = {}
 
         class FakeResolver:
-            async def resolve(
+            async def resolve_with_validation_feedback(
                 self,
                 field: EasyApplyField,
                 settings: UserAgentSettings,
                 *,
                 posting: JobPosting,
+                validation_message: str | None,
+                current_value: str = "",
+                previous_answer: str | None = None,
             ) -> ResolvedFieldValue | None:
-                del field, settings, posting
+                del field, settings, posting, validation_message, current_value, previous_answer
                 return ResolvedFieldValue(
                     value="2",
                     answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
@@ -1074,17 +1151,19 @@ def test_retry_invalid_fields_uses_fresh_answer_resolution_for_remediation() -> 
                     validation_message="Please enter a valid answer",
                 )
 
-            async def _complete_text_field_interaction(
+            async def _apply_field_value(
                 self,
-                *,
                 page: Page,
+                root: Locator,
                 field: EasyApplyField,
-                target_value: str,
+                resolution: ResolvedFieldValue,
                 settings: UserAgentSettings,
-            ) -> str:
-                del page, field, settings
-                captured["target_value"] = target_value
-                return target_value
+                *,
+                submission_cv_path: Path | None,
+            ) -> str | None:
+                del page, root, field, settings, submission_cv_path
+                captured["target_value"] = resolution.value
+                return resolution.value
 
         executor = ExecutorDouble()
         executor._answer_resolver = cast(LinkedInAnswerResolver, FakeResolver())
@@ -1127,14 +1206,17 @@ def test_retry_invalid_field_prefers_fresh_resolution_when_selection_is_required
         captured: dict[str, str] = {}
 
         class FakeResolver:
-            async def resolve(
+            async def resolve_with_validation_feedback(
                 self,
                 field: EasyApplyField,
                 settings: UserAgentSettings,
                 *,
                 posting: JobPosting,
+                validation_message: str | None,
+                current_value: str = "",
+                previous_answer: str | None = None,
             ) -> ResolvedFieldValue | None:
-                del field, settings, posting
+                del field, settings, posting, validation_message, current_value, previous_answer
                 return ResolvedFieldValue(
                     value="Yes",
                     answer_source=AnswerSource.AI,
@@ -1192,17 +1274,19 @@ def test_retry_invalid_field_prefers_fresh_resolution_when_selection_is_required
                     validation_message="Please make a selection",
                 )
 
-            async def _complete_text_field_interaction(
+            async def _apply_field_value(
                 self,
-                *,
                 page: Page,
+                root: Locator,
                 field: EasyApplyField,
-                target_value: str,
+                resolution: ResolvedFieldValue,
                 settings: UserAgentSettings,
-            ) -> str:
-                del page, field, settings
-                captured["target_value"] = target_value
-                return target_value
+                *,
+                submission_cv_path: Path | None,
+            ) -> str | None:
+                del page, root, field, settings, submission_cv_path
+                captured["target_value"] = resolution.value
+                return resolution.value
 
         executor = ExecutorDouble()
         executor._answer_resolver = cast(LinkedInAnswerResolver, FakeResolver())
@@ -1256,14 +1340,17 @@ def test_retry_invalid_select_field_reapplies_visible_option_with_fresh_resoluti
         captured: dict[str, str] = {}
 
         class FakeResolver:
-            async def resolve(
+            async def resolve_with_validation_feedback(
                 self,
                 field: EasyApplyField,
                 settings: UserAgentSettings,
                 *,
                 posting: JobPosting,
+                validation_message: str | None,
+                current_value: str = "",
+                previous_answer: str | None = None,
             ) -> ResolvedFieldValue | None:
-                del field, settings, posting
+                del field, settings, posting, validation_message, current_value, previous_answer
                 return ResolvedFieldValue(
                     value="Intermediate II",
                     answer_source=AnswerSource.AI,
