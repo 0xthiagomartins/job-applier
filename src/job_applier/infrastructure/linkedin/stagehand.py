@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -392,9 +393,12 @@ class StagehandLinkedInJobDetailExtractor:
                     verbose=0,
                     system_prompt=(
                         "You are reading a LinkedIn jobs search results page for an automation "
-                        "system. Focus only on the main search results list. Ignore premium "
-                        "upsells, job recommendations outside the main list, sidebars, banners, "
-                        "ads, recruiter promos, and global navigation."
+                        "system. Focus only on the main search results list. LinkedIn often shows "
+                        "a split layout where the selected job detail is on the right and the "
+                        "actual result cards are in a list on the left. Treat only that results "
+                        "list as the source of truth for job cards. Ignore the selected job detail "
+                        "pane, premium upsells, job recommendations outside the list, sidebars, "
+                        "banners, ads, recruiter promos, and global navigation."
                     ),
                 )
                 cdp_url = session.data.cdp_url
@@ -423,18 +427,34 @@ class StagehandLinkedInJobDetailExtractor:
                 extraction = await self._extract_search_results_page(session=session, page=page)
                 raw_results = extraction.get("results")
                 results = raw_results if isinstance(raw_results, list) else []
+                if not results:
+                    extraction = await self._extract_search_results_page_retry(
+                        session=session,
+                        page=page,
+                    )
+                    raw_results = extraction.get("results")
+                    results = raw_results if isinstance(raw_results, list) else []
                 cards = tuple(
                     StagehandSearchResultCardExtraction(
                         url=normalized_url,
-                        title=_clean_text(item.get("title")),
-                        company_name=_clean_text(item.get("company_name")),
-                        location=_clean_text(item.get("location")),
+                        title=_clean_card_label(item.get("title")),
+                        company_name=_clean_card_label(item.get("company_name")),
+                        location=_clean_card_label(item.get("location")),
                         easy_apply_visible=_coerce_bool(item.get("easy_apply_visible")),
                     )
                     for item in results
                     if isinstance(item, dict)
                     and (normalized_url := _normalize_linkedin_job_url(item.get("url"))) is not None
                 )
+                if not cards:
+                    observed_actions = await self._observe_search_result_actions(
+                        session=session,
+                        page=page,
+                    )
+                    cards = await self._extract_cards_from_observed_actions(
+                        page=page,
+                        actions=observed_actions,
+                    )
                 append_output_jsonl(
                     "stagehand/search-results.jsonl",
                     {
@@ -720,10 +740,10 @@ class StagehandLinkedInJobDetailExtractor:
             page=page,
             instruction=(
                 "Extract the visible job result cards from the main LinkedIn jobs search results "
-                "list. Ignore sidebars, premium banners, recruiter promotions, global navigation, "
-                "and any content outside the central results list. Return only real job cards that "
-                "a candidate could open from this results page, with their canonical job URL when "
-                "visible."
+                "list. The selected job detail pane on the right is not part of the results list "
+                "and must be ignored. Return only real visible job cards that a candidate could "
+                "open from the results list, with their canonical job URL when visible. If job "
+                "cards are visible in the left-side list, do not return an empty list."
             ),
             schema=_SEARCH_RESULTS_EXTRACT_SCHEMA,
             options={"timeout": float(self._runtime_settings.linkedin_default_timeout_ms)},
@@ -733,6 +753,180 @@ class StagehandLinkedInJobDetailExtractor:
             msg = "Stagehand returned an invalid search-results extraction payload."
             raise StagehandLinkedInError(msg)
         return result
+
+    async def _extract_search_results_page_retry(
+        self,
+        *,
+        session: Any,
+        page: Page,
+    ) -> dict[str, object]:
+        response = await session.extract(
+            page=page,
+            instruction=(
+                "Retry with a narrower focus. Extract up to the first 10 visible job rows from the "
+                "left-side LinkedIn results list only. Ignore the currently selected job detail on "
+                "the right, all banners, ads, recommendations, and any controls that are not part "
+                "of a visible job row. For each visible row, capture the canonical LinkedIn job "
+                "URL, title, company, location, and whether Easy Apply is visibly indicated. If a "
+                "field is unclear, return null for that field, but do not drop the row."
+            ),
+            schema=_SEARCH_RESULTS_EXTRACT_SCHEMA,
+            options={"timeout": float(self._runtime_settings.linkedin_default_timeout_ms)},
+        )
+        result = response.data.result
+        if not isinstance(result, dict):
+            msg = "Stagehand returned an invalid retry search-results extraction payload."
+            raise StagehandLinkedInError(msg)
+        append_output_jsonl(
+            "stagehand/search-results.jsonl",
+            {
+                "kind": "retry_completed",
+                "page_summary": _clean_text(result.get("page_summary")),
+            },
+        )
+        return result
+
+    async def _observe_search_result_actions(
+        self,
+        *,
+        session: Any,
+        page: Page,
+    ) -> tuple[StagehandObservedAction, ...]:
+        response = await session.observe(
+            page=page,
+            instruction=(
+                "Find the visible click actions that would open individual job result rows from "
+                "the main left-side LinkedIn results list. Ignore the selected job detail pane, "
+                "global navigation, filters, save buttons, share buttons, and recruiter promos."
+            ),
+            options={"timeout": float(self._runtime_settings.linkedin_default_timeout_ms)},
+        )
+        actions = tuple(
+            StagehandObservedAction(
+                description=_clean_text(item.description) or "",
+                selector=_clean_text(item.selector) or "",
+                method=_clean_text(item.method),
+                arguments=tuple(str(argument) for argument in (item.arguments or [])),
+            )
+            for item in response.data.result
+            if _clean_text(item.selector)
+        )
+        append_output_jsonl(
+            "stagehand/search-results.jsonl",
+            {
+                "kind": "observe_completed",
+                "action_count": len(actions),
+                "actions": [
+                    {
+                        "description": item.description,
+                        "selector": item.selector,
+                        "method": item.method,
+                        "arguments": list(item.arguments),
+                    }
+                    for item in actions
+                ],
+            },
+        )
+        return actions
+
+    async def _extract_cards_from_observed_actions(
+        self,
+        *,
+        page: Page,
+        actions: tuple[StagehandObservedAction, ...],
+    ) -> tuple[StagehandSearchResultCardExtraction, ...]:
+        selectors = [action.selector for action in actions if action.selector]
+        if not selectors:
+            return ()
+        unique_cards: dict[str, StagehandSearchResultCardExtraction] = {}
+
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                if await locator.count() == 0:
+                    continue
+                payload = await locator.evaluate(
+                    """
+                    (node) => {
+                      const cleanText = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                      const firstTextWithin = (container, selectors) => {
+                        if (!container) return "";
+                        for (const selector of selectors) {
+                          const element = container.querySelector(selector);
+                          const text = cleanText(element?.innerText || element?.textContent || "");
+                          if (text) return text;
+                        }
+                        return "";
+                      };
+                      const anchor = (
+                        node.closest("a[href*='/jobs/view/']")
+                        || node.querySelector?.("a[href*='/jobs/view/']")
+                        || (node.matches?.("a[href*='/jobs/view/']") ? node : null)
+                      );
+                      if (!anchor || !anchor.href) return null;
+                      const url = anchor.href.split("?")[0];
+                      if (!url.includes("/jobs/view/")) return null;
+                      const container = (
+                        anchor.closest(".job-card-container")
+                        || anchor.closest("[data-occludable-job-id]")
+                        || anchor.closest("[data-job-id]")
+                        || anchor.closest("li")
+                        || anchor.closest("div")
+                      );
+                      const lines = cleanText(container?.innerText || anchor.innerText || "")
+                        .split(/\\n+/)
+                        .map((item) => cleanText(item))
+                        .filter(Boolean);
+                      const title = cleanText(
+                        firstTextWithin(container, [
+                          ".job-card-list__title",
+                          ".artdeco-entity-lockup__title",
+                          ".job-card-container__link",
+                          "strong",
+                        ]) || anchor.innerText || lines[0] || ""
+                      );
+                      const companyName = cleanText(
+                        firstTextWithin(container, [
+                          ".artdeco-entity-lockup__subtitle span",
+                          ".artdeco-entity-lockup__subtitle",
+                          ".job-card-container__primary-description",
+                          ".job-card-container__company-name",
+                        ]) || lines[1] || ""
+                      );
+                      const location = cleanText(
+                        firstTextWithin(container, [
+                          ".job-card-container__metadata-item",
+                          ".artdeco-entity-lockup__caption",
+                          ".job-card-container__footer-item",
+                        ]) || lines[2] || ""
+                      );
+                      return {
+                        url,
+                        title: title || null,
+                        company_name: companyName || null,
+                        location: location || null,
+                        easy_apply_visible: lines.some((line) => /easy apply/i.test(line)),
+                      };
+                    }
+                    """
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("stagehand_search_results_observe_hydration_failed", exc_info=True)
+                continue
+            if not isinstance(payload, dict):
+                continue
+            normalized_url = _normalize_linkedin_job_url(payload.get("url"))
+            if normalized_url is None or normalized_url in unique_cards:
+                continue
+            unique_cards[normalized_url] = StagehandSearchResultCardExtraction(
+                url=normalized_url,
+                title=_clean_card_label(payload.get("title")),
+                company_name=_clean_card_label(payload.get("company_name")),
+                location=_clean_card_label(payload.get("location")),
+                easy_apply_visible=_coerce_bool(payload.get("easy_apply_visible")),
+            )
+
+        return tuple(unique_cards.values())
 
     async def _extract_search_surface_state(
         self,
@@ -747,7 +941,8 @@ class StagehandLinkedInJobDetailExtractor:
                 "search results area is ready for extraction, still loading, blocked by an "
                 "unexpected screen, or showing a legitimate empty-results state. Also infer "
                 "whether the Easy Apply and Past 24 hours filters appear active on the current "
-                "results surface when that can be determined confidently."
+                "results surface when that can be determined confidently. Return null instead of "
+                "false when the filter state is ambiguous."
             ),
             schema=_SEARCH_SURFACE_EXTRACT_SCHEMA,
             options={"timeout": float(self._runtime_settings.linkedin_default_timeout_ms)},
@@ -833,6 +1028,19 @@ def _coerce_bool(value: object) -> bool | None:
 def _clean_text(value: object) -> str | None:
     collapsed = " ".join(str(value or "").split()).strip()
     return collapsed or None
+
+
+def _clean_card_label(value: object) -> str | None:
+    collapsed = _clean_text(value)
+    if collapsed is None:
+        return None
+    normalized = re.sub(r"\s+with verification$", "", collapsed, flags=re.IGNORECASE).strip()
+    parts = normalized.split(" ")
+    if len(parts) >= 4 and len(parts) % 2 == 0:
+        midpoint = len(parts) // 2
+        if parts[:midpoint] == parts[midpoint:]:
+            normalized = " ".join(parts[:midpoint])
+    return normalized or None
 
 
 def _stringify_path(value: Path | None) -> str | None:
