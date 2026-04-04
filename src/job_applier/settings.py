@@ -13,6 +13,8 @@ from alembic.config import Config
 from pydantic import AnyUrl, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from job_applier.domain.enums import DebugExecutionStage
+
 
 class RuntimeSettings(BaseSettings):
     """Settings that control local paths and on-premise runtime defaults."""
@@ -33,6 +35,8 @@ class RuntimeSettings(BaseSettings):
     agent_test_mode: bool = False
     agent_max_selected_jobs_per_run: int | None = None
     agent_test_minimum_score_threshold: float | None = None
+    agent_debug_stage: DebugExecutionStage = DebugExecutionStage.FULL
+    agent_debug_max_jobs: int | None = None
     playwright_headless: bool = False
     playwright_trace_enabled: bool = True
     playwright_display: str | None = Field(default=None, alias="DISPLAY")
@@ -132,7 +136,30 @@ class RuntimeSettings(BaseSettings):
 
         if self.agent_max_selected_jobs_per_run is not None:
             return max(1, self.agent_max_selected_jobs_per_run)
+        if self.resolved_agent_debug_stage is DebugExecutionStage.APPLY:
+            return 1
         if self.agent_test_mode:
+            return 1
+        return None
+
+    @property
+    def resolved_agent_debug_stage(self) -> DebugExecutionStage:
+        """Return the effective debug stage for manual staged runs."""
+
+        return self.agent_debug_stage
+
+    @property
+    def resolved_agent_debug_max_jobs(self) -> int | None:
+        """Return how many fetched jobs a staged debug run should inspect before stopping."""
+
+        if self.agent_debug_max_jobs is not None:
+            return max(1, self.agent_debug_max_jobs)
+        if self.resolved_agent_debug_stage in {
+            DebugExecutionStage.SEARCH,
+            DebugExecutionStage.SCORE,
+        }:
+            return 3
+        if self.resolved_agent_debug_stage is DebugExecutionStage.APPLY:
             return 1
         return None
 
@@ -152,6 +179,8 @@ class RuntimeSettings(BaseSettings):
     def resolved_openai_responses_max_retries(self) -> int:
         """Return the effective OpenAI retry budget for the current runtime mode."""
 
+        if self.resolved_agent_debug_stage is not DebugExecutionStage.FULL:
+            return 0
         if self.agent_test_mode:
             return 0
         return max(0, self.openai_responses_max_retries)
@@ -173,6 +202,12 @@ class RuntimeSettings(BaseSettings):
         """Return the effective LinkedIn pagination depth for the current runtime mode."""
 
         max_pages = max(1, self.linkedin_max_search_pages)
+        if self.resolved_agent_debug_stage in {
+            DebugExecutionStage.SEARCH,
+            DebugExecutionStage.SCORE,
+            DebugExecutionStage.APPLY,
+        }:
+            return 1
         if self.agent_test_mode:
             return min(max_pages, 2)
         return max_pages

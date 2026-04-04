@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from job_applier.application.agent_execution import ExecutionRunSummary
 from job_applier.application.panel import PanelSettingsDocument
-from job_applier.domain.enums import ExecutionOrigin
+from job_applier.domain.enums import AgentExecutionStatus, DebugExecutionStage, ExecutionOrigin
 from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
 
 logger = logging.getLogger(__name__)
@@ -19,8 +19,16 @@ logger = logging.getLogger(__name__)
 class ExecutionRunner(Protocol):
     """Minimal protocol required by the scheduler."""
 
-    async def run_execution(self, *, origin: ExecutionOrigin) -> ExecutionRunSummary:
+    async def run_execution(
+        self,
+        *,
+        origin: ExecutionOrigin,
+        stage: DebugExecutionStage | None = None,
+    ) -> ExecutionRunSummary:
         """Run one agent execution."""
+
+    def list_recent_executions(self, *, limit: int = 10) -> list[ExecutionRunSummary]:
+        """Return recent executions for overlap inspection."""
 
 
 class AgentScheduler:
@@ -59,12 +67,27 @@ class AgentScheduler:
             pass
         self._loop_task = None
 
-    async def trigger_now(self) -> ExecutionRunSummary:
+    async def trigger_now(
+        self,
+        *,
+        stage: DebugExecutionStage | None = None,
+    ) -> ExecutionRunSummary:
         """Run the orchestrator manually for debug/testing."""
 
+        if self._run_lock.locked():
+            running = self._find_running_execution()
+            if running is not None:
+                logger.info("agent_scheduler_manual_skip_due_to_running_execution")
+                return running
         async with self._run_lock:
-            logger.info("agent_scheduler_manual_trigger")
-            return await self._orchestrator.run_execution(origin=ExecutionOrigin.MANUAL)
+            logger.info(
+                "agent_scheduler_manual_trigger",
+                extra={"stage": stage.value if stage is not None else None},
+            )
+            return await self._orchestrator.run_execution(
+                origin=ExecutionOrigin.MANUAL,
+                stage=stage,
+            )
 
     async def tick(self, *, now_utc: datetime | None = None) -> ExecutionRunSummary | None:
         """Check the persisted schedule and run the agent when it is due."""
@@ -115,3 +138,11 @@ class AgentScheduler:
         effective_now = now_utc or datetime.now().astimezone()
         timezone = ZoneInfo(document.schedule.timezone)
         return effective_now.astimezone(timezone)
+
+    def _find_running_execution(self) -> ExecutionRunSummary | None:
+        """Return the most recent running execution when one exists."""
+
+        for summary in self._orchestrator.list_recent_executions(limit=5):
+            if summary.status is AgentExecutionStatus.RUNNING:
+                return summary
+        return None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -37,6 +38,7 @@ from job_applier.domain.entities import (
 )
 from job_applier.domain.enums import (
     AgentExecutionStatus,
+    DebugExecutionStage,
     ExecutionEventType,
     ExecutionOrigin,
     SubmissionStatus,
@@ -304,6 +306,8 @@ class AgentExecutionOrchestrator:
         output_dir: Path | None = None,
         max_selected_jobs_per_run: int | None = None,
         test_minimum_score_threshold: float | None = None,
+        debug_stage: DebugExecutionStage = DebugExecutionStage.FULL,
+        debug_max_jobs: int | None = None,
     ) -> None:
         self._panel_store = panel_store
         self._execution_store = execution_store
@@ -321,24 +325,41 @@ class AgentExecutionOrchestrator:
             if test_minimum_score_threshold is not None
             else None
         )
+        self._debug_stage = debug_stage
+        self._debug_max_jobs = max(1, debug_max_jobs) if debug_max_jobs is not None else None
+        self._run_lock = asyncio.Lock()
 
-    async def run_execution(self, *, origin: ExecutionOrigin) -> ExecutionRunSummary:
+    async def run_execution(
+        self,
+        *,
+        origin: ExecutionOrigin,
+        stage: DebugExecutionStage | None = None,
+    ) -> ExecutionRunSummary:
         """Run one agent execution from config load to application attempts."""
 
+        effective_stage = stage or self._debug_stage
+        if self._run_lock.locked():
+            running_summary = self._find_running_summary()
+            if running_summary is not None:
+                return running_summary
         execution_id = uuid4()
         started_at = datetime.now().astimezone()
-        if self._output_dir is not None:
-            reset_run_output(
-                self._output_dir,
-                execution_id=execution_id,
-                origin=origin.value,
-                started_at=started_at,
-            )
+        async with self._run_lock:
+            if self._output_dir is not None:
+                reset_run_output(
+                    self._output_dir,
+                    execution_id=execution_id,
+                    origin=origin.value,
+                    started_at=started_at,
+                )
 
-        with bind_execution_context(execution_id), bind_run_output(self._output_dir):
-            return await self._run_execution_bound(
-                execution_id=execution_id, started_at=started_at, origin=origin
-            )
+            with bind_execution_context(execution_id), bind_run_output(self._output_dir):
+                return await self._run_execution_bound(
+                    execution_id=execution_id,
+                    started_at=started_at,
+                    origin=origin,
+                    stage=effective_stage,
+                )
 
     async def _run_execution_bound(
         self,
@@ -346,6 +367,7 @@ class AgentExecutionOrchestrator:
         execution_id: UUID,
         started_at: datetime,
         origin: ExecutionOrigin,
+        stage: DebugExecutionStage,
     ) -> ExecutionRunSummary:
         """Run one agent execution with a bound structured logging context."""
 
@@ -427,9 +449,18 @@ class AgentExecutionOrchestrator:
                 "current_stage": "config_loaded",
                 "current_job": None,
                 "current_step": None,
+                "debug_stage": stage.value,
             },
         )
         append_timeline_event("config_loaded", {"execution_id": str(execution_id)})
+        append_timeline_event(
+            "debug_stage_selected",
+            {
+                "execution_id": str(execution_id),
+                "stage": stage.value,
+                "debug_max_jobs": self._debug_max_jobs,
+            },
+        )
 
         snapshot = build_profile_snapshot(settings)
         summary = ExecutionRunSummary(
@@ -458,6 +489,7 @@ class AgentExecutionOrchestrator:
                 "current_stage": "fetch_jobs",
                 "current_job": None,
                 "current_step": None,
+                "debug_stage": stage.value,
                 "jobs_seen": 0,
                 "jobs_selected": 0,
                 "successful_submissions": 0,
@@ -473,20 +505,31 @@ class AgentExecutionOrchestrator:
         successful_submissions = 0
         fetch_stage_emitted = False
 
-        async def process_posting(posting: JobPosting) -> bool:
-            nonlocal summary, latest_error, error_count, jobs_selected, successful_submissions
+        def should_stop_after_debug_stage(*, jobs_seen: int) -> bool:
+            if self._debug_max_jobs is None:
+                return False
+            if stage not in {DebugExecutionStage.SEARCH, DebugExecutionStage.SCORE}:
+                return False
+            return jobs_seen >= self._debug_max_jobs
 
-            current_job = {
+        def current_job_payload(posting: JobPosting) -> dict[str, object]:
+            return {
                 "job_posting_id": str(posting.id),
                 "company_name": posting.company_name,
                 "title": posting.title,
                 "url": posting.url,
             }
+
+        async def process_posting(posting: JobPosting) -> bool:
+            nonlocal summary, latest_error, error_count, jobs_selected, successful_submissions
+
+            current_job = current_job_payload(posting)
             update_progress_snapshot(
                 {
                     "status": "running",
                     "current_stage": "score_job",
                     "current_job": current_job,
+                    "debug_stage": stage.value,
                     "jobs_seen": jobs_seen,
                     "jobs_selected": jobs_selected,
                     "successful_submissions": successful_submissions,
@@ -524,6 +567,7 @@ class AgentExecutionOrchestrator:
                         "status": "running",
                         "current_stage": "score_job_failed",
                         "current_job": current_job,
+                        "debug_stage": stage.value,
                         "last_error": latest_error,
                         "jobs_seen": jobs_seen,
                         "jobs_selected": jobs_selected,
@@ -555,12 +599,64 @@ class AgentExecutionOrchestrator:
                         "status": "running",
                         "current_stage": "score_rejected",
                         "current_job": {**current_job, "score": scored_job.score},
+                        "debug_stage": stage.value,
                         "jobs_seen": jobs_seen,
                         "jobs_selected": jobs_selected,
                         "successful_submissions": successful_submissions,
                         "error_count": error_count,
                     },
                 )
+                if stage is DebugExecutionStage.SCORE and should_stop_after_debug_stage(
+                    jobs_seen=jobs_seen
+                ):
+                    append_timeline_event(
+                        "debug_stage_limit_reached",
+                        {
+                            "execution_id": str(execution_id),
+                            "stage": stage.value,
+                            "jobs_seen": jobs_seen,
+                            "debug_max_jobs": self._debug_max_jobs,
+                        },
+                    )
+                    return False
+                return True
+
+            if stage is DebugExecutionStage.SCORE:
+                jobs_selected += 1
+                summary = self._persist_running_summary(
+                    summary,
+                    jobs_selected=jobs_selected,
+                    successful_submissions=successful_submissions,
+                    error_count=error_count,
+                    last_error=latest_error,
+                )
+                update_progress_snapshot(
+                    {
+                        "status": "running",
+                        "current_stage": "score_only_completed",
+                        "current_job": {**current_job, "score": scored_job.score},
+                        "debug_stage": stage.value,
+                        "jobs_seen": jobs_seen,
+                        "jobs_selected": jobs_selected,
+                        "successful_submissions": successful_submissions,
+                        "error_count": error_count,
+                    },
+                )
+                append_timeline_event(
+                    "score_only_completed",
+                    {**current_job, "score": scored_job.score},
+                )
+                if should_stop_after_debug_stage(jobs_seen=jobs_seen):
+                    append_timeline_event(
+                        "debug_stage_limit_reached",
+                        {
+                            "execution_id": str(execution_id),
+                            "stage": stage.value,
+                            "jobs_seen": jobs_seen,
+                            "debug_max_jobs": self._debug_max_jobs,
+                        },
+                    )
+                    return False
                 return True
 
             jobs_selected += 1
@@ -576,6 +672,7 @@ class AgentExecutionOrchestrator:
                     "status": "running",
                     "current_stage": "submit_job",
                     "current_job": {**current_job, "score": scored_job.score},
+                    "debug_stage": stage.value,
                     "jobs_seen": jobs_seen,
                     "jobs_selected": jobs_selected,
                     "successful_submissions": successful_submissions,
@@ -622,6 +719,7 @@ class AgentExecutionOrchestrator:
                             "submission_id": str(existing_submission.id),
                             "skip_reason": "already_applied",
                         },
+                        "debug_stage": stage.value,
                         "jobs_seen": jobs_seen,
                         "jobs_selected": jobs_selected,
                         "successful_submissions": successful_submissions,
@@ -679,6 +777,7 @@ class AgentExecutionOrchestrator:
                         "status": "running",
                         "current_stage": "submit_job_failed",
                         "current_job": current_job,
+                        "debug_stage": stage.value,
                         "last_error": latest_error,
                         "jobs_seen": jobs_seen,
                         "jobs_selected": jobs_selected,
@@ -720,6 +819,7 @@ class AgentExecutionOrchestrator:
                         "status": "running",
                         "current_stage": "submit_skipped",
                         "current_job": {**current_job, "submission_id": str(submission.id)},
+                        "debug_stage": stage.value,
                         "jobs_seen": jobs_seen,
                         "jobs_selected": jobs_selected,
                         "successful_submissions": successful_submissions,
@@ -768,6 +868,7 @@ class AgentExecutionOrchestrator:
                         "status": "running",
                         "current_stage": "submit_failed",
                         "current_job": {**current_job, "submission_id": str(submission.id)},
+                        "debug_stage": stage.value,
                         "last_error": latest_error,
                         "jobs_seen": jobs_seen,
                         "jobs_selected": jobs_selected,
@@ -822,6 +923,7 @@ class AgentExecutionOrchestrator:
                     "status": "running",
                     "current_stage": "submission_completed",
                     "current_job": {**current_job, "submission_id": str(record.submission.id)},
+                    "debug_stage": stage.value,
                     "jobs_seen": jobs_seen,
                     "jobs_selected": jobs_selected,
                     "successful_submissions": successful_submissions,
@@ -852,12 +954,8 @@ class AgentExecutionOrchestrator:
                     {
                         "status": "running",
                         "current_stage": "job_fetched",
-                        "current_job": {
-                            "job_posting_id": str(posting.id),
-                            "company_name": posting.company_name,
-                            "title": posting.title,
-                            "url": posting.url,
-                        },
+                        "current_job": current_job_payload(posting),
+                        "debug_stage": stage.value,
                         "jobs_seen": jobs_seen,
                         "jobs_selected": jobs_selected,
                         "successful_submissions": successful_submissions,
@@ -867,13 +965,36 @@ class AgentExecutionOrchestrator:
                 append_timeline_event(
                     "job_fetched",
                     {
-                        "job_posting_id": str(posting.id),
-                        "company_name": posting.company_name,
-                        "title": posting.title,
-                        "url": posting.url,
+                        **current_job_payload(posting),
                         "jobs_seen": jobs_seen,
                     },
                 )
+                if stage is DebugExecutionStage.SEARCH:
+                    update_progress_snapshot(
+                        {
+                            "status": "running",
+                            "current_stage": "search_only_completed",
+                            "current_job": current_job_payload(posting),
+                            "debug_stage": stage.value,
+                            "jobs_seen": jobs_seen,
+                            "jobs_selected": jobs_selected,
+                            "successful_submissions": successful_submissions,
+                            "error_count": error_count,
+                        },
+                    )
+                    append_timeline_event("search_only_completed", current_job_payload(posting))
+                    if should_stop_after_debug_stage(jobs_seen=jobs_seen):
+                        append_timeline_event(
+                            "debug_stage_limit_reached",
+                            {
+                                "execution_id": str(execution_id),
+                                "stage": stage.value,
+                                "jobs_seen": jobs_seen,
+                                "debug_max_jobs": self._debug_max_jobs,
+                            },
+                        )
+                        return False
+                    return True
                 return await process_posting(posting)
 
             try:
@@ -915,6 +1036,7 @@ class AgentExecutionOrchestrator:
                 {
                     "status": "running",
                     "current_stage": "jobs_fetched",
+                    "debug_stage": stage.value,
                     "jobs_seen": jobs_seen,
                     "jobs_selected": jobs_selected,
                     "successful_submissions": successful_submissions,
@@ -948,6 +1070,7 @@ class AgentExecutionOrchestrator:
                 {
                     "status": "running",
                     "current_stage": "jobs_fetched",
+                    "debug_stage": stage.value,
                     "jobs_seen": jobs_seen,
                     "jobs_selected": jobs_selected,
                     "successful_submissions": successful_submissions,
@@ -1001,6 +1124,7 @@ class AgentExecutionOrchestrator:
                 "current_stage": "execution_completed",
                 "current_job": None,
                 "current_step": None,
+                "debug_stage": stage.value,
                 "jobs_seen": final_summary.jobs_seen,
                 "jobs_selected": final_summary.jobs_selected,
                 "successful_submissions": final_summary.successful_submissions,
@@ -1022,6 +1146,14 @@ class AgentExecutionOrchestrator:
         """Return recent execution summaries."""
 
         return self._execution_store.list_recent_executions(limit=limit)
+
+    def _find_running_summary(self) -> ExecutionRunSummary | None:
+        """Return the most recent running execution summary when one exists."""
+
+        for summary in self.list_recent_executions(limit=5):
+            if summary.status is AgentExecutionStatus.RUNNING:
+                return summary
+        return None
 
     def _finalize_fatal_error(
         self,

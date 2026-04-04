@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from job_applier.application.agent_execution import AgentExecutionOrchestrator
 from job_applier.application.agent_scheduler import AgentScheduler
+from job_applier.domain.enums import DebugExecutionStage
 from job_applier.infrastructure.local_execution_store import LocalExecutionStore
 from job_applier.interface.http.dependencies import (
     get_agent_orchestrator,
@@ -46,8 +47,9 @@ async def list_execution_events(
 @api_router.post("/run")
 async def run_agent_now(
     scheduler: Annotated[AgentScheduler, Depends(get_agent_scheduler)],
+    stage: Annotated[DebugExecutionStage | None, Query()] = None,
 ) -> JSONResponse:
     """Trigger one manual execution for debug/testing."""
 
-    summary = await scheduler.trigger_now()
+    summary = await scheduler.trigger_now(stage=stage)
     return JSONResponse(content={"execution": summary.model_dump(mode="json")})

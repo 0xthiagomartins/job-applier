@@ -112,3 +112,10 @@ class AgentExecutionStatus(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class DebugExecutionStage(StrEnum):
+    FULL = "full"
+    SEARCH = "search"
+    SCORE = "score"
+    APPLY = "apply"

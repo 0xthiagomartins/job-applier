@@ -23,6 +23,7 @@ from job_applier.application.panel import (
 from job_applier.domain import (
     AgentExecutionStatus,
     ApplicationSubmission,
+    DebugExecutionStage,
     ExecutionEventType,
     ExecutionOrigin,
     JobPosting,
@@ -125,16 +126,29 @@ def test_scheduler_runs_once_per_slot_and_supports_manual_trigger(tmp_path: Path
     class FakeOrchestrator:
         def __init__(self) -> None:
             self.origins: list[ExecutionOrigin] = []
+            self.summaries: list[ExecutionRunSummary] = []
 
-        async def run_execution(self, *, origin: ExecutionOrigin) -> ExecutionRunSummary:
+        async def run_execution(
+            self,
+            *,
+            origin: ExecutionOrigin,
+            stage: DebugExecutionStage | None = None,
+        ) -> ExecutionRunSummary:
+            del stage
             self.origins.append(origin)
-            return ExecutionRunSummary(
+            summary = ExecutionRunSummary(
                 execution_id=uuid4(),
                 origin=origin,
                 status=AgentExecutionStatus.COMPLETED,
                 started_at=datetime(2026, 3, 28, 23, 0, tzinfo=UTC),
                 finished_at=datetime(2026, 3, 28, 23, 1, tzinfo=UTC),
             )
+            self.summaries.append(summary)
+            return summary
+
+        def list_recent_executions(self, *, limit: int = 10) -> list[ExecutionRunSummary]:
+            del limit
+            return list(reversed(self.summaries))
 
     fake_orchestrator = FakeOrchestrator()
     scheduler = AgentScheduler(
@@ -159,6 +173,68 @@ def test_scheduler_runs_once_per_slot_and_supports_manual_trigger(tmp_path: Path
     assert second is None
     assert manual.origin is ExecutionOrigin.MANUAL
     assert fake_orchestrator.origins == [ExecutionOrigin.SCHEDULED, ExecutionOrigin.MANUAL]
+
+
+def test_scheduler_manual_trigger_returns_running_execution_when_one_is_active(
+    tmp_path: Path,
+) -> None:
+    panel_store = LocalPanelSettingsStore(root_dir=tmp_path / "panel")
+    panel_store.save_schedule(
+        ScheduleFormInput(
+            frequency=ScheduleFrequency.DAILY,
+            run_at="23:00",
+            timezone="UTC",
+        ),
+    )
+    running_summary = ExecutionRunSummary(
+        execution_id=uuid4(),
+        origin=ExecutionOrigin.MANUAL,
+        status=AgentExecutionStatus.RUNNING,
+        started_at=datetime(2026, 3, 28, 23, 0, tzinfo=UTC),
+    )
+
+    class FakeOrchestrator:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def run_execution(
+            self,
+            *,
+            origin: ExecutionOrigin,
+            stage: DebugExecutionStage | None = None,
+        ) -> ExecutionRunSummary:
+            del origin, stage
+            self.calls += 1
+            self.entered.set()
+            await self.release.wait()
+            return running_summary
+
+        def list_recent_executions(self, *, limit: int = 10) -> list[ExecutionRunSummary]:
+            del limit
+            return [running_summary]
+
+    fake_orchestrator = FakeOrchestrator()
+    scheduler = AgentScheduler(
+        panel_store=panel_store,
+        orchestrator=fake_orchestrator,
+        poll_interval_seconds=1,
+    )
+
+    async def exercise() -> tuple[ExecutionRunSummary, ExecutionRunSummary]:
+        first_task = asyncio.create_task(scheduler.trigger_now())
+        await fake_orchestrator.entered.wait()
+        second = await scheduler.trigger_now()
+        fake_orchestrator.release.set()
+        first = await first_task
+        return first, second
+
+    first, second = asyncio.run(exercise())
+
+    assert first == running_summary
+    assert second == running_summary
+    assert fake_orchestrator.calls == 1
 
 
 def test_orchestrator_only_submits_jobs_that_pass_scoring(tmp_path: Path) -> None:
@@ -375,6 +451,157 @@ def test_orchestrator_starts_processing_during_incremental_fetch(tmp_path: Path)
     assert summary.successful_submissions == 1
     assert fetcher.forwarded_titles == ["Python Automation Engineer 1"]
     assert submitter.calls == ["Python Automation Engineer 1"]
+
+
+def test_orchestrator_search_stage_stops_after_fetch_without_scoring_or_submit(
+    tmp_path: Path,
+) -> None:
+    panel_store = build_ready_panel_store(tmp_path / "panel")
+    execution_store = LocalExecutionStore(root_dir=tmp_path / "executions")
+    submission_store = InMemorySuccessfulSubmissionStore()
+
+    postings = [
+        JobPosting(
+            platform=Platform.LINKEDIN,
+            url=f"https://www.linkedin.com/jobs/view/{index}",
+            title=f"Python Automation Engineer {index}",
+            company_name=f"Company {index}",
+            description_raw="Python automation with FastAPI.",
+        )
+        for index in range(1, 5)
+    ]
+
+    class FakeIncrementalFetcher:
+        async def fetch(self, settings):
+            del settings
+            raise AssertionError("batch fetch should not run in this test")
+
+        async def fetch_incremental(self, settings, on_job):
+            del settings
+            seen = 0
+            for posting in postings:
+                seen += 1
+                should_continue = await on_job(posting)
+                if not should_continue:
+                    break
+            return seen
+
+    class FakeScorer(JobScorer):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def score(self, settings, posting):
+            del settings, posting
+            self.calls += 1
+            raise AssertionError("score should not run in search stage")
+
+    class FakeSubmitter(JobSubmitter):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def submit(self, settings, posting, *, execution_id, origin):
+            del settings, posting, execution_id, origin
+            self.calls += 1
+            raise AssertionError("submit should not run in search stage")
+
+    scorer = FakeScorer()
+    submitter = FakeSubmitter()
+    orchestrator = AgentExecutionOrchestrator(
+        panel_store=panel_store,
+        execution_store=execution_store,
+        successful_submission_store=submission_store,
+        job_fetcher=FakeIncrementalFetcher(),
+        job_scorer=scorer,
+        job_submitter=submitter,
+        debug_stage=DebugExecutionStage.SEARCH,
+        debug_max_jobs=2,
+    )
+
+    summary = asyncio.run(orchestrator.run_execution(origin=ExecutionOrigin.MANUAL))
+    events = execution_store.list_events(summary.execution_id)
+
+    assert summary.status is AgentExecutionStatus.COMPLETED
+    assert summary.jobs_seen == 2
+    assert summary.jobs_selected == 0
+    assert summary.successful_submissions == 0
+    assert scorer.calls == 0
+    assert submitter.calls == 0
+    assert any(event["event_type"] == "job_fetched" for event in events) is False
+
+
+def test_orchestrator_score_stage_scores_without_submitting(tmp_path: Path) -> None:
+    panel_store = build_ready_panel_store(tmp_path / "panel")
+    execution_store = LocalExecutionStore(root_dir=tmp_path / "executions")
+    submission_store = InMemorySuccessfulSubmissionStore()
+
+    postings = [
+        JobPosting(
+            platform=Platform.LINKEDIN,
+            url=f"https://www.linkedin.com/jobs/view/{index}",
+            title=f"Python Automation Engineer {index}",
+            company_name=f"Company {index}",
+            description_raw="Python automation with FastAPI.",
+        )
+        for index in range(1, 4)
+    ]
+
+    class FakeIncrementalFetcher:
+        async def fetch(self, settings):
+            del settings
+            raise AssertionError("batch fetch should not run in this test")
+
+        async def fetch_incremental(self, settings, on_job):
+            del settings
+            seen = 0
+            for posting in postings:
+                seen += 1
+                should_continue = await on_job(posting)
+                if not should_continue:
+                    break
+            return seen
+
+    class FakeScorer(JobScorer):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def score(self, settings, posting):
+            del settings
+            self.calls.append(posting.title)
+            return ScoredJobPosting(posting=posting, selected=True, score=0.88, reason="selected")
+
+    class FakeSubmitter(JobSubmitter):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def submit(self, settings, posting, *, execution_id, origin):
+            del settings, posting, execution_id, origin
+            self.calls += 1
+            raise AssertionError("submit should not run in score stage")
+
+    scorer = FakeScorer()
+    submitter = FakeSubmitter()
+    orchestrator = AgentExecutionOrchestrator(
+        panel_store=panel_store,
+        execution_store=execution_store,
+        successful_submission_store=submission_store,
+        job_fetcher=FakeIncrementalFetcher(),
+        job_scorer=scorer,
+        job_submitter=submitter,
+        debug_stage=DebugExecutionStage.SCORE,
+        debug_max_jobs=2,
+    )
+
+    summary = asyncio.run(orchestrator.run_execution(origin=ExecutionOrigin.MANUAL))
+
+    assert summary.status is AgentExecutionStatus.COMPLETED
+    assert summary.jobs_seen == 2
+    assert summary.jobs_selected == 2
+    assert summary.successful_submissions == 0
+    assert scorer.calls == [
+        "Python Automation Engineer 1",
+        "Python Automation Engineer 2",
+    ]
+    assert submitter.calls == 0
 
 
 def test_orchestrator_can_override_score_threshold_in_test_mode(tmp_path: Path) -> None:

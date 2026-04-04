@@ -123,6 +123,14 @@ For immediate iteration on a single problematic job, set `JOB_APPLIER_LINKEDIN_D
 
 If you also enable `JOB_APPLIER_STAGEHAND_ENABLED=true`, the debug-target path will use Stagehand observe/extract to get a cleaner semantic view of the LinkedIn job page before the parser merges the detail payload.
 
+For stage-by-stage debugging, set `JOB_APPLIER_AGENT_DEBUG_STAGE` to one of:
+- `search`: stop after fetch/hydration so we can validate filters, title parsing, company parsing and page-entry behavior
+- `score`: fetch and score a few jobs without entering `Easy Apply`
+- `apply`: keep the run focused on one selected job
+- `full`: normal end-to-end execution
+
+You can also override the per-stage inspection budget with `JOB_APPLIER_AGENT_DEBUG_MAX_JOBS`, and the manual API accepts `POST /api/agent/run?stage=search` (or `score` / `apply` / `full`) so you can switch stages without editing `.env` between runs.
+
 ## Quality commands
 
 Run lint:

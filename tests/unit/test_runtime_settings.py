@@ -2,6 +2,7 @@ from pathlib import Path
 
 from pydantic import AnyUrl, TypeAdapter
 
+from job_applier.domain import DebugExecutionStage
 from job_applier.settings import (
     RuntimeSettings,
     initialize_runtime_environment,
@@ -47,6 +48,19 @@ def test_runtime_settings_test_mode_enables_cheaper_single_job_execution() -> No
     assert settings.resolved_browser_agent_stall_threshold == 6
     assert settings.resolved_agent_max_selected_jobs_per_run == 1
     assert settings.resolved_agent_test_minimum_score_threshold == 0.5
+
+
+def test_runtime_settings_stage_debug_mode_limits_scope_for_iterative_debug() -> None:
+    settings = RuntimeSettings(
+        agent_debug_stage=DebugExecutionStage.SCORE,
+        linkedin_max_search_pages=5,
+        openai_responses_max_retries=4,
+    )
+
+    assert settings.resolved_agent_debug_stage is DebugExecutionStage.SCORE
+    assert settings.resolved_agent_debug_max_jobs == 3
+    assert settings.resolved_openai_responses_max_retries == 0
+    assert settings.resolved_linkedin_max_search_pages == 1
 
 
 def test_runtime_settings_debug_target_forces_zero_score_threshold_in_test_mode() -> None:
