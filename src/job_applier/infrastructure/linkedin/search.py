@@ -55,6 +55,54 @@ RESULTS_PER_PAGE = 25
 RESULTS_PAGE_MAX_SCROLL_ROUNDS = 12
 RESULTS_PAGE_STALE_SCROLL_ROUNDS = 2
 _DETAIL_PLACEHOLDER_TOKENS = frozenset({"linkedin debug target", "linkedin", "job search"})
+_NON_COMPANY_EXACT_TOKENS = frozenset(
+    {
+        "save",
+        "apply",
+        "easy apply",
+        "share",
+        "follow",
+        "message",
+        "more",
+        "report",
+        "dismiss",
+        "close",
+        "next",
+        "review",
+        "submit",
+        "done",
+        "back",
+    }
+)
+_NON_COMPANY_SUBSTRING_TOKENS = (
+    "applicant",
+    "candidate",
+    "há ",
+    "hour ago",
+    "hours ago",
+    "day ago",
+    "days ago",
+    "week ago",
+    "weeks ago",
+    "promoted",
+    "premium",
+    "search smarter",
+    "free trial",
+    "continue with premium",
+    "easy apply",
+    "reposted",
+    "full-time",
+    "contract",
+    "temporary",
+    "response insights",
+    "message hiring managers",
+    "with verification",
+    "report this job",
+    "see who was hired",
+    "see who is viewing your profile",
+    "get ai-powered advice",
+    "resume match",
+)
 
 
 class LinkedInSearchError(RuntimeError):
@@ -265,30 +313,9 @@ def _looks_like_non_company_line(value: str) -> bool:
         return True
     if _looks_like_location_line(normalized):
         return True
-    return any(
-        token in normalized
-        for token in (
-            "applicant",
-            "candidate",
-            "há ",
-            "hour ago",
-            "hours ago",
-            "day ago",
-            "days ago",
-            "week ago",
-            "weeks ago",
-            "promoted",
-            "premium",
-            "search smarter",
-            "free trial",
-            "continue with premium",
-            "easy apply",
-            "reposted",
-            "full-time",
-            "contract",
-            "temporary",
-        )
-    )
+    if normalized in _NON_COMPANY_EXACT_TOKENS:
+        return True
+    return any(token in normalized for token in _NON_COMPANY_SUBSTRING_TOKENS)
 
 
 def _looks_like_noisy_listing_card(listing: LinkedInCollectedJob) -> bool:
@@ -371,10 +398,10 @@ def merge_job_detail_payload(
     company_name = ""
     for candidate in (
         _collapse_text(detail_payload.get("structured_company_name")),
-        _collapse_text(detail_payload.get("company_name")),
         *company_candidates,
         *top_card_lines_after_title,
         *top_card_lines,
+        _collapse_text(detail_payload.get("company_name")),
         normalized_listing_company,
     ):
         if not candidate or _looks_like_placeholder_label(candidate):

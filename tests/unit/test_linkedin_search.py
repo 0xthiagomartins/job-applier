@@ -815,6 +815,78 @@ def test_merge_job_detail_payload_prefers_structured_job_posting_company() -> No
     assert merged.company_name == "Payfy"
 
 
+def test_merge_job_detail_payload_ignores_action_and_insight_labels_when_recovering_company() -> (
+    None
+):
+    listing = LinkedInCollectedJob(
+        external_job_id="1234567890",
+        url="https://www.linkedin.com/jobs/view/1234567890/",
+        title="LinkedIn debug target",
+        company_name="LinkedIn debug target",
+        location=None,
+        description_raw="",
+        easy_apply=True,
+    )
+
+    merged = merge_job_detail_payload(
+        listing,
+        {
+            "title": "Senior Python Engineer",
+            "company_name": "Save",
+            "location": "",
+            "description_raw": "Build resilient Python services.",
+            "metadata_text": "Save | Apply | No response insights available yet",
+            "easy_apply": True,
+            "title_candidates": ["Senior Python Engineer"],
+            "company_candidates": (
+                "Save",
+                "No response insights available yet",
+                "Example Corp",
+            ),
+            "top_card_lines": (
+                "Senior Python Engineer",
+                "Save",
+                "No response insights available yet",
+                "Example Corp",
+                "Sao Paulo, SP, Brazil",
+                "Over 100 applicants",
+            ),
+        },
+    )
+
+    assert merged.company_name == "Example Corp"
+    assert merged.location == "Sao Paulo, SP, Brazil"
+
+
+def test_merge_job_detail_payload_keeps_valid_listing_company_when_detail_is_ui_noise() -> None:
+    listing = LinkedInCollectedJob(
+        external_job_id="1234567890",
+        url="https://www.linkedin.com/jobs/view/1234567890/",
+        title="Senior Python Engineer",
+        company_name="Example Corp",
+        location="Sao Paulo, SP, Brazil",
+        description_raw="",
+        easy_apply=True,
+    )
+
+    merged = merge_job_detail_payload(
+        listing,
+        {
+            "title": "Senior Python Engineer",
+            "company_name": "Save",
+            "location": "Sao Paulo, SP, Brazil",
+            "description_raw": "Build resilient Python services.",
+            "metadata_text": "Save | Apply | Premium",
+            "easy_apply": True,
+            "title_candidates": ["Senior Python Engineer"],
+            "company_candidates": (),
+            "top_card_lines": ("Senior Python Engineer", "Save", "Apply"),
+        },
+    )
+
+    assert merged.company_name == "Example Corp"
+
+
 def test_load_job_details_with_resilience_falls_back_to_listing_after_retries(
     tmp_path: Path,
 ) -> None:
