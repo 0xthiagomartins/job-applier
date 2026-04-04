@@ -101,6 +101,12 @@ _NON_COMPANY_SUBSTRING_TOKENS = (
     "see who was hired",
     "see who is viewing your profile",
     "get ai-powered advice",
+    "use ai to assess",
+    "assess how you fit",
+    "how you fit",
+    "see how you compare",
+    "see how you match",
+    "show match details",
     "resume match",
 )
 
@@ -398,11 +404,11 @@ def merge_job_detail_payload(
     company_name = ""
     for candidate in (
         _collapse_text(detail_payload.get("structured_company_name")),
+        _collapse_text(detail_payload.get("company_name")),
+        normalized_listing_company,
         *company_candidates,
         *top_card_lines_after_title,
         *top_card_lines,
-        _collapse_text(detail_payload.get("company_name")),
-        normalized_listing_company,
     ):
         if not candidate or _looks_like_placeholder_label(candidate):
             continue

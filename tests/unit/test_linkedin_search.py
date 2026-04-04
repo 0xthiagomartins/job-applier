@@ -887,6 +887,72 @@ def test_merge_job_detail_payload_keeps_valid_listing_company_when_detail_is_ui_
     assert merged.company_name == "Example Corp"
 
 
+def test_merge_job_detail_payload_ignores_ai_fit_promo_when_listing_company_is_valid() -> None:
+    listing = LinkedInCollectedJob(
+        external_job_id="4385543326",
+        url="https://www.linkedin.com/jobs/view/4385543326/",
+        title="Senior Data Developer (AWS, Python, Pyspark), Brasil",
+        company_name="CI&T",
+        location="Brazil",
+        description_raw="",
+        easy_apply=True,
+    )
+
+    merged = merge_job_detail_payload(
+        listing,
+        {
+            "title": "Senior Data Developer (AWS, Python, Pyspark), Brasil",
+            "company_name": "",
+            "location": "Brazil",
+            "description_raw": "Build resilient data platforms.",
+            "metadata_text": "Use AI to assess how you fit",
+            "easy_apply": True,
+            "title_candidates": ["Senior Data Developer (AWS, Python, Pyspark), Brasil"],
+            "company_candidates": ("Use AI to assess how you fit",),
+            "top_card_lines": (
+                "Senior Data Developer (AWS, Python, Pyspark), Brasil",
+                "Use AI to assess how you fit",
+                "Brazil",
+            ),
+        },
+    )
+
+    assert merged.company_name == "CI&T"
+
+
+def test_merge_job_detail_payload_keeps_valid_listing_company_over_match_details_banner() -> None:
+    listing = LinkedInCollectedJob(
+        external_job_id="4385543326",
+        url="https://www.linkedin.com/jobs/view/4385543326/",
+        title="Senior Data Developer (AWS, Python, Pyspark), Brasil",
+        company_name="CI&T",
+        location="Brazil",
+        description_raw="",
+        easy_apply=True,
+    )
+
+    merged = merge_job_detail_payload(
+        listing,
+        {
+            "title": "Senior Data Developer (AWS, Python, Pyspark), Brasil",
+            "company_name": "",
+            "location": "Brazil",
+            "description_raw": "Build resilient data platforms.",
+            "metadata_text": "Show match details",
+            "easy_apply": True,
+            "title_candidates": ["Senior Data Developer (AWS, Python, Pyspark), Brasil"],
+            "company_candidates": ("Show match details",),
+            "top_card_lines": (
+                "Senior Data Developer (AWS, Python, Pyspark), Brasil",
+                "Show match details",
+                "Brazil",
+            ),
+        },
+    )
+
+    assert merged.company_name == "CI&T"
+
+
 def test_load_job_details_with_resilience_falls_back_to_listing_after_retries(
     tmp_path: Path,
 ) -> None:
