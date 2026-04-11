@@ -777,6 +777,7 @@ class PlaywrightLinkedInJobsClient:
                     )
                     await self._goto_paginated_results_page(
                         page,
+                        criteria=criteria,
                         target_page_url=target_page_url,
                         page_index=page_index + 1,
                     )
@@ -1009,25 +1010,17 @@ class PlaywrightLinkedInJobsClient:
         await self._pause_before_navigation(page, reason="search_results_entry")
         await page.goto(direct_results_url, wait_until="domcontentloaded")
         await self._ensure_authenticated_page(page)
-        if await self._wait_for_extractable_search_cards(page):
-            append_output_jsonl(
-                "run.log",
-                {
-                    "source": "linkedin_search",
-                    "kind": "search_entry_ready_via_cards",
-                    "url": page.url,
-                },
-            )
-            await self._capture_screenshot(page, run_dir / "jobs-search-entry.png")
-            return
         try:
-            await self._wait_for_search_surface(page, criteria=criteria)
+            assessment = await self._wait_for_search_surface(page, criteria=criteria)
             append_output_jsonl(
                 "run.log",
                 {
                     "source": "linkedin_search",
-                    "kind": "search_entry_ready_via_assessment",
+                    "kind": "search_entry_ready",
                     "url": page.url,
+                    "status": assessment.status,
+                    "summary": assessment.summary,
+                    "evidence": list(assessment.evidence),
                 },
             )
             await self._capture_screenshot(page, run_dir / "jobs-search-entry.png")
@@ -1060,6 +1053,7 @@ class PlaywrightLinkedInJobsClient:
         self,
         page: Page,
         *,
+        criteria: LinkedInSearchCriteria,
         target_page_url: str,
         page_index: int,
     ) -> None:
@@ -1088,6 +1082,7 @@ class PlaywrightLinkedInJobsClient:
                 )
                 if await self._results_page_navigation_succeeded(
                     page,
+                    criteria=criteria,
                     target_page_url=target_page_url,
                 ):
                     return
@@ -1099,13 +1094,14 @@ class PlaywrightLinkedInJobsClient:
         self,
         page: Page,
         *,
+        criteria: LinkedInSearchCriteria,
         target_page_url: str,
     ) -> bool:
         current_params = dict(parse_qsl(urlparse(page.url).query, keep_blank_values=True))
         target_params = dict(parse_qsl(urlparse(target_page_url).query, keep_blank_values=True))
         if current_params.get("start", "0") != target_params.get("start", "0"):
             return False
-        return await self._wait_for_extractable_search_cards(page, attempts=2)
+        return await self._search_results_ready(page, criteria=criteria)
 
     async def _complete_search_with_browser_agent(
         self,
@@ -1262,6 +1258,35 @@ class PlaywrightLinkedInJobsClient:
         current_url = getattr(page, "url", "")
         last_assessment: BrowserTaskAssessment | None = None
         for attempt in range(5):
+            if self._prefers_stagehand_search_semantics():
+                stagehand_assessment = await self._maybe_assess_search_surface_with_stagehand(
+                    page,
+                    criteria=criteria,
+                )
+                if stagehand_assessment is not None:
+                    last_assessment = stagehand_assessment
+                    append_output_jsonl(
+                        "run.log",
+                        {
+                            "source": "linkedin_search",
+                            "kind": "search_surface_stagehand_assessment",
+                            "attempt": attempt + 1,
+                            "status": stagehand_assessment.status,
+                            "confidence": stagehand_assessment.confidence,
+                            "summary": stagehand_assessment.summary,
+                            "evidence": list(stagehand_assessment.evidence),
+                            "url": current_url,
+                        },
+                    )
+                    if stagehand_assessment.status == "complete":
+                        return stagehand_assessment
+                    if stagehand_assessment.status == "blocked":
+                        msg = (
+                            stagehand_assessment.summary
+                            or "LinkedIn search is blocked on the current screen."
+                        )
+                        raise LinkedInSearchError(msg)
+
             if await self._wait_for_extractable_search_cards(page, attempts=1):
                 append_output_jsonl(
                     "run.log",
@@ -1278,33 +1303,35 @@ class PlaywrightLinkedInJobsClient:
                     summary="LinkedIn job cards are already visible on the results page.",
                     evidence=("job_cards_visible",),
                 )
-            stagehand_assessment = await self._maybe_assess_search_surface_with_stagehand(
-                page,
-                criteria=criteria,
-            )
-            if stagehand_assessment is not None:
-                last_assessment = stagehand_assessment
-                append_output_jsonl(
-                    "run.log",
-                    {
-                        "source": "linkedin_search",
-                        "kind": "search_surface_stagehand_assessment",
-                        "attempt": attempt + 1,
-                        "status": stagehand_assessment.status,
-                        "confidence": stagehand_assessment.confidence,
-                        "summary": stagehand_assessment.summary,
-                        "evidence": list(stagehand_assessment.evidence),
-                        "url": current_url,
-                    },
+
+            if not self._prefers_stagehand_search_semantics():
+                stagehand_assessment = await self._maybe_assess_search_surface_with_stagehand(
+                    page,
+                    criteria=criteria,
                 )
-                if stagehand_assessment.status == "complete":
-                    return stagehand_assessment
-                if stagehand_assessment.status == "blocked":
-                    msg = (
-                        stagehand_assessment.summary
-                        or "LinkedIn search is blocked on the current screen."
+                if stagehand_assessment is not None:
+                    last_assessment = stagehand_assessment
+                    append_output_jsonl(
+                        "run.log",
+                        {
+                            "source": "linkedin_search",
+                            "kind": "search_surface_stagehand_assessment",
+                            "attempt": attempt + 1,
+                            "status": stagehand_assessment.status,
+                            "confidence": stagehand_assessment.confidence,
+                            "summary": stagehand_assessment.summary,
+                            "evidence": list(stagehand_assessment.evidence),
+                            "url": current_url,
+                        },
                     )
-                    raise LinkedInSearchError(msg)
+                    if stagehand_assessment.status == "complete":
+                        return stagehand_assessment
+                    if stagehand_assessment.status == "blocked":
+                        msg = (
+                            stagehand_assessment.summary
+                            or "LinkedIn search is blocked on the current screen."
+                        )
+                        raise LinkedInSearchError(msg)
             assessment = await self._assess_search_surface(page, criteria=criteria)
             last_assessment = assessment
             append_output_jsonl(
@@ -1340,14 +1367,26 @@ class PlaywrightLinkedInJobsClient:
         *,
         criteria: LinkedInSearchCriteria,
     ) -> bool:
+        if self._prefers_stagehand_search_semantics():
+            stagehand_assessment = await self._maybe_assess_search_surface_with_stagehand(
+                page,
+                criteria=criteria,
+            )
+            if stagehand_assessment is not None:
+                if stagehand_assessment.status == "complete":
+                    return True
+                if await self._wait_for_extractable_search_cards(page, attempts=1):
+                    return True
+                return False
         if await self._wait_for_extractable_search_cards(page, attempts=1):
             return True
-        stagehand_assessment = await self._maybe_assess_search_surface_with_stagehand(
-            page,
-            criteria=criteria,
-        )
-        if stagehand_assessment is not None:
-            return stagehand_assessment.status == "complete"
+        if not self._prefers_stagehand_search_semantics():
+            stagehand_assessment = await self._maybe_assess_search_surface_with_stagehand(
+                page,
+                criteria=criteria,
+            )
+            if stagehand_assessment is not None:
+                return stagehand_assessment.status == "complete"
         assessment = await self._assess_search_surface(page, criteria=criteria)
         return assessment.status == "complete"
 
@@ -1543,6 +1582,18 @@ class PlaywrightLinkedInJobsClient:
         *,
         page_index: int,
     ) -> LinkedInResultsPageCollection:
+        semantic_listings = await self._collect_listing_cards_with_stagehand_primary(
+            page=page,
+            page_index=page_index,
+        )
+        if semantic_listings is not None:
+            return LinkedInResultsPageCollection(
+                listings=semantic_listings,
+                rounds=1,
+                visible_listing_count=len(semantic_listings),
+                stale_rounds=0,
+            )
+
         collected_by_url: dict[str, LinkedInCollectedJob] = {}
         stale_rounds = 0
         last_visible_listing_count = 0
@@ -1604,6 +1655,76 @@ class PlaywrightLinkedInJobsClient:
             visible_listing_count=last_visible_listing_count,
             stale_rounds=stale_rounds,
         )
+
+    async def _collect_listing_cards_with_stagehand_primary(
+        self,
+        page: Page,
+        *,
+        page_index: int,
+    ) -> tuple[LinkedInCollectedJob, ...] | None:
+        extractor = self._active_stagehand_job_detail_extractor
+        if extractor is None:
+            return None
+
+        extract_search_results_page = getattr(extractor, "extract_search_results_page", None)
+        if extract_search_results_page is None:
+            return None
+
+        try:
+            stagehand_cards = await extract_search_results_page(
+                url=page.url,
+                storage_state_path=self._runtime_settings.resolved_linkedin_storage_state_path,
+                chrome_path=self._playwright_executable_path,
+            )
+        except StagehandLinkedInError as exc:
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "linkedin_search",
+                    "kind": "stagehand_results_page_primary_failed",
+                    "page_index": page_index,
+                    "url": page.url,
+                    "message": str(exc),
+                },
+            )
+            return None
+
+        listings = tuple(
+            LinkedInCollectedJob(
+                external_job_id=self._extract_job_id_from_url(card.url),
+                url=card.url,
+                title=card.title or "LinkedIn job result",
+                company_name=card.company_name or "LinkedIn job result",
+                location=card.location,
+                description_raw="",
+                easy_apply=card.easy_apply_visible,
+                metadata_text="",
+            )
+            for card in stagehand_cards
+            if card.url
+        )
+        if not listings:
+            return None
+
+        append_output_jsonl(
+            "run.log",
+            {
+                "source": "linkedin_search",
+                "kind": "stagehand_results_page_primary_applied",
+                "page_index": page_index,
+                "url": page.url,
+                "listing_count": len(listings),
+            },
+        )
+        append_timeline_event(
+            "linkedin_search_results_page_stagehand_primary_applied",
+            {
+                "page_index": page_index,
+                "url": page.url,
+                "listing_count": len(listings),
+            },
+        )
+        return listings
 
     async def _scroll_results_surface(self, page: Page) -> dict[str, object]:
         payload = await page.evaluate(
@@ -2323,6 +2444,9 @@ class PlaywrightLinkedInJobsClient:
             ),
             evidence=tuple(evidence),
         )
+
+    def _prefers_stagehand_search_semantics(self) -> bool:
+        return self._active_stagehand_job_detail_extractor is not None
 
     def _listing_cards_need_semantic_repair(
         self,

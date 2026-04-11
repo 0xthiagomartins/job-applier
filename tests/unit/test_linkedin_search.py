@@ -361,7 +361,14 @@ def test_wait_for_search_surface_short_circuits_when_job_cards_are_visible(tmp_p
 
 def test_wait_for_search_surface_uses_stagehand_complete_assessment(tmp_path: Path) -> None:
     runtime_settings = RuntimeSettings(data_dir=tmp_path, stagehand_enabled=True)
-    client = PlaywrightLinkedInJobsClient(runtime_settings)
+
+    class FakeStagehandExtractor:
+        pass
+
+    client = PlaywrightLinkedInJobsClient(
+        runtime_settings,
+        stagehand_job_detail_extractor=FakeStagehandExtractor(),  # type: ignore[arg-type]
+    )
     criteria = build_search_criteria(build_user_agent_settings(), runtime_settings)
 
     class FakePage:
@@ -409,7 +416,14 @@ def test_wait_for_search_surface_uses_stagehand_complete_assessment(tmp_path: Pa
 
 def test_search_results_ready_uses_stagehand_surface_assessment(tmp_path: Path) -> None:
     runtime_settings = RuntimeSettings(data_dir=tmp_path, stagehand_enabled=True)
-    client = PlaywrightLinkedInJobsClient(runtime_settings)
+
+    class FakeStagehandExtractor:
+        pass
+
+    client = PlaywrightLinkedInJobsClient(
+        runtime_settings,
+        stagehand_job_detail_extractor=FakeStagehandExtractor(),  # type: ignore[arg-type]
+    )
     criteria = build_search_criteria(build_user_agent_settings(), runtime_settings)
 
     class FakePage:
@@ -446,6 +460,63 @@ def test_search_results_ready_uses_stagehand_surface_assessment(tmp_path: Path) 
         )
         client._assess_search_surface = fail_assessment  # type: ignore[method-assign]
         assert await client._search_results_ready(cast(Page, FakePage()), criteria=criteria) is True
+
+    asyncio.run(scenario())
+
+
+def test_wait_for_search_surface_prefers_stagehand_before_card_probe_when_enabled(
+    tmp_path: Path,
+) -> None:
+    runtime_settings = RuntimeSettings(data_dir=tmp_path, stagehand_enabled=True)
+
+    class FakeStagehandExtractor:
+        pass
+
+    client = PlaywrightLinkedInJobsClient(
+        runtime_settings,
+        stagehand_job_detail_extractor=FakeStagehandExtractor(),  # type: ignore[arg-type]
+    )
+    criteria = build_search_criteria(build_user_agent_settings(), runtime_settings)
+
+    class FakePage:
+        url = "https://www.linkedin.com/jobs/search/?keywords=python"
+
+        async def wait_for_timeout(self, milliseconds: int) -> None:
+            raise AssertionError("The search surface should not wait after Stagehand completes.")
+
+    async def scenario() -> None:
+        async def fail_has_cards(page: object, *, attempts: int = 3) -> bool:
+            del page, attempts
+            raise AssertionError("Card probing should not run before Stagehand in semantic mode.")
+
+        async def fake_stagehand_assess(
+            page: object,
+            *,
+            criteria: LinkedInSearchCriteria,
+        ) -> BrowserTaskAssessment | None:
+            del page, criteria
+            return BrowserTaskAssessment(
+                status="complete",
+                confidence=0.92,
+                summary="Stagehand already confirmed the results surface.",
+                evidence=("stagehand_results_ready",),
+            )
+
+        async def fail_assessment(
+            page: object,
+            criteria: LinkedInSearchCriteria,
+        ) -> BrowserTaskAssessment:
+            del page, criteria
+            raise AssertionError("Browser assessment should not run after Stagehand completes.")
+
+        client._wait_for_extractable_search_cards = fail_has_cards  # type: ignore[method-assign]
+        client._maybe_assess_search_surface_with_stagehand = (  # type: ignore[method-assign]
+            fake_stagehand_assess
+        )
+        client._assess_search_surface = fail_assessment  # type: ignore[method-assign]
+        result = await client._wait_for_search_surface(cast(Page, FakePage()), criteria=criteria)
+        assert result.status == "complete"
+        assert "stagehand" in result.summary.lower()
 
     asyncio.run(scenario())
 
@@ -546,9 +617,129 @@ def test_collect_listing_cards_from_results_page_hydrates_virtualized_results(
     asyncio.run(scenario())
 
 
+def test_collect_listing_cards_from_results_page_uses_stagehand_as_primary_source(
+    tmp_path: Path,
+) -> None:
+    runtime_settings = RuntimeSettings(data_dir=tmp_path, stagehand_enabled=True)
+
+    class FakeStagehandExtractor:
+        async def extract_search_results_page(
+            self,
+            *,
+            url: str,
+            storage_state_path: Path,
+            chrome_path: str | None = None,
+        ) -> tuple[StagehandSearchResultCardExtraction, ...]:
+            del storage_state_path, chrome_path
+            assert url == "https://www.linkedin.com/jobs/search/?keywords=python"
+            return (
+                StagehandSearchResultCardExtraction(
+                    url="https://www.linkedin.com/jobs/view/1234567890/",
+                    title="Senior Python Engineer",
+                    company_name="Example Corp",
+                    location="Sao Paulo, SP, Brazil",
+                    easy_apply_visible=True,
+                ),
+            )
+
+    client = PlaywrightLinkedInJobsClient(
+        runtime_settings,
+        stagehand_job_detail_extractor=FakeStagehandExtractor(),  # type: ignore[arg-type]
+    )
+
+    async def scenario() -> None:
+        async def fail_extract(page: object) -> list[LinkedInCollectedJob]:
+            del page
+            raise AssertionError("DOM extraction should not run when Stagehand succeeds.")
+
+        async def fail_scroll(page: object) -> dict[str, object]:
+            del page
+            raise AssertionError("Scroll should not run when Stagehand already returned cards.")
+
+        client._extract_listing_cards = fail_extract  # type: ignore[method-assign]
+        client._scroll_results_surface = fail_scroll  # type: ignore[method-assign]
+        page = cast(
+            Page,
+            type(
+                "FakePage", (), {"url": "https://www.linkedin.com/jobs/search/?keywords=python"}
+            )(),
+        )
+        collection = await client._collect_listing_cards_from_results_page(page, page_index=1)
+        assert len(collection.listings) == 1
+        assert collection.rounds == 1
+        assert collection.listings[0].title == "Senior Python Engineer"
+        assert collection.listings[0].company_name == "Example Corp"
+
+    asyncio.run(scenario())
+
+
+def test_collect_listing_cards_from_results_page_falls_back_to_dom_when_stagehand_returns_empty(
+    tmp_path: Path,
+) -> None:
+    runtime_settings = RuntimeSettings(data_dir=tmp_path, stagehand_enabled=True)
+
+    class FakeStagehandExtractor:
+        async def extract_search_results_page(
+            self,
+            *,
+            url: str,
+            storage_state_path: Path,
+            chrome_path: str | None = None,
+        ) -> tuple[StagehandSearchResultCardExtraction, ...]:
+            del url, storage_state_path, chrome_path
+            return ()
+
+    client = PlaywrightLinkedInJobsClient(
+        runtime_settings,
+        stagehand_job_detail_extractor=FakeStagehandExtractor(),  # type: ignore[arg-type]
+    )
+    dom_listing = LinkedInCollectedJob(
+        external_job_id="1234567890",
+        url="https://www.linkedin.com/jobs/view/1234567890/",
+        title="Senior Python Engineer",
+        company_name="Example Corp",
+        location="Sao Paulo, SP, Brazil",
+        description_raw="Build resilient Python services.",
+        easy_apply=True,
+        metadata_text="Senior Python Engineer | Example Corp | Sao Paulo, SP, Brazil",
+    )
+
+    class FakePage:
+        url = "https://www.linkedin.com/jobs/search/?keywords=python"
+
+        async def wait_for_timeout(self, milliseconds: int) -> None:
+            del milliseconds
+            return None
+
+    async def scenario() -> None:
+        calls = {"extract": 0, "scroll": 0}
+
+        async def fake_extract(page: object) -> list[LinkedInCollectedJob]:
+            del page
+            calls["extract"] += 1
+            return [dom_listing]
+
+        async def fake_scroll(page: object) -> dict[str, object]:
+            del page
+            calls["scroll"] += 1
+            return {"scrolled": False}
+
+        client._extract_listing_cards = fake_extract  # type: ignore[method-assign]
+        client._scroll_results_surface = fake_scroll  # type: ignore[method-assign]
+        collection = await client._collect_listing_cards_from_results_page(
+            cast(Page, FakePage()),
+            page_index=1,
+        )
+        assert collection.listings == (dom_listing,)
+        assert calls == {"extract": 1, "scroll": 1}
+
+    asyncio.run(scenario())
+
+
 def test_paginated_results_navigation_retries_after_timeout(tmp_path: Path) -> None:
     runtime_settings = RuntimeSettings(data_dir=tmp_path, linkedin_default_timeout_ms=15_000)
     client = PlaywrightLinkedInJobsClient(runtime_settings)
+    criteria = build_search_criteria(build_user_agent_settings(), runtime_settings)
 
     class FakePage:
         def __init__(self) -> None:
@@ -573,20 +764,19 @@ def test_paginated_results_navigation_retries_after_timeout(tmp_path: Path) -> N
             self.waits.append(milliseconds)
 
     async def scenario() -> None:
-        async def fake_wait_for_extractable_search_cards(
+        async def fake_search_results_ready(
             page: object,
             *,
-            attempts: int = 3,
+            criteria: LinkedInSearchCriteria,
         ) -> bool:
-            del page, attempts
+            del page, criteria
             return False
 
-        client._wait_for_extractable_search_cards = (  # type: ignore[method-assign]
-            fake_wait_for_extractable_search_cards
-        )
+        client._search_results_ready = fake_search_results_ready  # type: ignore[method-assign]
         page = FakePage()
         await client._goto_paginated_results_page(
             cast(Page, page),
+            criteria=criteria,
             target_page_url=(
                 "https://www.linkedin.com/jobs/search/?keywords=python+automation&start=25"
             ),
@@ -602,6 +792,7 @@ def test_paginated_results_navigation_retries_after_timeout(tmp_path: Path) -> N
 def test_paginated_results_navigation_accepts_ready_page_after_timeout(tmp_path: Path) -> None:
     runtime_settings = RuntimeSettings(data_dir=tmp_path, linkedin_default_timeout_ms=15_000)
     client = PlaywrightLinkedInJobsClient(runtime_settings)
+    criteria = build_search_criteria(build_user_agent_settings(), runtime_settings)
 
     class FakePage:
         def __init__(self) -> None:
@@ -621,19 +812,18 @@ def test_paginated_results_navigation_accepts_ready_page_after_timeout(tmp_path:
             raise AssertionError("retry wait should not happen when the page is already ready")
 
     async def scenario() -> None:
-        async def fake_wait_for_extractable_search_cards(
+        async def fake_search_results_ready(
             page: object,
             *,
-            attempts: int = 3,
+            criteria: LinkedInSearchCriteria,
         ) -> bool:
-            del page, attempts
+            del page, criteria
             return True
 
-        client._wait_for_extractable_search_cards = (  # type: ignore[method-assign]
-            fake_wait_for_extractable_search_cards
-        )
+        client._search_results_ready = fake_search_results_ready  # type: ignore[method-assign]
         await client._goto_paginated_results_page(
             cast(Page, FakePage()),
+            criteria=criteria,
             target_page_url=(
                 "https://www.linkedin.com/jobs/search/?keywords=python+automation&start=25"
             ),
