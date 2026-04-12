@@ -604,6 +604,196 @@ def test_orchestrator_score_stage_scores_without_submitting(tmp_path: Path) -> N
     assert submitter.calls == 0
 
 
+def test_orchestrator_stage_override_uses_default_search_budget(tmp_path: Path) -> None:
+    panel_store = build_ready_panel_store(tmp_path / "panel")
+    execution_store = LocalExecutionStore(root_dir=tmp_path / "executions")
+    submission_store = InMemorySuccessfulSubmissionStore()
+
+    postings = [
+        JobPosting(
+            platform=Platform.LINKEDIN,
+            url=f"https://www.linkedin.com/jobs/view/{index}",
+            title=f"Python Automation Engineer {index}",
+            company_name=f"Company {index}",
+            description_raw="Python automation with FastAPI.",
+        )
+        for index in range(1, 6)
+    ]
+
+    class FakeIncrementalFetcher:
+        async def fetch(self, settings):
+            del settings
+            raise AssertionError("batch fetch should not run in this test")
+
+        async def fetch_incremental(self, settings, on_job):
+            del settings
+            seen = 0
+            for posting in postings:
+                seen += 1
+                should_continue = await on_job(posting)
+                if not should_continue:
+                    break
+            return seen
+
+    class FakeScorer(JobScorer):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def score(self, settings, posting):
+            del settings, posting
+            self.calls += 1
+            raise AssertionError("score should not run in search stage")
+
+    orchestrator = AgentExecutionOrchestrator(
+        panel_store=panel_store,
+        execution_store=execution_store,
+        successful_submission_store=submission_store,
+        job_fetcher=FakeIncrementalFetcher(),
+        job_scorer=FakeScorer(),
+        debug_stage=DebugExecutionStage.FULL,
+        debug_max_jobs=None,
+    )
+
+    summary = asyncio.run(
+        orchestrator.run_execution(
+            origin=ExecutionOrigin.MANUAL,
+            stage=DebugExecutionStage.SEARCH,
+        )
+    )
+
+    assert summary.status is AgentExecutionStatus.COMPLETED
+    assert summary.jobs_seen == 3
+    assert summary.jobs_selected == 0
+    assert summary.successful_submissions == 0
+
+
+def test_orchestrator_stage_override_preserves_explicit_debug_budget(tmp_path: Path) -> None:
+    panel_store = build_ready_panel_store(tmp_path / "panel")
+    execution_store = LocalExecutionStore(root_dir=tmp_path / "executions")
+    submission_store = InMemorySuccessfulSubmissionStore()
+
+    postings = [
+        JobPosting(
+            platform=Platform.LINKEDIN,
+            url=f"https://www.linkedin.com/jobs/view/{index}",
+            title=f"Python Automation Engineer {index}",
+            company_name=f"Company {index}",
+            description_raw="Python automation with FastAPI.",
+        )
+        for index in range(1, 6)
+    ]
+
+    class FakeIncrementalFetcher:
+        async def fetch(self, settings):
+            del settings
+            raise AssertionError("batch fetch should not run in this test")
+
+        async def fetch_incremental(self, settings, on_job):
+            del settings
+            seen = 0
+            for posting in postings:
+                seen += 1
+                should_continue = await on_job(posting)
+                if not should_continue:
+                    break
+            return seen
+
+    class FakeScorer(JobScorer):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def score(self, settings, posting):
+            del settings, posting
+            self.calls += 1
+            raise AssertionError("score should not run in search stage")
+
+    orchestrator = AgentExecutionOrchestrator(
+        panel_store=panel_store,
+        execution_store=execution_store,
+        successful_submission_store=submission_store,
+        job_fetcher=FakeIncrementalFetcher(),
+        job_scorer=FakeScorer(),
+        debug_stage=DebugExecutionStage.FULL,
+        debug_max_jobs=2,
+    )
+
+    summary = asyncio.run(
+        orchestrator.run_execution(
+            origin=ExecutionOrigin.MANUAL,
+            stage=DebugExecutionStage.SEARCH,
+        )
+    )
+
+    assert summary.status is AgentExecutionStatus.COMPLETED
+    assert summary.jobs_seen == 2
+    assert summary.jobs_selected == 0
+    assert summary.successful_submissions == 0
+
+
+def test_orchestrator_passes_stage_override_to_stage_aware_incremental_fetcher(
+    tmp_path: Path,
+) -> None:
+    panel_store = build_ready_panel_store(tmp_path / "panel")
+    execution_store = LocalExecutionStore(root_dir=tmp_path / "executions")
+    submission_store = InMemorySuccessfulSubmissionStore()
+
+    posting = JobPosting(
+        platform=Platform.LINKEDIN,
+        url="https://www.linkedin.com/jobs/view/1",
+        title="Python Automation Engineer",
+        company_name="Acme",
+        description_raw="Python automation with FastAPI.",
+    )
+
+    class FakeStageAwareIncrementalFetcher:
+        def __init__(self) -> None:
+            self.stages: list[DebugExecutionStage] = []
+
+        async def fetch(self, settings):
+            del settings
+            raise AssertionError("batch fetch should not run in this test")
+
+        async def fetch_incremental(self, settings, on_job):
+            del settings, on_job
+            raise AssertionError("stage-aware incremental path should be used")
+
+        async def fetch_incremental_for_stage(self, settings, on_job, *, stage):
+            del settings
+            self.stages.append(stage)
+            await on_job(posting)
+            return 1
+
+    class FakeScorer(JobScorer):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def score(self, settings, posting):
+            del settings, posting
+            self.calls += 1
+            raise AssertionError("score should not run in search stage")
+
+    fetcher = FakeStageAwareIncrementalFetcher()
+    orchestrator = AgentExecutionOrchestrator(
+        panel_store=panel_store,
+        execution_store=execution_store,
+        successful_submission_store=submission_store,
+        job_fetcher=fetcher,
+        job_scorer=FakeScorer(),
+        debug_stage=DebugExecutionStage.FULL,
+    )
+
+    summary = asyncio.run(
+        orchestrator.run_execution(
+            origin=ExecutionOrigin.MANUAL,
+            stage=DebugExecutionStage.SEARCH,
+        )
+    )
+
+    assert summary.status is AgentExecutionStatus.COMPLETED
+    assert summary.jobs_seen == 1
+    assert fetcher.stages == [DebugExecutionStage.SEARCH]
+
+
 def test_orchestrator_can_override_score_threshold_in_test_mode(tmp_path: Path) -> None:
     panel_store = build_ready_panel_store(tmp_path / "panel")
     execution_store = LocalExecutionStore(root_dir=tmp_path / "executions")

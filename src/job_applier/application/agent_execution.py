@@ -112,6 +112,33 @@ class IncrementalJobFetcher(Protocol):
         """
 
 
+@runtime_checkable
+class StageAwareJobFetcher(Protocol):
+    """Optional fetcher contract that can adapt behavior to a staged debug request."""
+
+    async def fetch_for_stage(
+        self,
+        settings: UserAgentSettings,
+        *,
+        stage: DebugExecutionStage,
+    ) -> list[JobPosting]:
+        """Return jobs with stage-specific runtime behavior applied."""
+
+
+@runtime_checkable
+class StageAwareIncrementalJobFetcher(Protocol):
+    """Optional incremental fetcher contract that receives the effective debug stage."""
+
+    async def fetch_incremental_for_stage(
+        self,
+        settings: UserAgentSettings,
+        on_job: Callable[[JobPosting], Awaitable[bool]],
+        *,
+        stage: DebugExecutionStage,
+    ) -> int:
+        """Persist and emit jobs with stage-specific runtime behavior applied."""
+
+
 class JobScorer(Protocol):
     """Port used to qualify a posting before application."""
 
@@ -338,6 +365,7 @@ class AgentExecutionOrchestrator:
         """Run one agent execution from config load to application attempts."""
 
         effective_stage = stage or self._debug_stage
+        effective_debug_max_jobs = self._resolve_debug_max_jobs(effective_stage)
         if self._run_lock.locked():
             running_summary = self._find_running_summary()
             if running_summary is not None:
@@ -359,6 +387,7 @@ class AgentExecutionOrchestrator:
                     started_at=started_at,
                     origin=origin,
                     stage=effective_stage,
+                    debug_max_jobs=effective_debug_max_jobs,
                 )
 
     async def _run_execution_bound(
@@ -368,6 +397,7 @@ class AgentExecutionOrchestrator:
         started_at: datetime,
         origin: ExecutionOrigin,
         stage: DebugExecutionStage,
+        debug_max_jobs: int | None,
     ) -> ExecutionRunSummary:
         """Run one agent execution with a bound structured logging context."""
 
@@ -458,7 +488,7 @@ class AgentExecutionOrchestrator:
             {
                 "execution_id": str(execution_id),
                 "stage": stage.value,
-                "debug_max_jobs": self._debug_max_jobs,
+                "debug_max_jobs": debug_max_jobs,
             },
         )
 
@@ -506,11 +536,11 @@ class AgentExecutionOrchestrator:
         fetch_stage_emitted = False
 
         def should_stop_after_debug_stage(*, jobs_seen: int) -> bool:
-            if self._debug_max_jobs is None:
+            if debug_max_jobs is None:
                 return False
             if stage not in {DebugExecutionStage.SEARCH, DebugExecutionStage.SCORE}:
                 return False
-            return jobs_seen >= self._debug_max_jobs
+            return jobs_seen >= debug_max_jobs
 
         def current_job_payload(posting: JobPosting) -> dict[str, object]:
             return {
@@ -615,7 +645,7 @@ class AgentExecutionOrchestrator:
                             "execution_id": str(execution_id),
                             "stage": stage.value,
                             "jobs_seen": jobs_seen,
-                            "debug_max_jobs": self._debug_max_jobs,
+                            "debug_max_jobs": debug_max_jobs,
                         },
                     )
                     return False
@@ -653,7 +683,7 @@ class AgentExecutionOrchestrator:
                             "execution_id": str(execution_id),
                             "stage": stage.value,
                             "jobs_seen": jobs_seen,
-                            "debug_max_jobs": self._debug_max_jobs,
+                            "debug_max_jobs": debug_max_jobs,
                         },
                     )
                     return False
@@ -990,7 +1020,7 @@ class AgentExecutionOrchestrator:
                                 "execution_id": str(execution_id),
                                 "stage": stage.value,
                                 "jobs_seen": jobs_seen,
-                                "debug_max_jobs": self._debug_max_jobs,
+                                "debug_max_jobs": debug_max_jobs,
                             },
                         )
                         return False
@@ -998,10 +1028,17 @@ class AgentExecutionOrchestrator:
                 return await process_posting(posting)
 
             try:
-                jobs_seen = await self._job_fetcher.fetch_incremental(
-                    settings,
-                    process_incremental_job,
-                )
+                if isinstance(self._job_fetcher, StageAwareIncrementalJobFetcher):
+                    jobs_seen = await self._job_fetcher.fetch_incremental_for_stage(
+                        settings,
+                        process_incremental_job,
+                        stage=stage,
+                    )
+                else:
+                    jobs_seen = await self._job_fetcher.fetch_incremental(
+                        settings,
+                        process_incremental_job,
+                    )
             except Exception as exc:  # noqa: BLE001
                 return self._finalize_fatal_error(
                     summary=summary.model_copy(update={"jobs_seen": jobs_seen}),
@@ -1011,7 +1048,10 @@ class AgentExecutionOrchestrator:
                 )
         else:
             try:
-                jobs = await self._job_fetcher.fetch(settings)
+                if isinstance(self._job_fetcher, StageAwareJobFetcher):
+                    jobs = await self._job_fetcher.fetch_for_stage(settings, stage=stage)
+                else:
+                    jobs = await self._job_fetcher.fetch(settings)
             except Exception as exc:  # noqa: BLE001
                 return self._finalize_fatal_error(
                     summary=summary,
@@ -1153,6 +1193,17 @@ class AgentExecutionOrchestrator:
         for summary in self.list_recent_executions(limit=5):
             if summary.status is AgentExecutionStatus.RUNNING:
                 return summary
+        return None
+
+    def _resolve_debug_max_jobs(self, stage: DebugExecutionStage) -> int | None:
+        """Return the effective staged budget for the requested execution stage."""
+
+        if self._debug_max_jobs is not None:
+            return self._debug_max_jobs
+        if stage in {DebugExecutionStage.SEARCH, DebugExecutionStage.SCORE}:
+            return 3
+        if stage is DebugExecutionStage.APPLY:
+            return 1
         return None
 
     def _finalize_fatal_error(

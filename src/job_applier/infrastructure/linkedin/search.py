@@ -20,7 +20,7 @@ from job_applier.application.agent_execution import JobFetcher
 from job_applier.application.config import UserAgentSettings
 from job_applier.application.repositories import JobPostingRepository
 from job_applier.domain.entities import JobPosting
-from job_applier.domain.enums import Platform, SeniorityLevel, WorkplaceType
+from job_applier.domain.enums import DebugExecutionStage, Platform, SeniorityLevel, WorkplaceType
 from job_applier.infrastructure.linkedin.auth import (
     LinkedInAuthError,
     LinkedInCredentials,
@@ -194,6 +194,8 @@ class IncrementalLinkedInJobsClient(Protocol):
 def build_search_criteria(
     settings: UserAgentSettings,
     runtime_settings: RuntimeSettings,
+    *,
+    stage: DebugExecutionStage | None = None,
 ) -> LinkedInSearchCriteria:
     """Build LinkedIn search criteria from the user and runtime settings."""
 
@@ -205,11 +207,33 @@ def build_search_criteria(
         workplace_types=settings.search.workplace_types,
         seniority=settings.search.seniority,
         easy_apply_only=settings.search.easy_apply_only,
-        max_pages=runtime_settings.resolved_linkedin_max_search_pages,
+        max_pages=_resolve_search_max_pages(runtime_settings, stage=stage),
         debug_target_job_url=runtime_settings.resolved_linkedin_debug_target_job_url,
         ai_api_key=settings.ai.api_key,
         ai_model=settings.ai.model,
     )
+
+
+def _resolve_search_max_pages(
+    runtime_settings: RuntimeSettings,
+    *,
+    stage: DebugExecutionStage | None = None,
+) -> int:
+    """Return the effective pagination depth for the current fetch context."""
+
+    if stage is None:
+        return runtime_settings.resolved_linkedin_max_search_pages
+
+    max_pages = max(1, runtime_settings.linkedin_max_search_pages)
+    if stage in {
+        DebugExecutionStage.SEARCH,
+        DebugExecutionStage.SCORE,
+        DebugExecutionStage.APPLY,
+    }:
+        return 1
+    if runtime_settings.agent_test_mode:
+        return min(max_pages, 2)
+    return max_pages
 
 
 def build_paginated_search_url(url: str, *, page_index: int) -> str:
@@ -500,7 +524,15 @@ class LinkedInJobFetcher(JobFetcher):
         self._parser = parser or LinkedInJobParser()
 
     async def fetch(self, settings: UserAgentSettings) -> list[JobPosting]:
-        criteria = build_search_criteria(settings, self._runtime_settings)
+        return await self.fetch_for_stage(settings, stage=DebugExecutionStage.FULL)
+
+    async def fetch_for_stage(
+        self,
+        settings: UserAgentSettings,
+        *,
+        stage: DebugExecutionStage,
+    ) -> list[JobPosting]:
+        criteria = build_search_criteria(settings, self._runtime_settings, stage=stage)
         logger.info("linkedin_search_started", extra=criteria.to_log_payload())
 
         collected_jobs = await self._client.fetch_jobs(criteria)
@@ -556,7 +588,22 @@ class LinkedInJobFetcher(JobFetcher):
     ) -> int:
         """Persist jobs incrementally and hand them to the orchestrator immediately."""
 
-        criteria = build_search_criteria(settings, self._runtime_settings)
+        return await self.fetch_incremental_for_stage(
+            settings,
+            on_job,
+            stage=DebugExecutionStage.FULL,
+        )
+
+    async def fetch_incremental_for_stage(
+        self,
+        settings: UserAgentSettings,
+        on_job: Callable[[JobPosting], Awaitable[bool]],
+        *,
+        stage: DebugExecutionStage,
+    ) -> int:
+        """Persist jobs incrementally and hand them to the orchestrator immediately."""
+
+        criteria = build_search_criteria(settings, self._runtime_settings, stage=stage)
         logger.info("linkedin_search_started", extra=criteria.to_log_payload())
 
         seen_keys: set[str] = set()

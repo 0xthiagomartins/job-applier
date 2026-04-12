@@ -19,6 +19,7 @@ from job_applier.application.config import (
     UserProfileConfig,
 )
 from job_applier.domain import (
+    DebugExecutionStage,
     JobPosting,
     Platform,
     ScheduleFrequency,
@@ -116,6 +117,21 @@ def test_search_criteria_caps_page_depth_in_agent_test_mode(tmp_path: Path) -> N
     criteria = build_search_criteria(build_user_agent_settings(), runtime_settings)
 
     assert criteria.max_pages == 2
+
+
+def test_search_criteria_caps_page_depth_for_search_stage_override(tmp_path: Path) -> None:
+    runtime_settings = RuntimeSettings(
+        data_dir=tmp_path,
+        linkedin_max_search_pages=8,
+    )
+
+    criteria = build_search_criteria(
+        build_user_agent_settings(),
+        runtime_settings,
+        stage=DebugExecutionStage.SEARCH,
+    )
+
+    assert criteria.max_pages == 1
 
 
 def test_search_criteria_carries_debug_target_job_url(tmp_path: Path) -> None:
@@ -257,6 +273,56 @@ def test_linkedin_job_fetcher_streams_incrementally_and_can_stop_early(tmp_path:
     assert forwarded_titles == ["Automation Engineer"]
     assert len(stored) == 1
     assert stored[0].external_job_id == "job-001"
+
+
+def test_linkedin_job_fetcher_applies_stage_specific_search_budget(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'linkedin-search-stage-aware.db').resolve()}"
+    upgrade_to_head(database_url)
+
+    runtime_settings = RuntimeSettings(data_dir=tmp_path, linkedin_max_search_pages=8)
+    repository = SqliteJobPostingRepository(create_session_factory(database_url))
+    settings = build_user_agent_settings()
+
+    class FakeIncrementalLinkedInJobsClient:
+        async def fetch_jobs(self, criteria: LinkedInSearchCriteria) -> list[LinkedInCollectedJob]:
+            del criteria
+            raise AssertionError("batch fetch should not run when incremental streaming exists")
+
+        async def stream_jobs(
+            self,
+            criteria: LinkedInSearchCriteria,
+            on_job: Callable[[LinkedInCollectedJob], Awaitable[bool]],
+        ) -> None:
+            assert criteria.max_pages == 1
+            await on_job(
+                LinkedInCollectedJob(
+                    external_job_id="job-001",
+                    url="https://www.linkedin.com/jobs/view/job-001",
+                    title="Automation Engineer",
+                    company_name="Acme",
+                    location="Remote",
+                    description_raw="Build browser automation.",
+                    easy_apply=True,
+                    metadata_text="Remote | Mid-Senior level | Easy Apply",
+                )
+            )
+
+    fetcher = LinkedInJobFetcher(
+        client=FakeIncrementalLinkedInJobsClient(),
+        runtime_settings=runtime_settings,
+        job_repository=repository,
+    )
+
+    async def scenario() -> int:
+        return await fetcher.fetch_incremental_for_stage(
+            settings,
+            lambda posting: _collect_posting_and_continue(posting, []),
+            stage=DebugExecutionStage.SEARCH,
+        )
+
+    jobs_seen = asyncio.run(scenario())
+
+    assert jobs_seen == 1
 
 
 def test_wait_for_search_surface_returns_after_first_complete_assessment(tmp_path: Path) -> None:
@@ -1441,6 +1507,11 @@ def test_build_search_surface_assessment_from_stagehand_marks_pending_when_filte
 async def _collect_posting_and_stop(posting: JobPosting, forwarded_titles: list[str]) -> bool:
     forwarded_titles.append(posting.title)
     return False
+
+
+async def _collect_posting_and_continue(posting: JobPosting, forwarded_titles: list[str]) -> bool:
+    forwarded_titles.append(posting.title)
+    return True
 
 
 def build_user_agent_settings() -> UserAgentSettings:
