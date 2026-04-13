@@ -30,6 +30,7 @@ Suite shape:
   - successful-submission persistence only
   - artifacts, recruiter interactions and execution events
   - referential integrity and repository contracts
+  - already-applied smoke for the submit gate
 - `e2e`: controlled environment
   - panel configuration
   - manual execution trigger
@@ -43,6 +44,12 @@ uv run ruff check .
 uv run mypy src tests
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest
 cd apps/panel && npm run typecheck && npm run build
+```
+
+Targeted smoke for the already-applied guard:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest tests/integration/test_already_applied_smoke.py
 ```
 
 Rule of thumb:
