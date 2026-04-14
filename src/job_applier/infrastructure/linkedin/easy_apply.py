@@ -383,6 +383,41 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     )
                 except LinkedInEasyApplyError as exc:
                     notes = str(exc) or "Browser agent could not open the Easy Apply modal."
+                    already_applied_notes = await self._detect_existing_application_on_job_page(
+                        page,
+                        settings=settings,
+                    )
+                    if already_applied_notes is not None:
+                        artifacts.extend(
+                            await self._capture_debug_bundle(
+                                page,
+                                run_dir=run_dir,
+                                submission_id=submission_id,
+                                label="skip_already_applied",
+                            ),
+                        )
+                        self._record_event(
+                            execution_events,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            event_type=ExecutionEventType.JOB_PROCESSED,
+                            payload={
+                                "job_posting_id": str(posting.id),
+                                "origin": origin.value,
+                                "reason": "already_applied",
+                                "status": SubmissionStatus.SKIPPED.value,
+                                "notes": already_applied_notes,
+                            },
+                        )
+                        return EasyApplyExecutionResult(
+                            submission_id=submission_id,
+                            started_at=started_at,
+                            status=SubmissionStatus.SKIPPED,
+                            notes=already_applied_notes,
+                            execution_events=tuple(execution_events),
+                            artifacts=tuple(artifacts),
+                            recruiter_interactions=tuple(recruiter_interactions),
+                        )
                     logger.info(
                         "linkedin_easy_apply_unavailable",
                         extra={
@@ -417,6 +452,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         started_at=started_at,
                         status=SubmissionStatus.FAILED,
                         notes=notes,
+                        execution_events=tuple(execution_events),
+                        artifacts=tuple(artifacts),
+                        recruiter_interactions=tuple(recruiter_interactions),
                     )
                 update_progress_snapshot(
                     {
@@ -2392,6 +2430,46 @@ class PlaywrightLinkedInEasyApplyExecutor:
             "Browser agent could not open the LinkedIn Easy Apply modal from the current job page."
         )
         raise LinkedInEasyApplyError(msg)
+
+    async def _detect_existing_application_on_job_page(
+        self,
+        page: Page,
+        *,
+        settings: UserAgentSettings,
+    ) -> str | None:
+        try:
+            assessment = await self._assess_browser_state_with_agent(
+                page,
+                settings=settings,
+                task_name="linkedin_job_page_existing_application",
+                goal=(
+                    "Determine whether the current LinkedIn job page already shows that this "
+                    "account previously applied to the job. Do not try to start the application "
+                    "flow during this assessment."
+                ),
+                extra_rules=(
+                    (
+                        "Use complete only when the visible page explicitly indicates an existing "
+                        "application for this account, such as application submitted, already "
+                        "applied, or a dedicated application status tied to this job."
+                    ),
+                    (
+                        "Use blocked when the page lacks an Easy Apply entry point for another "
+                        "visible reason such as external application, no longer accepting "
+                        "applications, or another non-account-specific blocker."
+                    ),
+                    "Use unknown when the evidence is mixed or insufficient.",
+                    (
+                        "When the page shows an application status section with submitted or "
+                        "already-applied language, prefer complete."
+                    ),
+                ),
+            )
+        except LinkedInEasyApplyError:
+            return None
+        if assessment.status != "complete":
+            return None
+        return assessment.summary or "LinkedIn indicates this job was already applied to."
 
     async def _progress_easy_apply_step_with_agent(
         self,

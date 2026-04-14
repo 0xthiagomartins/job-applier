@@ -39,6 +39,7 @@ from job_applier.infrastructure.linkedin import (
 )
 from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserAgentAction,
+    BrowserTaskAssessment,
     OpenAIResponsesBrowserAgent,
 )
 from job_applier.infrastructure.linkedin.easy_apply import (
@@ -1324,6 +1325,55 @@ def test_retry_invalid_fields_uses_fresh_answer_resolution_for_remediation() -> 
         )
 
         assert captured["target_value"] == "2"
+
+    asyncio.run(scenario())
+
+
+def test_detect_existing_application_on_job_page_uses_agentic_assessment() -> None:
+    async def scenario() -> None:
+        settings = build_user_agent_settings()
+
+        class ExecutorDouble(PlaywrightLinkedInEasyApplyExecutor):
+            def __init__(self) -> None:
+                pass
+
+            async def _assess_browser_state_with_agent(
+                self,
+                page: Page,
+                *,
+                settings: UserAgentSettings,
+                task_name: str,
+                goal: str,
+                extra_rules: tuple[str, ...] = (),
+                recent_actions: tuple[dict[str, object], ...] = (),
+                step_index: int = 0,
+                focus_locator: Locator | None = None,
+            ) -> BrowserTaskAssessment:
+                del page, settings, recent_actions, step_index, focus_locator
+                assert task_name == "linkedin_job_page_existing_application"
+                assert "previously applied" in goal
+                assert any("application status section" in rule for rule in extra_rules)
+                return BrowserTaskAssessment(
+                    status="complete",
+                    confidence=0.98,
+                    summary=(
+                        "The page shows an application status section stating the "
+                        "application was submitted already."
+                    ),
+                    evidence=("application_status_submitted",),
+                )
+
+        executor = ExecutorDouble()
+
+        notes = await executor._detect_existing_application_on_job_page(
+            cast(Page, object()),
+            settings=settings,
+        )
+
+        assert notes == (
+            "The page shows an application status section stating the application was "
+            "submitted already."
+        )
 
     asyncio.run(scenario())
 
