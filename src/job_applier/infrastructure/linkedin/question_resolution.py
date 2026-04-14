@@ -203,6 +203,15 @@ class GuardrailAnswer:
     reasoning: str
 
 
+@dataclass(frozen=True, slots=True)
+class ValidationFeedbackContext:
+    """Structured context describing why the previous field attempt was rejected."""
+
+    validation_message: str | None = None
+    current_value: str = ""
+    previous_answer: str | None = None
+
+
 class AmbiguousAnswerGenerator(Protocol):
     """Generate a best-effort answer when deterministic resolution is not possible."""
 
@@ -212,6 +221,7 @@ class AmbiguousAnswerGenerator(Protocol):
         field: EasyApplyField,
         settings: UserAgentSettings,
         posting: JobPosting,
+        validation_context: ValidationFeedbackContext | None = None,
     ) -> GeneratedAnswer | None:
         """Return a generated answer or `None` when the generator cannot help."""
 
@@ -553,6 +563,7 @@ class OpenAIResponsesAnswerGenerator:
         field: EasyApplyField,
         settings: UserAgentSettings,
         posting: JobPosting,
+        validation_context: ValidationFeedbackContext | None = None,
     ) -> GeneratedAnswer | None:
         """Generate a structured answer using the user's configured model and key."""
 
@@ -567,7 +578,12 @@ class OpenAIResponsesAnswerGenerator:
         }:
             return None
 
-        prompt_payload = self._build_prompt_payload(field=field, settings=settings, posting=posting)
+        prompt_payload = self._build_prompt_payload(
+            field=field,
+            settings=settings,
+            posting=posting,
+            validation_context=validation_context,
+        )
         logger.info(
             "linkedin_ai_autofill_prompt",
             extra={
@@ -718,7 +734,10 @@ class OpenAIResponsesAnswerGenerator:
                                 "For language proficiency ladders, prefer conservative middle "
                                 "options such as intermediate when exact data is missing. "
                                 "Do not invent legal, visa, or certification facts. "
-                                "Keep free-text answers concise, professional, and believable."
+                                "Keep free-text answers concise, professional, and believable. "
+                                "When validation feedback is provided, assume the previous "
+                                "attempt was rejected, use that feedback to repair the answer, "
+                                "and avoid repeating the same invalid value."
                             ),
                         },
                     ],
@@ -769,6 +788,7 @@ class OpenAIResponsesAnswerGenerator:
         field: EasyApplyField,
         settings: UserAgentSettings,
         posting: JobPosting,
+        validation_context: ValidationFeedbackContext | None = None,
     ) -> dict[str, object]:
         profile_payload = {
             "name": settings.profile.name,
@@ -791,7 +811,7 @@ class OpenAIResponsesAnswerGenerator:
             "availability": settings.profile.availability,
             "default_responses": settings.profile.default_responses,
         }
-        return {
+        prompt_payload: dict[str, object] = {
             "question": field.question_raw,
             "normalized_key": field.normalized_key,
             "question_type": field.question_type.value,
@@ -868,6 +888,27 @@ class OpenAIResponsesAnswerGenerator:
             },
             "candidate_profile": profile_payload,
         }
+        if validation_context is not None and any(
+            (
+                _non_empty_value(validation_context.validation_message),
+                _non_empty_value(validation_context.current_value),
+                _non_empty_value(validation_context.previous_answer),
+            )
+        ):
+            prompt_payload["validation_feedback"] = {
+                "validation_message": validation_context.validation_message,
+                "current_value": validation_context.current_value,
+                "previous_answer": validation_context.previous_answer,
+                "repair_policy": [
+                    (
+                        "Treat the validation message as direct evidence of why the prior "
+                        "answer failed."
+                    ),
+                    ("Do not repeat the same invalid answer unless you are only repairing format."),
+                    "Prefer the smallest plausible correction that satisfies the validation.",
+                ],
+            }
+        return prompt_payload
 
     def _build_experience_inference_context(
         self,
@@ -1056,16 +1097,46 @@ class LinkedInAnswerResolver:
     ) -> ResolvedFieldValue | None:
         normalized_validation = normalize_text(validation_message or "")
         adapted_field = self._adapt_field_for_validation_feedback(field, normalized_validation)
+        validation_context = ValidationFeedbackContext(
+            validation_message=validation_message,
+            current_value=current_value,
+            previous_answer=previous_answer,
+        )
         candidates: list[ResolvedFieldValue] = []
+        has_feedback_ai_candidate = False
 
-        if adapted_field != field:
+        if (
+            settings.ruleset.allow_best_effort_autofill
+            and not _looks_like_sensitive_demographic_question(adapted_field)
+        ):
+            feedback_ai_answer = await self._generate_ai_answer(
+                field=adapted_field,
+                settings=settings,
+                posting=posting,
+                validation_context=validation_context,
+            )
+            if feedback_ai_answer is not None:
+                candidates.append(
+                    ResolvedFieldValue(
+                        value=feedback_ai_answer.value,
+                        answer_source=AnswerSource.AI,
+                        fill_strategy=FillStrategy.AUTOFILL_AI,
+                        ambiguity_flag=True,
+                        confidence=feedback_ai_answer.confidence,
+                        reasoning=feedback_ai_answer.reasoning,
+                    )
+                )
+                has_feedback_ai_candidate = True
+
+        if adapted_field != field and not has_feedback_ai_candidate:
             adapted_resolution = await self.resolve(adapted_field, settings, posting=posting)
             if adapted_resolution is not None:
                 candidates.append(adapted_resolution)
 
-        base_resolution = await self.resolve(field, settings, posting=posting)
-        if base_resolution is not None:
-            candidates.append(base_resolution)
+        if not has_feedback_ai_candidate:
+            base_resolution = await self.resolve(field, settings, posting=posting)
+            if base_resolution is not None:
+                candidates.append(base_resolution)
 
         for raw_value, reasoning in (
             (previous_answer, "reuse_previous_answer_with_validation_feedback"),
@@ -1121,12 +1192,14 @@ class LinkedInAnswerResolver:
         field: EasyApplyField,
         settings: UserAgentSettings,
         posting: JobPosting,
+        validation_context: ValidationFeedbackContext | None = None,
     ) -> GeneratedAnswer | None:
         try:
             return await self._ambiguous_answer_generator.generate(
                 field=field,
                 settings=settings,
                 posting=posting,
+                validation_context=validation_context,
             )
         except Exception:  # noqa: BLE001
             logger.exception(

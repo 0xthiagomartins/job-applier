@@ -412,8 +412,9 @@ def test_answer_resolver_rejects_target_company_as_current_employer_answer() -> 
             field: EasyApplyField,
             settings: UserAgentSettings,
             posting: JobPosting,
+            validation_context: object | None = None,
         ) -> GeneratedAnswer | None:
-            del field, settings, posting
+            del field, settings, posting, validation_context
             return GeneratedAnswer(
                 value="Acme",
                 confidence=0.74,
@@ -503,8 +504,9 @@ def test_answer_resolver_rejects_ai_answer_that_copies_broken_negative_language_
             field: EasyApplyField,
             settings: UserAgentSettings,
             posting: JobPosting,
+            validation_context: object | None = None,
         ) -> GeneratedAnswer | None:
-            del field, settings, posting
+            del field, settings, posting, validation_context
             return GeneratedAnswer(
                 value="I don't know English at all",
                 confidence=1.0,
@@ -775,6 +777,67 @@ def test_answer_resolver_reinterprets_invalid_numeric_feedback_for_ambiguous_exp
     assert answer is not None
     assert answer.value == "2"
     assert answer.reasoning == "plausible_profile_inference"
+
+
+def test_answer_resolver_uses_ai_with_validation_feedback_before_guardrails() -> None:
+    base_settings = build_user_agent_settings()
+    settings = base_settings.model_copy(
+        update={
+            "profile": base_settings.profile.model_copy(update={"years_experience_by_stack": {}})
+        }
+    )
+    posting = build_posting()
+    captured_calls: list[tuple[str, object | None]] = []
+
+    class ValidationAwareGenerator:
+        async def generate(
+            self,
+            *,
+            field: EasyApplyField,
+            settings: UserAgentSettings,
+            posting: JobPosting,
+            validation_context: object | None = None,
+        ) -> GeneratedAnswer | None:
+            del settings, posting
+            captured_calls.append((field.question_type.value, validation_context))
+            if validation_context is None:
+                return None
+            return GeneratedAnswer(
+                value="2",
+                confidence=0.73,
+                reasoning="replanned_from_validation_feedback",
+            )
+
+    resolver = LinkedInAnswerResolver(
+        ambiguous_answer_generator=ValidationAwareGenerator(),
+    )
+    field = EasyApplyField(
+        question_raw="Do you have experience in Robot Framework?",
+        normalized_key="do_you_have_experience_in_robot_framework",
+        question_type=QuestionType.YES_NO_GENERIC,
+        control_kind="text",
+        input_type="text",
+    )
+
+    answer = asyncio.run(
+        resolver.resolve_with_validation_feedback(
+            field,
+            settings,
+            posting=posting,
+            validation_message="Enter a decimal number larger than 0.0",
+            current_value="Yes",
+            previous_answer="Yes",
+        )
+    )
+
+    assert answer is not None
+    assert answer.value == "2"
+    assert answer.answer_source is AnswerSource.AI
+    assert answer.fill_strategy is FillStrategy.AUTOFILL_AI
+    assert answer.reasoning == "replanned_from_validation_feedback"
+    assert len(captured_calls) == 1
+    assert captured_calls[0][0] == QuestionType.YEARS_EXPERIENCE.value
+    assert captured_calls[0][1] is not None
 
 
 def test_answer_resolver_keeps_profile_value_for_invalid_location_combobox() -> None:
@@ -1763,7 +1826,9 @@ class SuccessfulGenerator:
         field: EasyApplyField,
         settings: UserAgentSettings,
         posting: JobPosting,
+        validation_context: object | None = None,
     ) -> GeneratedAnswer | None:
+        del field, settings, posting, validation_context
         return GeneratedAnswer(
             value="No",
             confidence=0.64,
@@ -1778,7 +1843,9 @@ class YearsExperienceGenerator:
         field: EasyApplyField,
         settings: UserAgentSettings,
         posting: JobPosting,
+        validation_context: object | None = None,
     ) -> GeneratedAnswer | None:
+        del field, settings, posting, validation_context
         return GeneratedAnswer(
             value="6",
             confidence=0.58,
@@ -1793,7 +1860,9 @@ class FailingGenerator:
         field: EasyApplyField,
         settings: UserAgentSettings,
         posting: JobPosting,
+        validation_context: object | None = None,
     ) -> GeneratedAnswer | None:
+        del field, settings, posting, validation_context
         raise RuntimeError("temporary OpenAI outage")
 
 
@@ -1804,7 +1873,9 @@ class NoopGenerator:
         field: EasyApplyField,
         settings: UserAgentSettings,
         posting: JobPosting,
+        validation_context: object | None = None,
     ) -> GeneratedAnswer | None:
+        del field, settings, posting, validation_context
         return None
 
 
