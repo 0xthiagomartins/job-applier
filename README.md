@@ -99,6 +99,22 @@ Runtime behavior:
 - in headful mode, the browser stays visible so the user can solve captcha or checkpoint screens.
 - when the panel state is still empty, the app bootstraps a local profile automatically from `.env` and tries to import a CV from `~/Documents`.
 
+## Dynamic Resume (Feature Flag)
+
+The dynamic Oh-My-CV flow is guarded by a feature flag and is disabled by default.
+
+- enable with `JOB_APPLIER_RESUME_DYNAMIC_ENABLED=true`;
+- when enabled, each target job can receive a tailored resume variant generated as Oh-My-CV markdown;
+- the renderer then attempts to export that markdown to PDF and uses the resulting file in Easy Apply;
+- if generation or rendering fails, the flow falls back to the original uploaded CV (safe default);
+- the profile API now accepts optional `resume_css`, so users can persist custom stylesheet rules from the panel/UI for PDF rendering.
+
+Optional custom renderer command:
+
+```bash
+JOB_APPLIER_RESUME_DYNAMIC_RENDER_COMMAND='oh-my-cv render "{markdown}" --output "{pdf}" --css "{css}"'
+```
+
 ## Last-run troubleshooting
 
 When you click `Run now`, the app resets `artifacts/last-run/` and keeps only the latest execution bundle:

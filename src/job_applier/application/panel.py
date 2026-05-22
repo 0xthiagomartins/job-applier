@@ -115,6 +115,7 @@ class StoredProfileSection(PanelModel):
     default_responses: dict[str, str] = Field(default_factory=dict)
     cv_path: str | None = None
     cv_filename: str | None = None
+    resume_css: str | None = None
 
 
 class ProfileFormInput(BaseModel):
@@ -133,6 +134,7 @@ class ProfileFormInput(BaseModel):
     salary_expectation: int | None = None
     availability: str = Field(min_length=1)
     default_responses: dict[str, str] = Field(default_factory=dict)
+    resume_css: str | None = None
 
 
 class StoredPreferencesSection(PanelModel):

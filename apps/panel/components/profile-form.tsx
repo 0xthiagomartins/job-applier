@@ -28,6 +28,7 @@ export function ProfileForm(): React.JSX.Element {
     salary_expectation: "",
     availability: "",
     default_responses: "",
+    resume_css: "",
   });
   const [cvFile, setCvFile] = useState<File | null>(null);
   const [currentCvName, setCurrentCvName] = useState<string | null>(null);
@@ -55,6 +56,7 @@ export function ProfileForm(): React.JSX.Element {
           default_responses: Object.entries(state.profile.default_responses)
             .map(([key, value]) => `${key}=${value}`)
             .join("\n"),
+          resume_css: state.profile.resume_css ?? "",
         });
         setCurrentCvName(state.profile.cv_filename);
       })
@@ -196,6 +198,14 @@ export function ProfileForm(): React.JSX.Element {
             />
           </Field>
           {currentCvName ? <p className="text-sm text-muted-foreground">Current file: {currentCvName}</p> : null}
+          <Field label="Resume CSS override">
+            <Textarea
+              placeholder="#resume-preview h2 { color: #4f8d34; }"
+              rows={10}
+              value={form.resume_css}
+              onChange={(event) => updateField("resume_css", event.target.value)}
+            />
+          </Field>
         </CardContent>
       </Card>
 

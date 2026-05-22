@@ -88,6 +88,7 @@ async def save_profile(
     salary_expectation: Annotated[int | None, Form()] = None,
     availability: Annotated[str, Form()] = "",
     default_responses: Annotated[str, Form()] = "",
+    resume_css: Annotated[str, Form()] = "",
     cv_file: Annotated[UploadFile | None, File()] = None,
 ) -> JSONResponse:
     """Persist the profile section from a multipart form."""
@@ -107,6 +108,7 @@ async def save_profile(
             salary_expectation=salary_expectation,
             availability=availability,
             default_responses=parse_text_mapping_lines(default_responses),
+            resume_css=resume_css.strip() or None,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

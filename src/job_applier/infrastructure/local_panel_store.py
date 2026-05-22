@@ -24,6 +24,7 @@ from job_applier.application.panel import (
     StoredScheduleSection,
     ensure_runtime_dir,
 )
+from job_applier.resume_theme import DEFAULT_OH_MY_CV_RESUME_CSS
 from job_applier.settings import RuntimeSettings
 
 
@@ -178,6 +179,7 @@ class LocalPanelSettingsStore:
                 },
                 cv_path=str(copied_cv_path) if copied_cv_path else None,
                 cv_filename=cv_path.name if cv_path else None,
+                resume_css=DEFAULT_OH_MY_CV_RESUME_CSS,
             ),
             preferences=StoredPreferencesSection(
                 keywords=("python", "automation"),
@@ -238,6 +240,8 @@ class LocalPanelSettingsStore:
                         "cv_filename": (
                             document.profile.cv_filename or bootstrap_document.profile.cv_filename
                         ),
+                        "resume_css": document.profile.resume_css
+                        or bootstrap_document.profile.resume_css,
                     },
                 ),
                 "preferences": document.preferences.model_copy(

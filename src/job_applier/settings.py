@@ -61,6 +61,10 @@ class RuntimeSettings(BaseSettings):
     browser_agent_single_action_max_attempts: int = 3
     browser_agent_stall_threshold: int = 3
     linkedin_field_interaction_timeout_seconds: int = 45
+    resume_dynamic_enabled: bool = False
+    resume_dynamic_render_command: str | None = None
+    resume_dynamic_render_timeout_seconds: int = 120
+    resume_dynamic_max_cv_chars: int = 20_000
     bootstrap_panel_on_empty_state: bool = True
     bootstrap_profile_name: str | None = None
     bootstrap_profile_email: str | None = None

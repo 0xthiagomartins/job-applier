@@ -37,6 +37,7 @@ class UserProfileConfig(FrozenModel):
     default_responses: dict[str, str] = Field(default_factory=dict)
     cv_path: str | None = None
     cv_filename: str | None = None
+    resume_css: str | None = None
     positive_filters: tuple[str, ...] = ()
     blacklist: tuple[str, ...] = ()
 

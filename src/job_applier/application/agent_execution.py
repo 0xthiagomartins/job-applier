@@ -282,6 +282,7 @@ def build_user_agent_settings(document: PanelSettingsDocument) -> UserAgentSetti
                 default_responses=document.profile.default_responses,
                 cv_path=document.profile.cv_path,
                 cv_filename=document.profile.cv_filename,
+                resume_css=document.profile.resume_css,
                 positive_filters=document.preferences.positive_keywords,
                 blacklist=document.preferences.negative_keywords,
             ),

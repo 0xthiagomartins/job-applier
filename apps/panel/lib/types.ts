@@ -14,6 +14,7 @@ export type ProfileSection = {
   default_responses: Record<string, string>;
   cv_path: string | null;
   cv_filename: string | null;
+  resume_css: string | null;
 };
 
 export type PreferencesSection = {
