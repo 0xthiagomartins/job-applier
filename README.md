@@ -28,8 +28,8 @@ The current repository bootstrap already includes:
 - Python 3.14 project management with `uv`
 - FastAPI backend API with panel configuration endpoints
 - Next.js + TypeScript panel in `apps/panel` with shadcn-style components
-- Ruff, mypy, pytest and pre-commit configuration
-- GitHub Actions CI for lint, type-check and tests
+- Ruff, mypy and pre-commit configuration
+- lint, type-check and panel build commands
 - single-container on-premise runtime path with local SQLite fallback
 - automatic Alembic upgrade to the latest schema on startup
 
@@ -143,13 +143,7 @@ uv run ruff format --check .
 Run type-check:
 
 ```bash
-uv run mypy src tests
-```
-
-Run tests:
-
-```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest
+uv run mypy src
 ```
 
 Frontend checks:
@@ -159,8 +153,6 @@ cd apps/panel
 npm run typecheck
 npm run build
 ```
-
-The lean test philosophy for this repo lives in [docs/testing-strategy.md](docs/testing-strategy.md).
 
 ## On-premise container
 
