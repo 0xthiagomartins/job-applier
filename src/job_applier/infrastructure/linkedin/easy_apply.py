@@ -7,7 +7,6 @@ import json
 import logging
 import random
 import re
-import shutil
 import traceback
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -78,11 +77,17 @@ from job_applier.infrastructure.linkedin.question_resolution import (
     _profile_first_name,
     _profile_last_name,
     field_has_meaningful_current_value,
+    field_needs_semantic_step_planning,
+    field_reference,
     normalize_text,
 )
 from job_applier.infrastructure.linkedin.recruiter_connect import (
     LinkedInRecruiterCandidateFinder,
     PlaywrightRecruiterConnector,
+)
+from job_applier.infrastructure.resume_dynamic import (
+    DynamicResumeBuildResult,
+    OhMyCvDynamicResumeBuilder,
 )
 from job_applier.observability import (
     append_artifact_reference,
@@ -108,6 +113,7 @@ class EasyApplyStep:
     step_index: int
     total_steps: int
     fields: tuple[EasyApplyField, ...]
+    surface_text: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +139,27 @@ class EasyApplyExecutionResult:
         if self.status is not SubmissionStatus.SUBMITTED and self.submitted_at is not None:
             msg = "submitted_at can only be set for submitted executions"
             raise ValueError(msg)
+
+
+@dataclass(frozen=True, slots=True)
+class JobApplyEntrypointAssessment:
+    """Deterministic view of the application controls visible on the job page."""
+
+    easy_apply_available: bool
+    external_apply_only: bool
+    labels: tuple[str, ...] = ()
+    notes: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedSubmissionCv:
+    """Resume artifact selected for one submission execution."""
+
+    path: Path
+    cv_version: str
+    artifacts: tuple[ArtifactSnapshot, ...] = ()
+    used_dynamic_variant: bool = False
+    notes: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +221,8 @@ def _field_debug_summary(field: EasyApplyField) -> dict[str, object]:
         "current_value": field.current_value,
         "classification_confidence": field.classification_confidence,
         "classification_rule": field.classification_rule,
+        "field_context_preview": field.field_context[:240],
+        "helper_text": field.helper_text,
         "option_count": len(field.options),
         "options_preview": list(field.options[:6]),
     }
@@ -208,13 +237,20 @@ def _step_field_signature(step: EasyApplyStep) -> tuple[tuple[str, ...], ...]:
             field.control_kind,
             field.input_type or "",
             "required" if field.required else "optional",
+            str(len(field.options)),
         )
         for field in step.fields
     )
 
 
 def _step_surface_changed(previous_step: EasyApplyStep, current_step: EasyApplyStep) -> bool:
-    return _step_field_signature(previous_step) != _step_field_signature(current_step)
+    if _step_field_signature(previous_step) != _step_field_signature(current_step):
+        return True
+    if previous_step.fields or current_step.fields:
+        return False
+    return normalize_text(previous_step.surface_text[:240]) != normalize_text(
+        current_step.surface_text[:240]
+    )
 
 
 class EasyApplyExecutor(Protocol):
@@ -247,6 +283,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         self._recruiter_candidate_finder = LinkedInRecruiterCandidateFinder()
         self._recruiter_connector = PlaywrightRecruiterConnector(runtime_settings)
         self._execution_event_repository = execution_event_repository
+        self._dynamic_resume_builder = OhMyCvDynamicResumeBuilder(runtime_settings)
         self._session_manager: LinkedInSessionManager | None = None
 
     async def execute(
@@ -359,12 +396,88 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         label="job_opened",
                     ),
                 )
+                entrypoint_assessment = await self._assess_job_apply_entrypoint(page)
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.STEP_REACHED,
+                    payload={
+                        "stage": "easy_apply_entrypoint_assessed",
+                        "job_posting_id": str(posting.id),
+                        "easy_apply_available": entrypoint_assessment.easy_apply_available,
+                        "external_apply_only": entrypoint_assessment.external_apply_only,
+                        "labels": list(entrypoint_assessment.labels[:6]),
+                        "notes": entrypoint_assessment.notes,
+                    },
+                )
+                append_timeline_event(
+                    "easy_apply_entrypoint_assessed",
+                    {
+                        "job_posting_id": str(posting.id),
+                        "submission_id": str(submission_id),
+                        "easy_apply_available": entrypoint_assessment.easy_apply_available,
+                        "external_apply_only": entrypoint_assessment.external_apply_only,
+                        "labels": list(entrypoint_assessment.labels[:6]),
+                        "notes": entrypoint_assessment.notes,
+                    },
+                )
+                if entrypoint_assessment.external_apply_only:
+                    notes = (
+                        entrypoint_assessment.notes
+                        or "The job page only exposes an external apply control."
+                    )
+                    update_progress_snapshot(
+                        {
+                            "current_stage": "submit_skipped",
+                            "current_job": self._build_progress_job(
+                                posting,
+                                submission_id,
+                                status=SubmissionStatus.SKIPPED.value,
+                            ),
+                            "current_step": None,
+                            "last_error": notes,
+                        },
+                    )
+                    self._record_event(
+                        execution_events,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
+                        event_type=ExecutionEventType.JOB_PROCESSED,
+                        payload={
+                            "job_posting_id": str(posting.id),
+                            "origin": origin.value,
+                            "reason": "external_apply_only",
+                            "status": SubmissionStatus.SKIPPED.value,
+                            "notes": notes,
+                        },
+                    )
+                    return EasyApplyExecutionResult(
+                        submission_id=submission_id,
+                        started_at=started_at,
+                        status=SubmissionStatus.SKIPPED,
+                        notes=notes,
+                        execution_events=tuple(execution_events),
+                        artifacts=tuple(artifacts),
+                        recruiter_interactions=tuple(recruiter_interactions),
+                    )
                 recruiter_candidate = await self._recruiter_candidate_finder.find(page, settings)
-                submission_cv_path = self._prepare_submission_cv_path(
+                prepared_submission_cv = await self._prepare_submission_cv_path(
                     settings=settings,
+                    posting=posting,
+                    execution_id=execution_id,
                     run_dir=run_dir,
                     submission_id=submission_id,
+                    execution_events=execution_events,
                 )
+                submission_cv_path = prepared_submission_cv.path if prepared_submission_cv else None
+                submission_cv_version = (
+                    prepared_submission_cv.cv_version
+                    if prepared_submission_cv is not None
+                    else settings.profile.cv_filename
+                )
+                if prepared_submission_cv is not None:
+                    artifacts.extend(prepared_submission_cv.artifacts)
 
                 try:
                     update_progress_snapshot(
@@ -550,6 +663,17 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     )
                     answers.extend(step_answers)
                     artifacts.extend(step_artifacts)
+                    await self._retry_invalid_fields_after_primary_action(
+                        page,
+                        settings=settings,
+                        posting=posting,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
+                        execution_events=execution_events,
+                        previous_step=step,
+                        step_answers=tuple(step_answers),
+                        repair_origin="pre_primary_action",
+                    )
 
                     try:
                         update_progress_snapshot(
@@ -743,7 +867,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                 answers=tuple(answers),
                                 recruiter_interactions=tuple(recruiter_interactions),
                                 submitted_at=utc_now(),
-                                cv_version=settings.profile.cv_filename,
+                                cv_version=submission_cv_version,
                             )
                         update_progress_snapshot(
                             {
@@ -936,6 +1060,45 @@ class PlaywrightLinkedInEasyApplyExecutor:
             field.question_type is QuestionType.RESUME_UPLOAD and field.control_kind == "file"
             for field in step.fields
         )
+        semantic_candidate_fields = tuple(
+            field
+            for field in step.fields
+            if field_needs_semantic_step_planning(field)
+            and not (
+                step_has_file_resume_control
+                and field.question_type is QuestionType.RESUME_UPLOAD
+                and field.control_kind != "file"
+            )
+        )
+        semantic_step_plan = await self._answer_resolver.plan_step(
+            step_index=step.step_index,
+            total_steps=step.total_steps,
+            surface_text=step.surface_text,
+            fields=step.fields,
+            candidate_fields=semantic_candidate_fields,
+            settings=settings,
+            posting=posting,
+        )
+        semantic_plan_by_ref = (
+            {plan.field_ref: plan for plan in semantic_step_plan.field_plans}
+            if semantic_step_plan is not None
+            else {}
+        )
+        if semantic_candidate_fields:
+            self._record_event(
+                execution_events,
+                execution_id=execution_id,
+                submission_id=submission_id,
+                event_type=ExecutionEventType.STEP_REACHED,
+                payload={
+                    "stage": "easy_apply_semantic_step_plan",
+                    "step_index": step.step_index,
+                    "candidate_field_refs": [
+                        field_reference(field) for field in semantic_candidate_fields
+                    ],
+                    "planned_field_refs": list(semantic_plan_by_ref),
+                },
+            )
 
         for field in step.fields:
             if (
@@ -971,7 +1134,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "classification_confidence": field.classification_confidence,
                     },
                 )
-            resolution = await self._answer_resolver.resolve(field, settings, posting=posting)
+            resolution = await self._answer_resolver.resolve(
+                field,
+                settings,
+                posting=posting,
+                semantic_plan=semantic_plan_by_ref.get(field_reference(field)),
+            )
             if resolution is None:
                 stage = (
                     "easy_apply_field_preserved"
@@ -994,6 +1162,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "prefilled": field.prefilled,
                         "current_value": field.current_value,
                         "classification_confidence": field.classification_confidence,
+                        "field_context": field.field_context[:240],
                         "options_preview": list(field.options[:6]),
                     },
                 )
@@ -1117,22 +1286,32 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     await locator.click()
                     await locator.fill(resolution.value)
                     await page.wait_for_timeout(250)
-                try:
-                    return await asyncio.wait_for(
-                        self._complete_text_field_interaction(
-                            page=page,
-                            field=field,
-                            target_value=resolution.value,
-                            settings=settings,
-                        ),
-                        timeout=self._runtime_settings.linkedin_field_interaction_timeout_seconds,
-                    )
-                except TimeoutError as exc:
-                    msg = (
-                        "Timed out while the browser agent was trying to finalize an "
-                        "interactive Easy Apply field."
-                    )
-                    raise LinkedInEasyApplyError(msg) from exc
+                state = await self._inspect_text_field_interaction(locator)
+                if self._text_field_requires_interactive_selection(state):
+                    try:
+                        return await asyncio.wait_for(
+                            self._complete_text_field_interaction(
+                                page=page,
+                                field=field,
+                                target_value=resolution.value,
+                                settings=settings,
+                            ),
+                            timeout=(
+                                self._runtime_settings.linkedin_field_interaction_timeout_seconds
+                            ),
+                        )
+                    except TimeoutError as exc:
+                        msg = (
+                            "Timed out while the browser agent was trying to finalize an "
+                            "interactive Easy Apply field."
+                        )
+                        raise LinkedInEasyApplyError(msg) from exc
+                committed_state = await self._commit_typed_text_field_entry(
+                    page=page,
+                    locator=locator,
+                    initial_state=state,
+                )
+                return committed_state.current_value or resolution.value
             case "select":
                 if field.question_type is QuestionType.RESUME_UPLOAD:
                     return await self._apply_resume_choice_field(
@@ -1398,13 +1577,43 @@ class PlaywrightLinkedInEasyApplyExecutor:
             msg = "LinkedIn changed the current field before the interaction could finish."
             raise LinkedInEasyApplyError(msg)
         final_state = await self._inspect_text_field_interaction(locator)
-        if final_state.needs_agentic_follow_up or not final_state.has_value:
+        if (
+            self._text_field_requires_interactive_selection(final_state)
+            or not final_state.has_value
+        ):
             msg = (
                 "Browser agent could not finish the interactive field flow for the current "
                 "LinkedIn Easy Apply step."
             )
             raise LinkedInEasyApplyError(msg)
         return final_state.current_value or target_value
+
+    async def _commit_typed_text_field_entry(
+        self,
+        *,
+        page: Page,
+        locator: Locator,
+        initial_state: TextFieldInteractionState,
+    ) -> TextFieldInteractionState:
+        state = initial_state
+        if not state.focused and not state.invalid:
+            return state
+        for settle_action in ("blur", "tab"):
+            try:
+                if settle_action == "blur":
+                    await locator.evaluate("(node) => node.blur()")
+                else:
+                    await locator.press("Tab")
+                await page.wait_for_timeout(150)
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                state = await self._inspect_text_field_interaction(locator)
+            except Exception:  # noqa: BLE001
+                continue
+            if not state.focused or not state.invalid:
+                return state
+        return state
 
     async def _inspect_text_field_interaction(self, locator: Locator) -> TextFieldInteractionState:
         try:
@@ -1440,6 +1649,32 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 const overlap = Math.min(fieldRect.right, candidateRect.right)
                   - Math.max(fieldRect.left, candidateRect.left);
                 return overlap > Math.min(fieldRect.width, candidateRect.width) * 0.25;
+              };
+              const looksLikeCharacterCounter = (text) =>
+                /^\\d+\\s*\\/\\s*\\d+(?:\\s+\\d+\\s+\\S+\\s+\\d+(?:\\s+\\S+)*)?$/i.test(text);
+              const hasErrorSignal = (candidate) => {
+                if (!candidate || candidate.nodeType !== 1) {
+                  return false;
+                }
+                const role = collapse(candidate.getAttribute("role"));
+                const ariaLive = collapse(candidate.getAttribute("aria-live"));
+                const metadata = collapse(
+                  [
+                    candidate.getAttribute("class"),
+                    candidate.getAttribute("id"),
+                    candidate.getAttribute("data-test-form-element-error-messages"),
+                  ]
+                    .filter(Boolean)
+                    .join(" ")
+                );
+                return (
+                  role === "alert"
+                  || ariaLive === "assertive"
+                  || candidate.getAttribute("aria-invalid") === "true"
+                  || /(?:^|\\s)(?:error|invalid|warning)(?:\\s|$)/i.test(metadata)
+                  || metadata.includes("artdeco-inline-feedback__message")
+                  || metadata.includes("fb-dash-form-element__error-message")
+                );
               };
               const isPotentialOptionNode = (candidate) => {
                 if (!candidate || candidate.nodeType !== 1) {
@@ -1497,6 +1732,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 }
                 const text = collapse(candidate.innerText || candidate.textContent || "");
                 if (!text || text.length > 180 || seenValidationTexts.has(text)) {
+                  return;
+                }
+                if (looksLikeCharacterCounter(text) && !hasErrorSignal(candidate)) {
                   return;
                 }
                 const rect = candidate.getBoundingClientRect();
@@ -1704,7 +1942,24 @@ class PlaywrightLinkedInEasyApplyExecutor:
         )
 
     def _text_field_interaction_complete(self, state: TextFieldInteractionState) -> bool:
-        return state.has_value and not state.needs_agentic_follow_up
+        return (
+            state.has_value
+            and not state.invalid
+            and not self._text_field_requires_interactive_selection(state)
+        )
+
+    def _text_field_requires_interactive_selection(
+        self,
+        state: TextFieldInteractionState,
+    ) -> bool:
+        return bool(
+            state.visible_option_count
+            or state.aria_expanded
+            or state.active_descendant
+            or state.role == "combobox"
+            or state.aria_autocomplete is not None
+            or state.has_popup_binding
+        )
 
     async def _apply_resume_choice_field(
         self,
@@ -2132,6 +2387,13 @@ class PlaywrightLinkedInEasyApplyExecutor:
             """
             (node) => {
               const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
+              const truncate = (value, limit) => {
+                const collapsed = collapse(value);
+                if (!collapsed || collapsed.length <= limit) {
+                  return collapsed;
+                }
+                return `${collapsed.slice(0, Math.max(0, limit - 3)).trim()}...`;
+              };
               const labels = Array.from(node.querySelectorAll("label"));
               let refCounter = 1;
 
@@ -2177,6 +2439,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
                   ".fb-form-element",
                   ".jobs-easy-apply-form-section__grouping",
                   ".jobs-easy-apply-form-element",
+                  "[role='group']",
+                  "fieldset",
                 ].join(", "));
                 if (container) {
                   const textLabel = container.querySelector(
@@ -2207,7 +2471,119 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     return collapse(explicit.innerText);
                   }
                 }
+                let candidate = element.parentElement;
+                while (candidate && candidate !== node) {
+                  const text = collapse(candidate.innerText);
+                  const radioCount = candidate.querySelectorAll("input[type=radio]").length;
+                  const controlCount = candidate.querySelectorAll(
+                    "input, select, textarea",
+                  ).length;
+                  if (text && text.length <= 360 && radioCount <= 1 && controlCount <= 2) {
+                    return truncate(text, 240);
+                  }
+                  candidate = candidate.parentElement;
+                }
                 return collapse(element.getAttribute("value") || element.textContent || "");
+              };
+
+              const radioGroupKeyFor = (element) => {
+                const name = collapse(element.getAttribute("name"));
+                if (name) {
+                  return `name:${name}`;
+                }
+                const fieldset = element.closest("fieldset");
+                if (fieldset) {
+                  return ensureRef(fieldset, "data-job-applier-radio-group-ref");
+                }
+                const groupScope = scopeFor(element);
+                if (groupScope) {
+                  return ensureRef(groupScope, "data-job-applier-radio-group-ref");
+                }
+                const id = collapse(element.getAttribute("id"));
+                if (id) {
+                  return `id:${id}`;
+                }
+                return ensureRef(element, "data-job-applier-radio-group-ref");
+              };
+
+              const radioQuestionFor = (element) => {
+                const explicit = questionFor(element);
+                if (explicit && explicit.toLowerCase() !== "radio") {
+                  return explicit;
+                }
+                const groupScope = scopeFor(element);
+                if (!groupScope) {
+                  return explicit;
+                }
+                const lines = (groupScope.innerText || groupScope.textContent || "")
+                  .split(/\\n+/)
+                  .map((line) => collapse(line))
+                  .filter(Boolean);
+                if (lines.length >= 2) {
+                  return truncate(lines.slice(0, 2).join(" "), 220);
+                }
+                if (lines.length === 1) {
+                  return truncate(lines[0], 220);
+                }
+                return explicit;
+              };
+
+              const scopeFor = (element) => {
+                const semanticScope = element.closest(
+                  [
+                    ".jobs-easy-apply-form-section__grouping",
+                    ".fb-form-element",
+                    ".jobs-easy-apply-form-element",
+                    "[role='group']",
+                    "fieldset",
+                    "section",
+                  ].join(", ")
+                );
+                if (semanticScope) {
+                  return semanticScope;
+                }
+                let candidate = element.parentElement;
+                while (candidate && candidate !== node) {
+                  const text = collapse(candidate.innerText);
+                  const controlCount = candidate.querySelectorAll(
+                    "input, select, textarea",
+                  ).length;
+                  if (text && text.length <= 1200 && controlCount >= 1 && controlCount <= 6) {
+                    return candidate;
+                  }
+                  candidate = candidate.parentElement;
+                }
+                return element.parentElement;
+              };
+
+              const referencedTextFor = (element) => {
+                const ids = ["aria-describedby", "aria-errormessage"]
+                  .flatMap((attributeName) =>
+                    collapse(element.getAttribute(attributeName))
+                      .split(/\\s+/)
+                      .map((item) => item.trim())
+                      .filter(Boolean)
+                  );
+                const parts = [];
+                const seen = new Set();
+                for (const id of ids) {
+                  const referenced = document.getElementById(id);
+                  const text = collapse(referenced?.innerText || referenced?.textContent || "");
+                  if (!text || seen.has(text)) {
+                    continue;
+                  }
+                  seen.add(text);
+                  parts.push(text);
+                }
+                return truncate(parts.join(" "), 280);
+              };
+
+              const fieldContextFor = (element) => {
+                const scope = scopeFor(element);
+                if (scope && collapse(scope.innerText)) {
+                  return truncate(scope.innerText, 900);
+                }
+                return truncate(questionFor(element), 900);
               };
 
               const fields = [];
@@ -2259,6 +2635,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     || /\\*/.test(questionFor(element)),
                   prefilled: Boolean(currentValue),
                   current_value: currentValue,
+                  field_context: fieldContextFor(element),
+                  helper_text: referencedTextFor(element),
                   options:
                     tag === "select"
                       ? Array.from(element.options)
@@ -2272,35 +2650,42 @@ class PlaywrightLinkedInEasyApplyExecutor:
               const radioInputs = Array.from(
                 node.querySelectorAll("input[type=radio]:not([disabled])"),
               );
-              const seenRadioNames = new Set();
+              const seenRadioGroups = new Set();
               for (const input of radioInputs) {
-                const groupName = input.getAttribute("name") || input.getAttribute("id");
-                if (!groupName || seenRadioNames.has(groupName)) {
+                const groupKey = radioGroupKeyFor(input);
+                if (!groupKey || seenRadioGroups.has(groupKey)) {
                   continue;
                 }
-                seenRadioNames.add(groupName);
+                seenRadioGroups.add(groupKey);
                 const group = radioInputs.filter(
-                  (candidate) =>
-                    (candidate.getAttribute("name") || candidate.getAttribute("id")) === groupName,
+                  (candidate) => radioGroupKeyFor(candidate) === groupKey,
                 );
                 const selected = group.find((candidate) => candidate.checked);
                 const optionRefs = group.map((candidate) =>
                   ensureRef(candidate, "data-job-applier-option-ref"),
                 );
+                const groupScope = scopeFor(input);
+                const optionLabels = group
+                  .map((candidate) => optionLabel(candidate))
+                  .filter(Boolean);
                 fields.push({
                   dom_ref: ensureRef(input, "data-job-applier-field-ref"),
                   dom_id: input.getAttribute("id"),
                   name: input.getAttribute("name"),
                   input_type: "radio",
                   control_kind: "radio",
-                  question_raw: questionFor(input),
+                  question_raw: radioQuestionFor(input),
                   required:
-                    input.required
-                    || input.getAttribute("aria-required") === "true"
-                    || /\\*/.test(questionFor(input)),
+                    group.some(
+                      (candidate) =>
+                        candidate.required || candidate.getAttribute("aria-required") === "true",
+                    )
+                    || /\\*/.test(radioQuestionFor(input)),
                   prefilled: Boolean(selected),
                   current_value: selected ? optionLabel(selected) : "",
-                  options: group.map((candidate) => optionLabel(candidate)).filter(Boolean),
+                  field_context: truncate(groupScope?.innerText || questionFor(input), 900),
+                  helper_text: referencedTextFor(input),
+                  options: optionLabels,
                   option_refs: optionRefs,
                 });
               }
@@ -2320,16 +2705,21 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     || /\\*/.test(questionFor(input)),
                   prefilled: input.checked,
                   current_value: input.checked ? "Yes" : "",
+                  field_context: fieldContextFor(input),
+                  helper_text: referencedTextFor(input),
                   options: ["Yes", "No"],
                 });
               }
 
               const text = collapse(node.innerText);
-              const match = text.match(/step\\s*(\\d+)\\s*of\\s*(\\d+)/i);
+              const match =
+                text.match(/step\\s*(\\d+)\\s*of\\s*(\\d+)/i)
+                || text.match(/(?:^|\\b)(\\d+)\\s*\\/\\s*(\\d+)(?:\\b|\\s+pages?\\b)/i);
               return {
                 current_step: match ? Number(match[1]) : null,
                 total_steps: match ? Number(match[2]) : null,
                 fields,
+                surface_text: truncate(text, 2200),
               };
             }
             """,
@@ -2351,7 +2741,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
             for item in raw_fields
             if isinstance(item, dict)
         )
-        return EasyApplyStep(step_index=step_index, total_steps=total, fields=fields)
+        return EasyApplyStep(
+            step_index=step_index,
+            total_steps=total,
+            fields=fields,
+            surface_text=str(payload.get("surface_text") or ""),
+        )
 
     async def _open_easy_apply_modal_with_agent(
         self,
@@ -2368,6 +2763,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         try:
             for step_index in range(6):
                 if await self._easy_apply_modal_visible(page):
+                    await self._wait_for_easy_apply_surface(page)
                     return
 
                 action = await browser_agent.perform_single_task_action(
@@ -2420,6 +2816,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     },
                 )
                 if await self._easy_apply_modal_visible(page):
+                    await self._wait_for_easy_apply_surface(page)
                     return
                 if action.action_type == "done":
                     break
@@ -2471,6 +2868,134 @@ class PlaywrightLinkedInEasyApplyExecutor:
             return None
         return assessment.summary or "LinkedIn indicates this job was already applied to."
 
+    async def _assess_job_apply_entrypoint(self, page: Page) -> JobApplyEntrypointAssessment:
+        if await self._easy_apply_modal_visible(page):
+            return JobApplyEntrypointAssessment(
+                easy_apply_available=True,
+                external_apply_only=False,
+                notes="The LinkedIn Easy Apply modal is already visible on the page.",
+            )
+
+        controls_payload = await page.evaluate(
+            """
+            () => {
+              const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
+              const isVisible = (element) => {
+                if (!element) {
+                  return false;
+                }
+                const style = window.getComputedStyle(element);
+                if (
+                  style.display === "none"
+                  || style.visibility === "hidden"
+                  || style.opacity === "0"
+                ) {
+                  return false;
+                }
+                const rect = element.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) {
+                  return false;
+                }
+                return rect.bottom >= 0 && rect.top <= window.innerHeight;
+              };
+
+              const candidates = Array.from(
+                document.querySelectorAll("button, a[href], [role='button']"),
+              );
+              return candidates
+                .filter(isVisible)
+                .map((element) => {
+                  const rect = element.getBoundingClientRect();
+                  const text = collapse(element.innerText || element.textContent || "");
+                  const ariaLabel = collapse(element.getAttribute("aria-label") || "");
+                  const title = collapse(element.getAttribute("title") || "");
+                  const href =
+                    element instanceof HTMLAnchorElement
+                      ? element.href || element.getAttribute("href") || ""
+                      : element.getAttribute("href") || "";
+                  return {
+                    tag: element.tagName.toLowerCase(),
+                    text,
+                    aria_label: ariaLabel,
+                    title,
+                    href,
+                    target: element.getAttribute("target") || "",
+                    testid:
+                      element.getAttribute("data-testid")
+                      || element.getAttribute("data-test-id")
+                      || "",
+                    top: Math.round(rect.top),
+                  };
+                })
+                .sort((left, right) => left.top - right.top)
+                .slice(0, 80);
+            }
+            """,
+        )
+        controls = controls_payload if isinstance(controls_payload, list) else []
+        relevant_labels: list[str] = []
+        easy_apply_labels: list[str] = []
+        external_apply_labels: list[str] = []
+
+        for raw_control in controls:
+            if not isinstance(raw_control, dict):
+                continue
+            text = str(raw_control.get("text") or "")
+            aria_label = str(raw_control.get("aria_label") or "")
+            title = str(raw_control.get("title") or "")
+            href = str(raw_control.get("href") or "")
+            target = str(raw_control.get("target") or "")
+            combined_label = normalize_text(
+                " ".join(part for part in (text, aria_label, title) if part)
+            )
+            if not combined_label and not href:
+                continue
+            if combined_label:
+                relevant_labels.append(combined_label)
+
+            has_easy_apply_signal = "easy apply" in combined_label
+            if has_easy_apply_signal:
+                easy_apply_labels.append(combined_label)
+                continue
+
+            has_external_apply_signal = "apply on company website" in combined_label or (
+                "apply" in combined_label
+                and "linkedin.com/safety/go" in href.lower()
+                and target.lower() == "_blank"
+            )
+            if has_external_apply_signal:
+                external_apply_labels.append(combined_label or href)
+
+        deduped_labels = tuple(dict.fromkeys(label for label in relevant_labels if label))
+
+        if easy_apply_labels:
+            return JobApplyEntrypointAssessment(
+                easy_apply_available=True,
+                external_apply_only=False,
+                labels=tuple(dict.fromkeys(easy_apply_labels))[:8],
+                notes="A visible LinkedIn Easy Apply control is available on the job page.",
+            )
+
+        if external_apply_labels:
+            return JobApplyEntrypointAssessment(
+                easy_apply_available=False,
+                external_apply_only=True,
+                labels=tuple(dict.fromkeys(external_apply_labels))[:8],
+                notes=(
+                    "The only visible apply button leads to the company website and no control "
+                    "is available on this page to open the LinkedIn Easy Apply modal."
+                ),
+            )
+
+        return JobApplyEntrypointAssessment(
+            easy_apply_available=False,
+            external_apply_only=False,
+            labels=deduped_labels[:8],
+            notes=(
+                "No visible Easy Apply entrypoint was confirmed during the deterministic page scan."
+            ),
+        )
+
     async def _progress_easy_apply_step_with_agent(
         self,
         page: Page,
@@ -2487,6 +3012,36 @@ class PlaywrightLinkedInEasyApplyExecutor:
         try:
             for action_round in range(4):
                 root = await self._easy_apply_root(page)
+                footer_action = await self._click_easy_apply_footer_primary_button(
+                    page,
+                    root=root,
+                    step=step,
+                )
+                if footer_action is not None:
+                    last_action = footer_action
+                    recent_actions.append(
+                        {
+                            "action_round": action_round,
+                            "action_type": footer_action.action_type,
+                            "action_intent": footer_action.action_intent,
+                            "reasoning": footer_action.reasoning,
+                        }
+                    )
+                    self._record_event(
+                        execution_events,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
+                        event_type=ExecutionEventType.STEP_REACHED,
+                        payload={
+                            "stage": "easy_apply_primary_action",
+                            "step_index": step.step_index,
+                            "action_round": action_round,
+                            "action_type": footer_action.action_type,
+                            "action_intent": footer_action.action_intent,
+                            "reasoning": footer_action.reasoning,
+                        },
+                    )
+                    return footer_action
                 action = await browser_agent.perform_single_task_action(
                     page=page,
                     available_values={},
@@ -2589,16 +3144,245 @@ class PlaywrightLinkedInEasyApplyExecutor:
         msg = "Browser agent could not determine how to advance the Easy Apply step."
         raise LinkedInEasyApplyError(msg)
 
-    async def _wait_for_easy_apply_surface(self, page: Page, *, timeout_ms: int = 6_000) -> None:
+    async def _click_easy_apply_footer_primary_button(
+        self,
+        page: Page,
+        *,
+        root: Locator,
+        step: EasyApplyStep,
+    ) -> BrowserAgentAction | None:
+        footers = root.locator("footer")
+        footer_count = await footers.count()
+        if footer_count == 0:
+            return None
+
+        primary_button: Locator | None = None
+        primary_label: str | None = None
+        for footer_index in range(footer_count - 1, -1, -1):
+            footer = footers.nth(footer_index)
+            footer_buttons = footer.locator("button, [role='button']")
+            button_count = await footer_buttons.count()
+            if button_count == 0:
+                continue
+
+            visible_buttons: list[tuple[Locator, str]] = []
+            for button_index in range(button_count):
+                button = footer_buttons.nth(button_index)
+                try:
+                    if not await button.is_visible():
+                        continue
+                except Exception:  # noqa: BLE001
+                    continue
+                try:
+                    if not await button.is_enabled():
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
+                label = await self._read_locator_text(button)
+                if not label:
+                    continue
+                visible_buttons.append((button, label))
+            if visible_buttons:
+                primary_button, primary_label = visible_buttons[-1]
+                break
+
+        if primary_button is None or primary_label is None:
+            return None
+
+        try:
+            await primary_button.scroll_into_view_if_needed(timeout=2_000)
+            await page.wait_for_timeout(150)
+            await primary_button.click(timeout=3_000)
+            await page.wait_for_timeout(250)
+        except Exception:  # noqa: BLE001
+            return None
+
+        inferred_action_intent = self._infer_easy_apply_footer_action_intent(
+            primary_label,
+            step=step,
+        )
+
+        if inferred_action_intent == "submit_application":
+            action_intent = "submit_application"
+            reasoning = (
+                "Clicked the primary button in the Easy Apply footer and treated it as the "
+                f"final submit action based on the visible CTA label {primary_label!r}."
+            )
+        elif not await self._easy_apply_modal_visible(page):
+            action_intent = "submit_application"
+            reasoning = (
+                "Clicked the primary button in the Easy Apply footer and the modal closed, "
+                "which indicates the application was submitted."
+            )
+        else:
+            action_intent = "advance_step"
+            reasoning = (
+                "Clicked the primary button in the Easy Apply footer to advance the current "
+                f"step. The visible footer CTA label was {primary_label!r}."
+            )
+            await self._wait_for_easy_apply_surface(page)
+
+        return BrowserAgentAction(
+            action_type="click",
+            element_id=None,
+            value_source=None,
+            value=None,
+            action_intent=action_intent,
+            key_name=None,
+            scroll_target=None,
+            scroll_direction=None,
+            scroll_amount=0,
+            wait_seconds=0,
+            reasoning=reasoning,
+        )
+
+    def _infer_easy_apply_footer_action_intent(
+        self,
+        label: str,
+        *,
+        step: EasyApplyStep,
+    ) -> str:
+        normalized_label = normalize_text(label)
+        if not normalized_label:
+            return "advance_step"
+
+        if any(token in normalized_label for token in ("next", "review", "continue")):
+            return "advance_step"
+
+        if any(token in normalized_label for token in ("submit", "send", "apply")):
+            return "submit_application"
+
+        if step.total_steps > 0 and step.step_index >= step.total_steps - 1:
+            return "submit_application"
+
+        return "advance_step"
+
+    async def _read_locator_text(self, locator: Locator) -> str:
+        try:
+            label = await locator.inner_text(timeout=500)
+        except Exception:  # noqa: BLE001
+            label = ""
+        if not label:
+            try:
+                label = await locator.get_attribute("aria-label") or ""
+            except Exception:  # noqa: BLE001
+                label = ""
+        return normalize_text(label)
+
+    async def _wait_for_easy_apply_surface(self, page: Page, *, timeout_ms: int = 10_000) -> None:
         deadline = asyncio.get_running_loop().time() + max(1, timeout_ms) / 1_000
         while True:
-            if await self._easy_apply_modal_visible(page):
+            if await self._easy_apply_surface_ready(page):
                 return
             if asyncio.get_running_loop().time() >= deadline:
                 break
             await page.wait_for_timeout(350)
-        msg = "LinkedIn Easy Apply dialog is not visible after the last step action."
+        if await self._easy_apply_modal_visible(page):
+            msg = "LinkedIn Easy Apply dialog did not finish loading after the last step action."
+        else:
+            msg = "LinkedIn Easy Apply dialog is not visible after the last step action."
         raise LinkedInEasyApplyError(msg)
+
+    async def _easy_apply_surface_ready(self, page: Page) -> bool:
+        try:
+            root = await self._easy_apply_root(page)
+        except LinkedInEasyApplyError:
+            return False
+        try:
+            readiness = await root.evaluate(
+                """
+                (node) => {
+                  const isVisible = (element) => {
+                    if (!element) {
+                      return false;
+                    }
+                    const style = window.getComputedStyle(element);
+                    if (
+                      style.display === "none"
+                      || style.visibility === "hidden"
+                      || style.opacity === "0"
+                    ) {
+                      return false;
+                    }
+                    const rect = element.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  };
+
+                  const textOf = (element) => {
+                    if (!element) {
+                      return "";
+                    }
+                    const text = (
+                      element.innerText
+                      || element.textContent
+                      || element.getAttribute("aria-label")
+                      || ""
+                    );
+                    return text.replace(/\\s+/g, " ").trim();
+                  };
+
+                  const countVisible = (selector) =>
+                    Array.from(node.querySelectorAll(selector)).filter(isVisible).length;
+                  const visibleTexts = (selector) =>
+                    Array.from(node.querySelectorAll(selector))
+                      .filter(isVisible)
+                      .map(textOf)
+                      .filter(Boolean);
+
+                  const controls = countVisible(
+                    [
+                      "input:not([type=hidden]):not([disabled])",
+                      "select:not([disabled])",
+                      "textarea:not([disabled])",
+                      "[role='radiogroup']",
+                      "[role='group'] input:not([type=hidden]):not([disabled])",
+                      "[role='combobox']",
+                    ].join(", "),
+                  );
+                  const visibleLabels = countVisible("label, legend");
+                  const footerButtons = visibleTexts("footer button, footer [role='button']");
+                  const nonDismissFooterButtons = footerButtons.filter((label) => {
+                    const normalized = label.toLowerCase();
+                    return !normalized.startsWith("dismiss") && !normalized.startsWith("close");
+                  });
+                  const headerTexts = visibleTexts("header h1, header h2, h1, h2");
+                  const markerTexts = visibleTexts("p, span, div").filter((label) => {
+                    const normalized = label.toLowerCase();
+                    return (
+                      /\\b\\d+\\s*\\/\\s*\\d+\\s*pages\\b/.test(normalized)
+                      || /\\b\\d+\\s*percent complete\\b/.test(normalized)
+                      || normalized.includes("apply to ")
+                    );
+                  });
+                  const sduiMarker = Array.from(node.querySelectorAll("[data-sdui-screen]"))
+                    .map((element) => element.getAttribute("data-sdui-screen") || "")
+                    .some((value) => /EasyApply/i.test(value));
+                  const loaders = countVisible("[data-testid='loader'], [aria-busy='true']");
+
+                  if (controls > 0) {
+                    return true;
+                  }
+                  if (sduiMarker && markerTexts.length > 0 && nonDismissFooterButtons.length > 0) {
+                    return true;
+                  }
+                  if (headerTexts.some((label) => /apply to /i.test(label)) && controls > 0) {
+                    return true;
+                  }
+                  if (visibleLabels > 0 && nonDismissFooterButtons.length > 0) {
+                    return true;
+                  }
+                  if (loaders > 0) {
+                    return false;
+                  }
+                  return nonDismissFooterButtons.length > 0 && markerTexts.length > 0;
+                }
+                """,
+            )
+            return bool(readiness)
+        except PlaywrightTimeoutError:
+            return False
+        except Exception:  # noqa: BLE001
+            return False
 
     async def _await_submission_outcome(
         self,
@@ -2676,6 +3460,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
             execution_events=execution_events,
             previous_step=step,
             step_answers=step_answers,
+            repair_origin="post_primary_action",
         )
         current_step = await self._extract_step(
             page,
@@ -3017,6 +3802,32 @@ class PlaywrightLinkedInEasyApplyExecutor:
                       - Math.max(fieldRect.left, candidateRect.left);
                     return overlap > Math.min(fieldRect.width, candidateRect.width) * 0.25;
                   };
+                  const looksLikeCharacterCounter = (text) =>
+                    /^\\d+\\s*\\/\\s*\\d+(?:\\s+\\d+\\s+\\S+\\s+\\d+(?:\\s+\\S+)*)?$/i.test(text);
+                  const hasErrorSignal = (candidate) => {
+                    if (!candidate || candidate.nodeType !== 1) {
+                      return false;
+                    }
+                    const role = collapse(candidate.getAttribute("role"));
+                    const ariaLive = collapse(candidate.getAttribute("aria-live"));
+                    const metadata = collapse(
+                      [
+                        candidate.getAttribute("class"),
+                        candidate.getAttribute("id"),
+                        candidate.getAttribute("data-test-form-element-error-messages"),
+                      ]
+                        .filter(Boolean)
+                        .join(" ")
+                    );
+                    return (
+                      role === "alert"
+                      || ariaLive === "assertive"
+                      || candidate.getAttribute("aria-invalid") === "true"
+                      || /(?:^|\\s)(?:error|invalid|warning)(?:\\s|$)/i.test(metadata)
+                      || metadata.includes("artdeco-inline-feedback__message")
+                      || metadata.includes("fb-dash-form-element__error-message")
+                    );
+                  };
                   const validationTexts = [];
                   const seenValidationTexts = new Set();
                   const pushValidationText = (candidate) => {
@@ -3025,6 +3836,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     }
                     const text = collapse(candidate.innerText || candidate.textContent || "");
                     if (!text || seenValidationTexts.has(text) || text.length > 180) {
+                      return;
+                    }
+                    if (looksLikeCharacterCounter(text) && !hasErrorSignal(candidate)) {
                       return;
                     }
                     const rect = candidate.getBoundingClientRect();
@@ -3118,6 +3932,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         execution_events: list[ExecutionEvent],
         previous_step: EasyApplyStep,
         step_answers: tuple[ApplicationAnswer, ...],
+        repair_origin: str = "post_primary_action",
     ) -> None:
         if not await self._easy_apply_modal_visible(page):
             return
@@ -3186,6 +4001,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "step_index": current_step.step_index,
                         "normalized_key": field.normalized_key,
                         "validation_message": validation_message,
+                        "repair_origin": repair_origin,
                     },
                 )
                 continue
@@ -3224,6 +4040,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     "fill_strategy": effective_resolution.fill_strategy.value,
                     "confidence": effective_resolution.confidence,
                     "reasoning": effective_resolution.reasoning,
+                    "repair_origin": repair_origin,
                 },
             )
             if field.control_kind in {"text", "textarea"}:
@@ -3253,6 +4070,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                     "Could not apply a new value while retrying the invalid "
                                     "Easy Apply text field."
                                 ),
+                                "repair_origin": repair_origin,
                             },
                         )
                 except TimeoutError:
@@ -3269,6 +4087,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                 "Timed out while the browser agent was trying to finish an "
                                 "interactive Easy Apply field."
                             ),
+                            "repair_origin": repair_origin,
                         },
                     )
                 except LinkedInEasyApplyError as exc:
@@ -3282,6 +4101,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             "step_index": current_step.step_index,
                             "normalized_key": field.normalized_key,
                             "message": str(exc),
+                            "repair_origin": repair_origin,
                         },
                     )
                 continue
@@ -3305,6 +4125,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "step_index": current_step.step_index,
                         "normalized_key": field.normalized_key,
                         "message": str(exc),
+                        "repair_origin": repair_origin,
                     },
                 )
                 continue
@@ -3322,6 +4143,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             "Could not apply a new value while retrying the invalid Easy Apply "
                             "control."
                         ),
+                        "repair_origin": repair_origin,
                     },
                 )
 
@@ -3352,7 +4174,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
             raise LinkedInEasyApplyError(str(exc)) from exc
 
     async def _easy_apply_root(self, page: Page) -> Locator:
+        best_candidate: Locator | None = None
+        best_score = float("-inf")
+        first_visible_candidate: Locator | None = None
         for selector in (
+            "dialog[data-testid='dialog'][open]",
+            "[data-testid='dialog'][open]",
+            "dialog[open]",
+            "[data-testid='dialog']",
             ".jobs-easy-apply-modal",
             "[data-test-modal] [role='dialog']",
             "[role='dialog']",
@@ -3361,8 +4190,121 @@ class PlaywrightLinkedInEasyApplyExecutor:
             count = await locator.count()
             for index in range(count):
                 candidate = locator.nth(index)
-                if await candidate.is_visible():
-                    return candidate
+                try:
+                    if not await candidate.is_visible():
+                        continue
+                except Exception:  # noqa: BLE001
+                    continue
+                if first_visible_candidate is None:
+                    first_visible_candidate = candidate
+                try:
+                    score = float(
+                        await candidate.evaluate(
+                            """
+                            (node) => {
+                              const isVisible = (element) => {
+                                if (!element) {
+                                  return false;
+                                }
+                                const style = window.getComputedStyle(element);
+                                if (
+                                  style.display === "none"
+                                  || style.visibility === "hidden"
+                                  || style.opacity === "0"
+                                ) {
+                                  return false;
+                                }
+                                const rect = element.getBoundingClientRect();
+                                return rect.width > 0 && rect.height > 0;
+                              };
+
+                              const textOf = (element) => {
+                                if (!element) {
+                                  return "";
+                                }
+                                const text = (
+                                  element.innerText
+                                  || element.textContent
+                                  || element.getAttribute("aria-label")
+                                  || ""
+                                );
+                                return text.replace(/\\s+/g, " ").trim();
+                              };
+
+                              const countVisible = (selector) =>
+                                Array.from(node.querySelectorAll(selector)).filter(isVisible).length;
+                              const visibleTexts = (selector) =>
+                                Array.from(node.querySelectorAll(selector))
+                                  .filter(isVisible)
+                                  .map(textOf)
+                                  .filter(Boolean);
+
+                              let score = 0;
+                              if (node.matches("[data-job-applier-active-surface='true']")) {
+                                score += 80;
+                              }
+
+                              const sduiMatches = Array.from(
+                                node.querySelectorAll("[data-sdui-screen]"),
+                              )
+                                .map((element) => element.getAttribute("data-sdui-screen") || "")
+                                .filter(Boolean);
+                              if (sduiMatches.some((value) => /EasyApply/i.test(value))) {
+                                score += 120;
+                              }
+
+                              const headerTexts = visibleTexts("header h1, header h2, h1, h2");
+                              if (headerTexts.some((label) => /apply to /i.test(label))) {
+                                score += 35;
+                              }
+
+                              const markerTexts = visibleTexts("p, span, div");
+                              if (
+                                markerTexts.some((label) =>
+                                  /\\b\\d+\\s*\\/\\s*\\d+\\s*pages\\b/i.test(label),
+                                )
+                              ) {
+                                score += 30;
+                              }
+                              if (
+                                markerTexts.some((label) =>
+                                  /\\b\\d+\\s*percent complete\\b/i.test(label),
+                                )
+                              ) {
+                                score += 20;
+                              }
+
+                              score += Math.min(
+                                20,
+                                countVisible(
+                                  [
+                                    "input:not([type=hidden]):not([disabled])",
+                                    "select:not([disabled])",
+                                    "textarea:not([disabled])",
+                                    "[role='radiogroup']",
+                                    "[role='combobox']",
+                                  ].join(", "),
+                                ) * 4,
+                              );
+                              score += Math.min(
+                                12,
+                                countVisible("footer button, footer [role='button']") * 4,
+                              );
+                              score += Math.min(6, countVisible("label, legend"));
+                              return score;
+                            }
+                            """,
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    score = 0.0
+                if score > best_score:
+                    best_score = score
+                    best_candidate = candidate
+        if best_candidate is not None:
+            return best_candidate
+        if first_visible_candidate is not None:
+            return first_visible_candidate
         active_surface = page.locator('[data-job-applier-active-surface="true"]')
         if await active_surface.count() and await active_surface.first.is_visible():
             return active_surface.first
@@ -3611,24 +4553,89 @@ class PlaywrightLinkedInEasyApplyExecutor:
         slug = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
         return run_dir / f"{submission_id.hex}_{slug}_{token}.{extension}"
 
-    def _prepare_submission_cv_path(
+    async def _prepare_submission_cv_path(
         self,
         *,
         settings: UserAgentSettings,
+        posting: JobPosting,
+        execution_id: UUID,
         run_dir: Path,
         submission_id: UUID,
-    ) -> Path | None:
-        source_path = _existing_path(settings.profile.cv_path)
-        if source_path is None:
+        execution_events: list[ExecutionEvent],
+    ) -> PreparedSubmissionCv | None:
+        prepared = await asyncio.to_thread(
+            self._dynamic_resume_builder.build_for_job,
+            settings=settings,
+            posting=posting,
+            run_dir=run_dir,
+            submission_id=submission_id,
+        )
+        if prepared is None:
             return None
-        input_dir = run_dir / "input"
-        input_dir.mkdir(parents=True, exist_ok=True)
-        filename = settings.profile.cv_filename or source_path.name
-        sanitized_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", filename).strip() or source_path.name
-        destination = input_dir / f"{submission_id.hex[:8]}-{sanitized_name}"
-        if not destination.exists():
-            shutil.copy2(source_path, destination)
-        return destination
+        artifacts = self._build_dynamic_resume_artifacts(
+            prepared=prepared,
+            submission_id=submission_id,
+        )
+        self._record_event(
+            execution_events,
+            execution_id=execution_id,
+            submission_id=submission_id,
+            event_type=ExecutionEventType.STEP_REACHED,
+            payload={
+                "stage": "dynamic_resume_variant_selected",
+                "job_posting_id": str(posting.id),
+                "source_cv_path": str(prepared.source_cv_path),
+                "submission_cv_path": str(prepared.submission_cv_path),
+                "cv_version": prepared.cv_version,
+                "used_dynamic_variant": prepared.used_dynamic_variant,
+                "notes": prepared.notes,
+            },
+        )
+        return PreparedSubmissionCv(
+            path=prepared.submission_cv_path,
+            cv_version=prepared.cv_version,
+            artifacts=artifacts,
+            used_dynamic_variant=prepared.used_dynamic_variant,
+            notes=prepared.notes,
+        )
+
+    def _build_dynamic_resume_artifacts(
+        self,
+        *,
+        prepared: DynamicResumeBuildResult,
+        submission_id: UUID,
+    ) -> tuple[ArtifactSnapshot, ...]:
+        paths: list[Path] = []
+        if prepared.used_dynamic_variant:
+            paths.append(prepared.submission_cv_path)
+        if prepared.markdown_path is not None:
+            paths.append(prepared.markdown_path)
+        if prepared.css_path is not None:
+            paths.append(prepared.css_path)
+        unique_paths: list[Path] = []
+        seen: set[str] = set()
+        for path in paths:
+            key = str(path.resolve())
+            if key in seen or not path.exists() or not path.is_file():
+                continue
+            seen.add(key)
+            unique_paths.append(path)
+        artifacts: list[ArtifactSnapshot] = []
+        for path in unique_paths:
+            append_artifact_reference(
+                artifact_type=ArtifactType.CV_METADATA.value,
+                label=path.name,
+                path=path,
+                sha256=_sha256_file(path),
+            )
+            artifacts.append(
+                _build_file_artifact(
+                    submission_id=submission_id,
+                    path=path,
+                    artifact_type=ArtifactType.CV_METADATA,
+                ),
+            )
+        return tuple(artifacts)
 
     def _build_run_dir(self, posting: JobPosting, submission_id: UUID) -> Path:
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")

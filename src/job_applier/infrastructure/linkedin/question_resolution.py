@@ -102,6 +102,58 @@ STRUCTURED_OUTPUT_SCHEMA = {
     "required": ["answer", "confidence", "reasoning"],
 }
 
+SEMANTIC_STEP_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "field_plans": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "field_ref": {
+                        "type": "string",
+                        "description": "Stable field reference echoed from the prompt payload.",
+                    },
+                    "semantic_slot": {
+                        "type": ["string", "null"],
+                        "description": (
+                            "Short English semantic identifier such as "
+                            "candidate.contact.email when inferable."
+                        ),
+                    },
+                    "answer": {
+                        "type": ["string", "null"],
+                        "description": (
+                            "Chosen answer. Must exactly match one visible option label when "
+                            "options exist. Use null when the answer is too uncertain."
+                        ),
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "description": "Confidence score between 0 and 1.",
+                    },
+                    "reasoning": {
+                        "type": "string",
+                        "description": "Short explanation grounded in visible evidence.",
+                    },
+                },
+                "required": ["field_ref", "semantic_slot", "answer", "confidence", "reasoning"],
+            },
+        },
+    },
+    "required": ["field_plans"],
+}
+
+
+def collapse_whitespace(value: str) -> str:
+    """Collapse repeated whitespace while preserving original casing."""
+
+    return re.sub(r"\s+", " ", value).strip()
+
 
 def normalize_text(value: str) -> str:
     """Collapse repeated whitespace and lowercase for comparisons."""
@@ -133,6 +185,12 @@ def _canonical_binary_token(value: str) -> str | None:
     if normalized in _NO_OPTION_TOKENS:
         return "no"
     return None
+
+
+def field_reference(field: EasyApplyField) -> str:
+    """Return the most stable reference we have for one extracted field."""
+
+    return field.dom_ref or field.name or field.dom_id or field.normalized_key
 
 
 def field_has_meaningful_current_value(field: EasyApplyField) -> bool:
@@ -169,6 +227,8 @@ class EasyApplyField:
     required: bool = False
     prefilled: bool = False
     current_value: str = ""
+    field_context: str = ""
+    helper_text: str | None = None
     options: tuple[str, ...] = ()
     option_refs: tuple[str, ...] = ()
 
@@ -212,6 +272,24 @@ class ValidationFeedbackContext:
     previous_answer: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class SemanticFieldPlan:
+    """One semantic answer plan inferred from the whole Easy Apply step."""
+
+    field_ref: str
+    semantic_slot: str | None
+    answer: str | None
+    confidence: float
+    reasoning: str
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticStepPlan:
+    """Structured AI plan for the fields in one Easy Apply step."""
+
+    field_plans: tuple[SemanticFieldPlan, ...] = ()
+
+
 class AmbiguousAnswerGenerator(Protocol):
     """Generate a best-effort answer when deterministic resolution is not possible."""
 
@@ -224,6 +302,23 @@ class AmbiguousAnswerGenerator(Protocol):
         validation_context: ValidationFeedbackContext | None = None,
     ) -> GeneratedAnswer | None:
         """Return a generated answer or `None` when the generator cannot help."""
+
+
+class SemanticStepPlanner(Protocol):
+    """Plan answers for one whole Easy Apply step using shared multilingual context."""
+
+    async def plan(
+        self,
+        *,
+        fields: tuple[EasyApplyField, ...],
+        candidate_fields: tuple[EasyApplyField, ...],
+        step_index: int,
+        total_steps: int,
+        surface_text: str,
+        settings: UserAgentSettings,
+        posting: JobPosting,
+    ) -> SemanticStepPlan | None:
+        """Return a structured plan or `None` when the planner cannot help."""
 
 
 class LinkedInQuestionClassifier:
@@ -539,6 +634,8 @@ class LinkedInQuestionExtractor:
             required=bool(payload.get("required")),
             prefilled=bool(payload.get("prefilled")),
             current_value=str(payload.get("current_value") or ""),
+            field_context=str(payload.get("field_context") or ""),
+            helper_text=str(payload.get("helper_text")) if payload.get("helper_text") else None,
             options=options,
             option_refs=self._extract_option_refs(payload),
         )
@@ -550,6 +647,323 @@ class LinkedInQuestionExtractor:
         return tuple(
             item.strip() for item in raw_option_refs if isinstance(item, str) and item.strip()
         )
+
+
+def _build_candidate_profile_payload(settings: UserAgentSettings) -> dict[str, object]:
+    return {
+        "name": settings.profile.name,
+        "first_name": _profile_first_name(settings.profile.name),
+        "last_name": _profile_last_name(settings.profile.name),
+        "email": str(settings.profile.email),
+        "phone": settings.profile.phone,
+        "city": settings.profile.city,
+        "linkedin_url": (
+            str(settings.profile.linkedin_url) if settings.profile.linkedin_url else None
+        ),
+        "github_url": str(settings.profile.github_url) if settings.profile.github_url else None,
+        "portfolio_url": (
+            str(settings.profile.portfolio_url) if settings.profile.portfolio_url else None
+        ),
+        "years_experience_by_stack": settings.profile.years_experience_by_stack,
+        "work_authorized": settings.profile.work_authorized,
+        "needs_sponsorship": settings.profile.needs_sponsorship,
+        "salary_expectation": settings.profile.salary_expectation,
+        "availability": settings.profile.availability,
+        "default_responses": settings.profile.default_responses,
+    }
+
+
+def _extract_openai_output_text(response_data: dict[str, object]) -> str:
+    direct_output = response_data.get("output_text")
+    if isinstance(direct_output, str):
+        return direct_output.strip()
+
+    output_items = response_data.get("output", ())
+    if not isinstance(output_items, list):
+        return ""
+
+    parts: list[str] = []
+    for item in output_items:
+        if not isinstance(item, dict):
+            continue
+        content_items = item.get("content", ())
+        if not isinstance(content_items, list):
+            continue
+        for content in content_items:
+            if not isinstance(content, dict):
+                continue
+            text = content.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(part.strip() for part in parts if part.strip()).strip()
+
+
+class OpenAISemanticStepPlanner:
+    """Use the OpenAI Responses API to plan one whole Easy Apply step at a time."""
+
+    endpoint = "https://api.openai.com/v1/responses"
+
+    async def plan(
+        self,
+        *,
+        fields: tuple[EasyApplyField, ...],
+        candidate_fields: tuple[EasyApplyField, ...],
+        step_index: int,
+        total_steps: int,
+        surface_text: str,
+        settings: UserAgentSettings,
+        posting: JobPosting,
+    ) -> SemanticStepPlan | None:
+        if settings.ai.api_key is None or not candidate_fields:
+            return None
+
+        prompt_payload = self._build_prompt_payload(
+            fields=fields,
+            candidate_fields=candidate_fields,
+            step_index=step_index,
+            total_steps=total_steps,
+            surface_text=surface_text,
+            settings=settings,
+            posting=posting,
+        )
+        logger.info(
+            "linkedin_easy_apply_semantic_step_prompt",
+            extra={
+                "step_index": step_index,
+                "total_steps": total_steps,
+                "candidate_field_refs": [field_reference(field) for field in candidate_fields],
+                "model": settings.ai.model,
+                "prompt_payload": prompt_payload,
+            },
+        )
+
+        try:
+            response_data = await asyncio.to_thread(
+                self._create_response,
+                api_key=settings.ai.api_key.get_secret_value(),
+                model=settings.ai.model,
+                prompt_payload=prompt_payload,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "linkedin_easy_apply_semantic_step_failed",
+                extra={"step_index": step_index, "model": settings.ai.model},
+            )
+            return None
+
+        raw_output = _extract_openai_output_text(response_data)
+        logger.info(
+            "linkedin_easy_apply_semantic_step_response",
+            extra={
+                "step_index": step_index,
+                "total_steps": total_steps,
+                "model": settings.ai.model,
+                "response_text": raw_output,
+            },
+        )
+        if not raw_output:
+            return None
+
+        try:
+            payload = json.loads(raw_output)
+        except json.JSONDecodeError:
+            logger.warning(
+                "linkedin_easy_apply_semantic_step_invalid_json",
+                extra={"step_index": step_index, "response_text": raw_output},
+            )
+            return None
+
+        raw_field_plans = payload.get("field_plans", ())
+        if not isinstance(raw_field_plans, list):
+            return None
+
+        known_fields = {field_reference(field): field for field in fields}
+        field_plans: list[SemanticFieldPlan] = []
+        seen_refs: set[str] = set()
+        for item in raw_field_plans:
+            if not isinstance(item, dict):
+                continue
+            field_ref = str(item.get("field_ref") or "").strip()
+            if not field_ref or field_ref in seen_refs:
+                continue
+            field = known_fields.get(field_ref)
+            if field is None:
+                continue
+            seen_refs.add(field_ref)
+            semantic_slot = _non_empty_value(str(item.get("semantic_slot") or ""))
+            answer = _non_empty_value(str(item.get("answer") or ""))
+            confidence = float(item.get("confidence") or 0.0)
+            reasoning = collapse_whitespace(str(item.get("reasoning") or ""))
+            field_plans.append(
+                SemanticFieldPlan(
+                    field_ref=field_ref,
+                    semantic_slot=semantic_slot,
+                    answer=answer,
+                    confidence=confidence,
+                    reasoning=reasoning,
+                )
+            )
+
+        return SemanticStepPlan(field_plans=tuple(field_plans))
+
+    def _create_response(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        prompt_payload: dict[str, object],
+    ) -> dict[str, object]:
+        body = {
+            "model": model,
+            "input": [
+                {
+                    "role": "developer",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "You plan how to fill one LinkedIn Easy Apply step for a global "
+                                "browser automation agent. The UI may be in any language and the "
+                                "visible field label may be incomplete, misleading, or duplicated "
+                                "from one option. Infer each field's meaning from the entire step "
+                                "surface, the field block text, visible options, validation/help "
+                                "text, job context, and candidate profile. Return plans only for "
+                                "fields that still need an answer, but do cover every candidate "
+                                "field passed in the prompt when you can support a low-risk "
+                                "answer. Candidate fields may include plain text or numeric "
+                                "experience prompts, not only selects or radios. Use a short "
+                                "English "
+                                "semantic_slot such as candidate.contact.email or "
+                                "candidate.legal.work_authorization when inferable, but do not "
+                                "force a slot if the meaning is still unclear. When options "
+                                "exist, answer must exactly match one visible option label. When "
+                                "the prompt says the field expects years of experience or another "
+                                "plain numeric answer and there are no options, answer with a "
+                                "plain integer string only. Keep related answers across the same "
+                                "step internally consistent. When the candidate profile lacks the "
+                                "needed fact, prefer a "
+                                "conservative plausible answer only for low-risk application "
+                                "questions, and leave answer null for legal, certification, visa, "
+                                "or compliance facts you cannot support. Never invent personal "
+                                "facts that contradict the visible candidate profile."
+                            ),
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": json.dumps(prompt_payload, ensure_ascii=True),
+                        },
+                    ],
+                },
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "easy_apply_semantic_step_plan",
+                    "schema": SEMANTIC_STEP_OUTPUT_SCHEMA,
+                    "strict": True,
+                },
+            },
+        }
+        payload_bytes = json.dumps(body, ensure_ascii=True).encode("utf-8")
+        http_request = request.Request(
+            self.endpoint,
+            data=payload_bytes,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with request.urlopen(http_request, timeout=45) as response:  # noqa: S310
+                return cast(dict[str, object], json.loads(response.read().decode("utf-8")))
+        except error.HTTPError as exc:
+            error_text = exc.read().decode("utf-8", errors="replace")
+            logger.warning(
+                "openai_responses_http_error",
+                extra={"status": exc.code, "body": error_text},
+            )
+            raise
+
+    def _build_prompt_payload(
+        self,
+        *,
+        fields: tuple[EasyApplyField, ...],
+        candidate_fields: tuple[EasyApplyField, ...],
+        step_index: int,
+        total_steps: int,
+        surface_text: str,
+        settings: UserAgentSettings,
+        posting: JobPosting,
+    ) -> dict[str, object]:
+        candidate_refs = {field_reference(field) for field in candidate_fields}
+        serialized_fields: list[dict[str, object]] = []
+        for field in fields:
+            serialized_fields.append(
+                {
+                    "field_ref": field_reference(field),
+                    "needs_answer": field_reference(field) in candidate_refs,
+                    "question": field.question_raw,
+                    "normalized_key": field.normalized_key,
+                    "question_type": field.question_type.value,
+                    "control_kind": field.control_kind,
+                    "input_type": field.input_type,
+                    "required": field.required,
+                    "prefilled": field.prefilled,
+                    "current_value": field.current_value,
+                    "options": list(field.options),
+                    "field_context": _truncate_prompt_text(field.field_context, limit=700),
+                    "helper_text": _truncate_prompt_text(field.helper_text, limit=240),
+                    "expected_answer_shape": _field_expected_answer_shape(field),
+                    "response_contract": _field_response_contract(field),
+                    "field_label_reliability": (
+                        "low" if _field_label_matches_visible_option(field) else "normal"
+                    ),
+                    "option_set_observations": _build_option_set_observations(field),
+                    "experience_inference_context": _build_experience_inference_context(
+                        field=field,
+                        settings=settings,
+                        posting=posting,
+                    ),
+                }
+            )
+        return {
+            "step_index": step_index + 1,
+            "total_steps": total_steps,
+            "surface_text": _truncate_prompt_text(surface_text, limit=1600),
+            "fields": serialized_fields,
+            "candidate_profile": _build_candidate_profile_payload(settings),
+            "job": {
+                "title": posting.title,
+                "company_name": posting.company_name,
+                "location": posting.location,
+                "description_raw": _truncate_prompt_text(posting.description_raw, limit=2400),
+            },
+            "planning_policy": [
+                "Use all visible step context before falling back to the raw field label.",
+                (
+                    "Plan every candidate field, including plain text and numeric fields, "
+                    "not just obviously ambiguous selects or radios."
+                ),
+                "If a field label is unreliable, use the broader field block text and options.",
+                (
+                    "When the step asks related experience questions, keep the answers "
+                    "internally consistent across the whole step."
+                ),
+                "When options exist, respond with the exact visible option label only.",
+                (
+                    "For years-of-experience or numeric free-text questions without options, "
+                    "prefer a plain conservative integer string such as '2'."
+                ),
+                "Prefer conservative and internally consistent candidate claims.",
+                "Avoid null answers only when a reasonable low-risk answer is clearly supported.",
+            ],
+        }
 
 
 class OpenAIResponsesAnswerGenerator:
@@ -612,7 +1026,7 @@ class OpenAIResponsesAnswerGenerator:
             )
             return None
 
-        raw_output = self._extract_output_text(response_data)
+        raw_output = _extract_openai_output_text(response_data)
         logger.info(
             "linkedin_ai_autofill_response",
             extra={
@@ -634,51 +1048,15 @@ class OpenAIResponsesAnswerGenerator:
             )
             return None
 
-        answer = str(payload.get("answer") or "").strip()
-        if not answer:
+        answer = _coerce_generated_answer_for_field(
+            field=field,
+            raw_answer=str(payload.get("answer") or ""),
+            posting=posting,
+        )
+        if answer is None:
             return None
         confidence = float(payload.get("confidence") or 0.0)
         reasoning = str(payload.get("reasoning") or "").strip()
-        if field.options:
-            selected_option = pick_option(field.options, preferred=answer)
-            if (
-                selected_option is None
-                and field.question_type is QuestionType.YEARS_EXPERIENCE
-                and re.fullmatch(r"\d+(?:[.,]\d+)?", answer)
-            ):
-                selected_option = pick_numeric_option(
-                    field.options,
-                    target_value=float(answer.replace(",", ".")),
-                )
-            if selected_option is None:
-                return None
-            answer = selected_option
-        if _answer_matches_unreliable_negative_option_label(field=field, answer=answer):
-            logger.info(
-                "linkedin_ai_autofill_guardrail_rejected",
-                extra={
-                    "normalized_key": field.normalized_key,
-                    "question_type": field.question_type.value,
-                    "answer": answer,
-                    "reason": "unreliable_negative_option_label",
-                },
-            )
-            return None
-        if _answer_uses_target_employer_for_candidate_field(
-            field=field,
-            answer=answer,
-            posting=posting,
-        ):
-            logger.info(
-                "linkedin_ai_autofill_guardrail_rejected",
-                extra={
-                    "normalized_key": field.normalized_key,
-                    "question_type": field.question_type.value,
-                    "answer": answer,
-                    "reason": "target_employer_reused_as_candidate_employer",
-                },
-            )
-            return None
 
         return GeneratedAnswer(
             value=answer,
@@ -790,59 +1168,23 @@ class OpenAIResponsesAnswerGenerator:
         posting: JobPosting,
         validation_context: ValidationFeedbackContext | None = None,
     ) -> dict[str, object]:
-        profile_payload = {
-            "name": settings.profile.name,
-            "first_name": _profile_first_name(settings.profile.name),
-            "last_name": _profile_last_name(settings.profile.name),
-            "email": str(settings.profile.email),
-            "phone": settings.profile.phone,
-            "city": settings.profile.city,
-            "linkedin_url": (
-                str(settings.profile.linkedin_url) if settings.profile.linkedin_url else None
-            ),
-            "github_url": str(settings.profile.github_url) if settings.profile.github_url else None,
-            "portfolio_url": (
-                str(settings.profile.portfolio_url) if settings.profile.portfolio_url else None
-            ),
-            "years_experience_by_stack": settings.profile.years_experience_by_stack,
-            "work_authorized": settings.profile.work_authorized,
-            "needs_sponsorship": settings.profile.needs_sponsorship,
-            "salary_expectation": settings.profile.salary_expectation,
-            "availability": settings.profile.availability,
-            "default_responses": settings.profile.default_responses,
-        }
         prompt_payload: dict[str, object] = {
             "question": field.question_raw,
             "normalized_key": field.normalized_key,
             "question_type": field.question_type.value,
             "control_kind": field.control_kind,
             "input_type": field.input_type,
-            "expected_answer_shape": (
-                "integer_years"
-                if field.question_type is QuestionType.YEARS_EXPERIENCE
-                else "numeric_salary"
-                if field.question_type is QuestionType.SALARY_EXPECTATION
-                else None
-            ),
-            "response_contract": {
-                "must_choose_visible_option": bool(field.options),
-                "must_return_yes_or_no": (
-                    field.question_type is QuestionType.YES_NO_GENERIC and not field.options
-                ),
-                "must_return_plain_integer": field.question_type is QuestionType.YEARS_EXPERIENCE,
-                "must_return_plain_number": (
-                    field.question_type is QuestionType.SALARY_EXPECTATION
-                    or field.input_type == "number"
-                ),
-                "keep_free_text_concise": field.control_kind == "textarea",
-            },
+            "field_context": _truncate_prompt_text(field.field_context, limit=700),
+            "helper_text": _truncate_prompt_text(field.helper_text, limit=240),
+            "expected_answer_shape": _field_expected_answer_shape(field),
+            "response_contract": _field_response_contract(field),
             "options": list(field.options),
             "field_label_reliability": (
                 "low" if _field_label_matches_visible_option(field) else "normal"
             ),
             "option_set_observations": _build_option_set_observations(field),
             "current_value": field.current_value,
-            "experience_inference_context": self._build_experience_inference_context(
+            "experience_inference_context": _build_experience_inference_context(
                 field=field,
                 settings=settings,
                 posting=posting,
@@ -884,9 +1226,9 @@ class OpenAIResponsesAnswerGenerator:
                 "title": posting.title,
                 "company_name": posting.company_name,
                 "location": posting.location,
-                "description_raw": posting.description_raw,
+                "description_raw": _truncate_prompt_text(posting.description_raw, limit=2400),
             },
-            "candidate_profile": profile_payload,
+            "candidate_profile": _build_candidate_profile_payload(settings),
         }
         if validation_context is not None and any(
             (
@@ -910,78 +1252,6 @@ class OpenAIResponsesAnswerGenerator:
             }
         return prompt_payload
 
-    def _build_experience_inference_context(
-        self,
-        *,
-        field: EasyApplyField,
-        settings: UserAgentSettings,
-        posting: JobPosting,
-    ) -> dict[str, object]:
-        exact_stack_matches: list[dict[str, object]] = []
-        normalized_question = normalize_text(
-            " ".join(
-                (
-                    field.question_raw,
-                    field.normalized_key,
-                    posting.title,
-                    posting.description_raw,
-                )
-            )
-        )
-        ordered_stacks = sorted(
-            settings.profile.years_experience_by_stack.items(),
-            key=lambda item: item[1],
-            reverse=True,
-        )
-        for stack_name, years in ordered_stacks:
-            normalized_stack = normalize_text(stack_name)
-            normalized_stack_key = normalize_key(stack_name)
-            if (normalized_stack and normalized_stack in normalized_question) or (
-                normalized_stack_key and normalized_stack_key in normalized_question
-            ):
-                exact_stack_matches.append({"stack": stack_name, "years": years})
-
-        strongest_stack = ordered_stacks[0] if ordered_stacks else None
-        conservative_years = _infer_conservative_related_years(
-            settings.profile.years_experience_by_stack
-        )
-        return {
-            "exact_stack_matches": exact_stack_matches,
-            "top_known_stacks": [
-                {"stack": stack_name, "years": years} for stack_name, years in ordered_stacks[:6]
-            ],
-            "strongest_known_stack": (
-                {"stack": strongest_stack[0], "years": strongest_stack[1]}
-                if strongest_stack is not None
-                else None
-            ),
-            "conservative_inferred_years_for_related_tooling": conservative_years,
-        }
-
-    def _extract_output_text(self, response_data: dict[str, object]) -> str:
-        direct_output = response_data.get("output_text")
-        if isinstance(direct_output, str):
-            return direct_output.strip()
-
-        output_items = response_data.get("output", ())
-        if not isinstance(output_items, list):
-            return ""
-
-        parts: list[str] = []
-        for item in output_items:
-            if not isinstance(item, dict):
-                continue
-            content_items = item.get("content", ())
-            if not isinstance(content_items, list):
-                continue
-            for content in content_items:
-                if not isinstance(content, dict):
-                    continue
-                text = content.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "\n".join(part.strip() for part in parts if part.strip()).strip()
-
 
 class LinkedInAnswerResolver:
     """Resolve extracted Easy Apply fields using the defined priority chain."""
@@ -990,9 +1260,34 @@ class LinkedInAnswerResolver:
         self,
         *,
         ambiguous_answer_generator: AmbiguousAnswerGenerator | None = None,
+        semantic_step_planner: SemanticStepPlanner | None = None,
     ) -> None:
         self._ambiguous_answer_generator = (
             ambiguous_answer_generator or OpenAIResponsesAnswerGenerator()
+        )
+        self._semantic_step_planner = semantic_step_planner or OpenAISemanticStepPlanner()
+
+    async def plan_step(
+        self,
+        *,
+        step_index: int,
+        total_steps: int,
+        surface_text: str,
+        fields: tuple[EasyApplyField, ...],
+        candidate_fields: tuple[EasyApplyField, ...],
+        settings: UserAgentSettings,
+        posting: JobPosting,
+    ) -> SemanticStepPlan | None:
+        if not settings.ruleset.allow_best_effort_autofill:
+            return None
+        return await self._semantic_step_planner.plan(
+            fields=fields,
+            candidate_fields=candidate_fields,
+            step_index=step_index,
+            total_steps=total_steps,
+            surface_text=surface_text,
+            settings=settings,
+            posting=posting,
         )
 
     async def resolve(
@@ -1001,11 +1296,21 @@ class LinkedInAnswerResolver:
         settings: UserAgentSettings,
         *,
         posting: JobPosting,
+        semantic_plan: SemanticFieldPlan | None = None,
     ) -> ResolvedFieldValue | None:
         """Return the selected value for a field, preserving prefilled controls."""
 
         if field.prefilled and field_has_meaningful_current_value(field):
             return None
+
+        semantic_plan_value = self._resolve_semantic_plan_value(
+            field,
+            settings,
+            posting=posting,
+            semantic_plan=semantic_plan,
+        )
+        if semantic_plan_value is not None:
+            return semantic_plan_value
 
         rule_value = self._resolve_explicit_rule_value(field, settings)
         if rule_value is not None:
@@ -1186,6 +1491,47 @@ class LinkedInAnswerResolver:
 
         return None
 
+    def _resolve_semantic_plan_value(
+        self,
+        field: EasyApplyField,
+        settings: UserAgentSettings,
+        *,
+        posting: JobPosting,
+        semantic_plan: SemanticFieldPlan | None,
+    ) -> ResolvedFieldValue | None:
+        if semantic_plan is None:
+            return None
+
+        planned_value = semantic_plan.answer
+        if planned_value is None and semantic_plan.semantic_slot is not None:
+            planned_value = self._resolve_profile_value_by_semantic_slot(
+                semantic_plan.semantic_slot,
+                field,
+                settings,
+            )
+        if planned_value is None:
+            return None
+
+        coerced_value = _coerce_generated_answer_for_field(
+            field=field,
+            raw_answer=planned_value,
+            posting=posting,
+        )
+        if coerced_value is None:
+            return None
+
+        reasoning = semantic_plan.reasoning
+        if semantic_plan.semantic_slot:
+            reasoning = f"{semantic_plan.semantic_slot}: {reasoning}".strip(": ")
+        return ResolvedFieldValue(
+            value=coerced_value,
+            answer_source=AnswerSource.AI,
+            fill_strategy=FillStrategy.AUTOFILL_AI,
+            ambiguity_flag=True,
+            confidence=semantic_plan.confidence,
+            reasoning=reasoning or "semantic_step_plan",
+        )
+
     async def _generate_ai_answer(
         self,
         *,
@@ -1300,6 +1646,49 @@ class LinkedInAnswerResolver:
                 return _non_empty_value(settings.profile.phone)
             case _:
                 return None
+
+    def _resolve_profile_value_by_semantic_slot(
+        self,
+        semantic_slot: str,
+        field: EasyApplyField,
+        settings: UserAgentSettings,
+    ) -> str | None:
+        normalized_slot = normalize_key(semantic_slot)
+        if normalized_slot.endswith(("first_name", "given_name", "forename")):
+            return _non_empty_value(_profile_first_name(settings.profile.name))
+        if normalized_slot.endswith(("last_name", "family_name", "surname")):
+            return _non_empty_value(_profile_last_name(settings.profile.name))
+        if "contact_email" in normalized_slot or normalized_slot.endswith("email"):
+            return _non_empty_value(str(settings.profile.email))
+        if "contact_phone" in normalized_slot or normalized_slot.endswith(
+            ("phone", "phone_number", "mobile", "mobile_number")
+        ):
+            if normalize_key(field.normalized_key) == "phone_country_code":
+                return self._resolve_phone_country_code(field)
+            return _non_empty_value(settings.profile.phone)
+        if "location_city" in normalized_slot or normalized_slot.endswith(("city", "current_city")):
+            return _non_empty_value(settings.profile.city)
+        if "linkedin" in normalized_slot:
+            return str(settings.profile.linkedin_url) if settings.profile.linkedin_url else None
+        if "github" in normalized_slot:
+            return str(settings.profile.github_url) if settings.profile.github_url else None
+        if "portfolio" in normalized_slot or "website" in normalized_slot:
+            return str(settings.profile.portfolio_url) if settings.profile.portfolio_url else None
+        if "work_authorization" in normalized_slot:
+            return "Yes" if settings.profile.work_authorized else "No"
+        if "visa" in normalized_slot or "sponsorship" in normalized_slot:
+            return "Yes" if settings.profile.needs_sponsorship else "No"
+        if "salary" in normalized_slot or "compensation" in normalized_slot:
+            if settings.profile.salary_expectation is None:
+                return None
+            return str(settings.profile.salary_expectation)
+        if "availability" in normalized_slot or "start_date" in normalized_slot:
+            return _non_empty_value(settings.profile.availability)
+        if "resume" in normalized_slot or "cv" in normalized_slot:
+            return _non_empty_value(settings.profile.cv_path)
+        if "years_experience" in normalized_slot or "experience_years" in normalized_slot:
+            return self._resolve_exact_years_experience(field, settings)
+        return None
 
     def _resolve_phone_country_code(self, field: EasyApplyField) -> str | None:
         if field.options:
@@ -1585,6 +1974,211 @@ class LinkedInAnswerResolver:
             if value.strip():
                 return value.strip()
         return None
+
+
+def _truncate_prompt_text(value: str | None, *, limit: int) -> str | None:
+    if value is None:
+        return None
+    collapsed = collapse_whitespace(value)
+    if not collapsed:
+        return None
+    if len(collapsed) <= limit:
+        return collapsed
+    return f"{collapsed[: limit - 3].rstrip()}..."
+
+
+def _field_expected_answer_shape(field: EasyApplyField) -> str | None:
+    if field.question_type is QuestionType.YEARS_EXPERIENCE:
+        return "integer_years"
+    if field.question_type is QuestionType.SALARY_EXPECTATION:
+        return "numeric_salary"
+    return None
+
+
+def _field_response_contract(field: EasyApplyField) -> dict[str, bool]:
+    return {
+        "must_choose_visible_option": bool(field.options),
+        "must_return_yes_or_no": (
+            field.question_type is QuestionType.YES_NO_GENERIC and not field.options
+        ),
+        "must_return_plain_integer": field.question_type is QuestionType.YEARS_EXPERIENCE,
+        "must_return_plain_number": (
+            field.question_type is QuestionType.SALARY_EXPECTATION or field.input_type == "number"
+        ),
+        "keep_free_text_concise": field.control_kind == "textarea",
+    }
+
+
+def _build_experience_inference_context(
+    *,
+    field: EasyApplyField,
+    settings: UserAgentSettings,
+    posting: JobPosting,
+) -> dict[str, object]:
+    exact_stack_matches: list[dict[str, object]] = []
+    normalized_question = normalize_text(
+        " ".join(
+            (
+                field.question_raw,
+                field.normalized_key,
+                posting.title,
+                posting.description_raw,
+            )
+        )
+    )
+    ordered_stacks = sorted(
+        settings.profile.years_experience_by_stack.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    for stack_name, years in ordered_stacks:
+        normalized_stack = normalize_text(stack_name)
+        normalized_stack_key = normalize_key(stack_name)
+        if (normalized_stack and normalized_stack in normalized_question) or (
+            normalized_stack_key and normalized_stack_key in normalized_question
+        ):
+            exact_stack_matches.append({"stack": stack_name, "years": years})
+
+    strongest_stack = ordered_stacks[0] if ordered_stacks else None
+    conservative_years = _infer_conservative_related_years(
+        settings.profile.years_experience_by_stack
+    )
+    return {
+        "exact_stack_matches": exact_stack_matches,
+        "top_known_stacks": [
+            {"stack": stack_name, "years": years} for stack_name, years in ordered_stacks[:6]
+        ],
+        "strongest_known_stack": (
+            {"stack": strongest_stack[0], "years": strongest_stack[1]}
+            if strongest_stack is not None
+            else None
+        ),
+        "conservative_inferred_years_for_related_tooling": conservative_years,
+    }
+
+
+def _extract_plain_numeric_answer(raw_value: str, *, integer_only: bool) -> str | None:
+    stripped = raw_value.strip()
+    if not stripped:
+        return None
+    numeric_match = re.search(r"-?\d+(?:[.,]\d+)?", stripped)
+    if numeric_match is None:
+        return None
+    numeric_value = float(numeric_match.group(0).replace(",", "."))
+    if integer_only:
+        return str(max(0, int(round(numeric_value))))
+    if numeric_value.is_integer():
+        return str(int(numeric_value))
+    return f"{numeric_value:.2f}".rstrip("0").rstrip(".")
+
+
+def _coerce_generated_answer_for_field(
+    *,
+    field: EasyApplyField,
+    raw_answer: str,
+    posting: JobPosting,
+) -> str | None:
+    answer = raw_answer.strip()
+    if not answer:
+        return None
+    if field.options:
+        selected_option = pick_option(field.options, preferred=answer)
+        if (
+            selected_option is None
+            and field.question_type is QuestionType.YEARS_EXPERIENCE
+            and re.search(r"\d", answer)
+        ):
+            numeric_answer = _extract_plain_numeric_answer(answer, integer_only=False)
+            if numeric_answer is not None:
+                selected_option = pick_numeric_option(
+                    field.options,
+                    target_value=float(numeric_answer),
+                )
+        if selected_option is None:
+            return None
+        answer = selected_option
+    elif field.question_type is QuestionType.YES_NO_GENERIC:
+        canonical_binary = _canonical_binary_token(answer)
+        if canonical_binary is not None:
+            answer = "Yes" if canonical_binary == "yes" else "No"
+    elif field.question_type is QuestionType.YEARS_EXPERIENCE:
+        normalized_numeric = _extract_plain_numeric_answer(answer, integer_only=True)
+        if normalized_numeric is None:
+            return None
+        answer = normalized_numeric
+    elif field.question_type is QuestionType.SALARY_EXPECTATION or field.input_type == "number":
+        normalized_numeric = _extract_plain_numeric_answer(answer, integer_only=False)
+        if normalized_numeric is None:
+            return None
+        answer = normalized_numeric
+
+    if _answer_matches_unreliable_negative_option_label(field=field, answer=answer):
+        logger.info(
+            "linkedin_ai_autofill_guardrail_rejected",
+            extra={
+                "normalized_key": field.normalized_key,
+                "question_type": field.question_type.value,
+                "answer": answer,
+                "reason": "unreliable_negative_option_label",
+            },
+        )
+        return None
+    if _answer_uses_target_employer_for_candidate_field(
+        field=field,
+        answer=answer,
+        posting=posting,
+    ):
+        logger.info(
+            "linkedin_ai_autofill_guardrail_rejected",
+            extra={
+                "normalized_key": field.normalized_key,
+                "question_type": field.question_type.value,
+                "answer": answer,
+                "reason": "target_employer_reused_as_candidate_employer",
+            },
+        )
+        return None
+    return answer
+
+
+def field_needs_semantic_step_planning(field: EasyApplyField) -> bool:
+    """Return whether one field deserves whole-step semantic interpretation."""
+
+    if field.prefilled and field_has_meaningful_current_value(field):
+        return False
+    if field.question_type is QuestionType.UNKNOWN:
+        return True
+    if field.classification_confidence < 0.75:
+        return True
+    if _field_label_matches_visible_option(field):
+        return True
+    if (
+        field.required
+        and field.control_kind in {"text", "textarea"}
+        and not field_has_meaningful_current_value(field)
+        and field.question_type
+        in {
+            QuestionType.UNKNOWN,
+            QuestionType.FREE_TEXT_GENERIC,
+            QuestionType.YEARS_EXPERIENCE,
+            QuestionType.SALARY_EXPECTATION,
+        }
+    ):
+        return True
+    if (
+        field.control_kind in {"radio", "select", "checkbox"}
+        and field.required
+        and len(field.options) >= 2
+        and bool(_non_empty_value(field.field_context))
+        and field.question_type
+        in {
+            QuestionType.UNKNOWN,
+            QuestionType.YES_NO_GENERIC,
+            QuestionType.FREE_TEXT_GENERIC,
+        }
+    ):
+        return True
+    return False
 
 
 def pick_option(options: tuple[str, ...], *, preferred: str | None = None) -> str | None:

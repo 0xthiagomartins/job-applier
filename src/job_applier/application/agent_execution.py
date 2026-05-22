@@ -56,6 +56,21 @@ from job_applier.observability import (
 
 logger = logging.getLogger(__name__)
 
+_NON_EASY_APPLY_SELECTED_JOB_RELEASE_MARKERS = (
+    "no control is available on this page to open the linkedin easy apply modal",
+    "the only visible apply button leads to the company website",
+    "does not have an easy apply control",
+    "available application button redirects externally",
+    "required easy apply modal cannot be opened",
+)
+
+
+def _should_release_selected_job_slot(submission: ApplicationSubmission) -> bool:
+    notes = (submission.notes or "").strip().lower()
+    if not notes:
+        return False
+    return any(marker in notes for marker in _NON_EASY_APPLY_SELECTED_JOB_RELEASE_MARKERS)
+
 
 class PanelSettingsConfigurationError(ValueError):
     """Raised when the persisted panel data is not ready for agent execution."""
@@ -826,6 +841,15 @@ class AgentExecutionOrchestrator:
             submission = attempt.submission
 
             if submission.status is SubmissionStatus.SKIPPED:
+                if _should_release_selected_job_slot(submission):
+                    jobs_selected = max(0, jobs_selected - 1)
+                    summary = self._persist_running_summary(
+                        summary,
+                        jobs_selected=jobs_selected,
+                        successful_submissions=successful_submissions,
+                        error_count=error_count,
+                        last_error=latest_error,
+                    )
                 self._emit_event(
                     execution_id=execution_id,
                     event_type=ExecutionEventType.STEP_REACHED,
@@ -868,6 +892,8 @@ class AgentExecutionOrchestrator:
             if submission.status is SubmissionStatus.FAILED:
                 latest_error = submission.notes or "Submission failed."
                 error_count += 1
+                if _should_release_selected_job_slot(submission):
+                    jobs_selected = max(0, jobs_selected - 1)
                 summary = self._persist_running_summary(
                     summary,
                     jobs_selected=jobs_selected,
