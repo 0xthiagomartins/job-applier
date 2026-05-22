@@ -24,7 +24,7 @@ export function OverviewCards(): React.JSX.Element {
       <OverviewCard
         description={state?.preferences.location || "No location configured yet."}
         title="Search Snapshot"
-        value={state?.preferences.keywords.join(", ") || "No keywords yet"}
+        value={state?.preferences.keywords.join(", ") || "No role targets yet"}
       />
       <OverviewCard
         description={state?.schedule.timezone || "UTC"}

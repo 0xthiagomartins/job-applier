@@ -182,11 +182,16 @@ class LocalPanelSettingsStore:
                 resume_css=DEFAULT_OH_MY_CV_RESUME_CSS,
             ),
             preferences=StoredPreferencesSection(
-                keywords=("python", "automation"),
+                keywords=(
+                    "Automation Engineer",
+                    "RPA Developer",
+                    "Backend Developer",
+                    "Full Stack Developer",
+                ),
                 location="Remote",
                 posted_within_hours=24,
                 easy_apply_only=True,
-                positive_keywords=("python",),
+                positive_keywords=(),
                 negative_keywords=("internship",),
                 auto_connect_with_recruiter=False,
             ),

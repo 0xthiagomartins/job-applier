@@ -165,7 +165,10 @@ export function OperationalDashboard(): React.JSX.Element {
             <QuickLink
               href="/preferences"
               title="Search filters"
-              description={state.preferences.keywords.join(", ") || "Define keywords and scoring filters."}
+              description={
+                state.preferences.keywords.join(", ") ||
+                "Define role targets and scoring filters."
+              }
             />
             <QuickLink
               href="/schedule"

@@ -18,6 +18,27 @@ STACK_WEIGHT = 0.30
 LOCATION_WEIGHT = 0.20
 POSITIVE_KEYWORD_WEIGHT = 0.15
 
+_ROLE_TARGET_ALIAS_PATTERNS: dict[str, tuple[str, ...]] = {
+    "automation engineer": (
+        r"\bautomation (engineer|developer|specialist)\b",
+        r"\bintelligent automation\b",
+    ),
+    "rpa developer": (
+        r"\brpa\b",
+        r"\brobotic process automation\b",
+        r"\buipath developer\b",
+        r"\buipath\b",
+    ),
+    "backend developer": (
+        r"\bbackend\b",
+        r"\bserver[\s\-]?side\b",
+    ),
+    "full stack developer": (
+        r"\bfull[\s\-]?stack\b",
+        r"\bfullstack\b",
+    ),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class ScoreComputation:
@@ -117,12 +138,33 @@ class RuleBasedJobScorer(JobScorer):
                 threshold=threshold,
             )
 
-        title_matches = match_terms(settings.search.keywords, normalized_title)
+        title_matches, title_component = match_role_targets(
+            settings.search.keywords,
+            normalized_title,
+            searchable_text,
+        )
+        if settings.search.keywords and not title_matches:
+            reason = (
+                "Rejected because the job title does not map clearly to the configured role "
+                f"targets; title={title_component:.2f}."
+            )
+            return ScoreComputation(
+                score=0.0,
+                selected=False,
+                reason=reason,
+                title_matches=(),
+                stack_matches=(),
+                positive_matches=(),
+                blacklist_matches=(),
+                title_component=title_component,
+                stack_component=0.0,
+                location_component=0.0,
+                positive_component=0.0,
+                threshold=threshold,
+            )
         stack_terms = tuple(settings.profile.years_experience_by_stack.keys())
         stack_matches = match_terms(stack_terms, searchable_text)
         positive_matches = match_terms(settings.profile.positive_filters, searchable_text)
-
-        title_component = fraction(len(title_matches), len(settings.search.keywords))
         stack_component = fraction(len(stack_matches), len(stack_terms))
         location_component = compute_location_component(settings, posting, searchable_text)
         positive_component = fraction(len(positive_matches), len(settings.profile.positive_filters))
@@ -203,6 +245,53 @@ def match_terms(terms: tuple[str, ...], normalized_text: str) -> tuple[str, ...]
         if normalized_term in normalized_text and normalized_term not in matches:
             matches.append(normalized_term)
     return tuple(matches)
+
+
+def match_role_targets(
+    role_targets: tuple[str, ...],
+    normalized_title: str,
+    searchable_text: str,
+) -> tuple[tuple[str, ...], float]:
+    """Return matching role targets plus the strongest match score."""
+
+    scored_matches = [
+        (target, compute_role_target_match_score(target, normalized_title, searchable_text))
+        for target in role_targets
+        if target.strip()
+    ]
+    title_matches = tuple(target for target, score in scored_matches if score >= 0.55)
+    title_component = max((score for _target, score in scored_matches), default=0.0)
+    return title_matches, title_component
+
+
+def compute_role_target_match_score(
+    role_target: str,
+    normalized_title: str,
+    searchable_text: str,
+) -> float:
+    """Compute how strongly a vacancy maps to one configured role family."""
+
+    del searchable_text
+    canonical_target = normalize_text(role_target)
+    if not canonical_target:
+        return 0.0
+
+    title_tokens = set(normalized_title.split())
+    target_tokens = tuple(token for token in canonical_target.split() if token)
+    alias_patterns = _ROLE_TARGET_ALIAS_PATTERNS.get(canonical_target, ())
+
+    if canonical_target in normalized_title:
+        return 1.0
+    if alias_patterns and any(re.search(pattern, normalized_title) for pattern in alias_patterns):
+        return 1.0
+
+    title_overlap = fraction(
+        sum(token in title_tokens for token in target_tokens),
+        len(target_tokens),
+    )
+    if title_overlap >= 0.5:
+        return round(title_overlap, 4)
+    return 0.0
 
 
 def fraction(matches: int, total: int) -> float:

@@ -93,9 +93,9 @@ export function PreferencesForm(): React.JSX.Element {
   return (
     <form className="space-y-6" onSubmit={handleSubmit}>
       <div className="grid gap-5 md:grid-cols-2">
-        <Field className="md:col-span-2" label="Keywords">
+        <Field className="md:col-span-2" label="Role targets">
           <Textarea
-            placeholder="python, automation, easy apply"
+            placeholder="Automation Engineer, RPA Developer, Backend Developer, Full Stack Developer"
             value={state.preferences.keywords.join(", ")}
             onChange={(event) =>
               updateField(
@@ -167,7 +167,7 @@ export function PreferencesForm(): React.JSX.Element {
 
         <Field className="md:col-span-2" label="Positive keywords">
           <Textarea
-            placeholder="fastapi, python, automation"
+            placeholder="langchain, typescript, javascript"
             value={state.preferences.positive_keywords.join(", ")}
             onChange={(event) =>
               updateField(

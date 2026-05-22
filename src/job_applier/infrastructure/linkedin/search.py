@@ -121,6 +121,7 @@ class LinkedInSearchCriteria:
 
     keywords: tuple[str, ...]
     keywords_text: str
+    active_role_target: str | None
     location: str
     posted_within_hours: int
     workplace_types: tuple[WorkplaceType, ...]
@@ -136,6 +137,9 @@ class LinkedInSearchCriteria:
 
         return {
             "keywords": list(self.keywords),
+            "role_targets": list(self.keywords),
+            "active_role_target": self.active_role_target,
+            "active_search_query": self.keywords_text,
             "location": self.location,
             "posted_within_hours": self.posted_within_hours,
             "workplace_types": [item.value for item in self.workplace_types],
@@ -199,18 +203,64 @@ def build_search_criteria(
 ) -> LinkedInSearchCriteria:
     """Build LinkedIn search criteria from the user and runtime settings."""
 
-    return LinkedInSearchCriteria(
-        keywords=settings.search.keywords,
-        keywords_text=" ".join(settings.search.keywords).strip(),
-        location=settings.search.location,
-        posted_within_hours=settings.search.posted_within_hours,
-        workplace_types=settings.search.workplace_types,
-        seniority=settings.search.seniority,
-        easy_apply_only=settings.search.easy_apply_only,
-        max_pages=_resolve_search_max_pages(runtime_settings, stage=stage),
-        debug_target_job_url=runtime_settings.resolved_linkedin_debug_target_job_url,
-        ai_api_key=settings.ai.api_key,
-        ai_model=settings.ai.model,
+    return build_search_campaign_criteria(
+        settings,
+        runtime_settings,
+        stage=stage,
+    )[0]
+
+
+def build_search_campaign_criteria(
+    settings: UserAgentSettings,
+    runtime_settings: RuntimeSettings,
+    *,
+    stage: DebugExecutionStage | None = None,
+) -> tuple[LinkedInSearchCriteria, ...]:
+    """Build one LinkedIn search campaign per configured role target."""
+
+    role_targets = _normalize_role_targets(settings.search.keywords)
+    if runtime_settings.resolved_linkedin_debug_target_job_url is not None:
+        fallback_query = (
+            role_targets[0] if role_targets else " ".join(settings.search.keywords).strip()
+        )
+        return (
+            LinkedInSearchCriteria(
+                keywords=role_targets or settings.search.keywords,
+                keywords_text=fallback_query,
+                active_role_target=fallback_query or None,
+                location=settings.search.location,
+                posted_within_hours=settings.search.posted_within_hours,
+                workplace_types=settings.search.workplace_types,
+                seniority=settings.search.seniority,
+                easy_apply_only=settings.search.easy_apply_only,
+                max_pages=_resolve_search_max_pages(runtime_settings, stage=stage),
+                debug_target_job_url=runtime_settings.resolved_linkedin_debug_target_job_url,
+                ai_api_key=settings.ai.api_key,
+                ai_model=settings.ai.model,
+            ),
+        )
+
+    if not role_targets:
+        fallback_query = " ".join(settings.search.keywords).strip()
+        role_targets = (fallback_query,) if fallback_query else ("Automation Engineer",)
+
+    max_pages = _resolve_search_max_pages(runtime_settings, stage=stage)
+    return tuple(
+        LinkedInSearchCriteria(
+            keywords=role_targets,
+            keywords_text=role_target,
+            active_role_target=role_target,
+            location=settings.search.location,
+            posted_within_hours=settings.search.posted_within_hours,
+            workplace_types=settings.search.workplace_types,
+            seniority=settings.search.seniority,
+            easy_apply_only=settings.search.easy_apply_only,
+            max_pages=max_pages,
+            debug_target_job_url=None,
+            ai_api_key=settings.ai.api_key,
+            ai_model=settings.ai.model,
+        )
+        for role_target in role_targets
     )
 
 
@@ -258,6 +308,21 @@ def build_search_results_url(criteria: LinkedInSearchCriteria) -> str:
     if criteria.posted_within_hours <= 24:
         params["f_TPR"] = "r86400"
     return f"{LINKEDIN_JOBS_SEARCH_URL}?{urlencode(params)}"
+
+
+def _normalize_role_targets(keywords: tuple[str, ...]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for keyword in keywords:
+        candidate = " ".join(keyword.split()).strip()
+        if not candidate:
+            continue
+        token = candidate.casefold()
+        if token in seen:
+            continue
+        seen.add(token)
+        normalized.append(candidate)
+    return tuple(normalized)
 
 
 def infer_workplace_type(text: str) -> WorkplaceType | None:
@@ -532,53 +597,86 @@ class LinkedInJobFetcher(JobFetcher):
         *,
         stage: DebugExecutionStage,
     ) -> list[JobPosting]:
-        criteria = build_search_criteria(settings, self._runtime_settings, stage=stage)
-        logger.info("linkedin_search_started", extra=criteria.to_log_payload())
-
-        collected_jobs = await self._client.fetch_jobs(criteria)
+        criteria_set = build_search_campaign_criteria(
+            settings,
+            self._runtime_settings,
+            stage=stage,
+        )
         persisted_jobs: list[JobPosting] = []
         seen_keys: set[str] = set()
+        logger.info(
+            "linkedin_search_started",
+            extra={
+                "campaign_count": len(criteria_set),
+                "role_targets": list(settings.search.keywords),
+                "location": settings.search.location,
+            },
+        )
 
-        for collected_job in collected_jobs:
-            try:
-                posting = self._parser.parse(collected_job)
-            except ValueError:
-                logger.exception(
-                    "linkedin_job_parse_failed",
+        for campaign_index, criteria in enumerate(criteria_set, start=1):
+            logger.info(
+                "linkedin_search_campaign_started",
+                extra={
+                    **criteria.to_log_payload(),
+                    "campaign_index": campaign_index,
+                    "campaign_count": len(criteria_set),
+                },
+            )
+            collected_jobs = await self._client.fetch_jobs(criteria)
+            for collected_job in collected_jobs:
+                try:
+                    posting = self._parser.parse(collected_job)
+                except ValueError:
+                    logger.exception(
+                        "linkedin_job_parse_failed",
+                        extra={
+                            "external_job_id": collected_job.external_job_id,
+                            "url": collected_job.url,
+                            "active_role_target": criteria.active_role_target,
+                        },
+                    )
+                    continue
+                dedupe_key = posting.external_job_id or posting.url
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+
+                existing = None
+                if posting.external_job_id:
+                    existing = self._job_repository.find_by_external_job_id(
+                        platform=posting.platform.value,
+                        external_job_id=posting.external_job_id,
+                    )
+                if existing is not None:
+                    posting = replace(posting, id=existing.id)
+
+                saved_posting = self._job_repository.save(posting)
+                persisted_jobs.append(saved_posting)
+                logger.info(
+                    "linkedin_job_captured",
                     extra={
-                        "external_job_id": collected_job.external_job_id,
-                        "url": collected_job.url,
+                        "job_posting_id": str(saved_posting.id),
+                        "external_job_id": saved_posting.external_job_id,
+                        "company_name": saved_posting.company_name,
+                        "title": saved_posting.title,
+                        "easy_apply": saved_posting.easy_apply,
+                        "active_role_target": criteria.active_role_target,
                     },
                 )
-                continue
-            dedupe_key = posting.external_job_id or posting.url
-            if dedupe_key in seen_keys:
-                continue
-            seen_keys.add(dedupe_key)
-
-            existing = None
-            if posting.external_job_id:
-                existing = self._job_repository.find_by_external_job_id(
-                    platform=posting.platform.value,
-                    external_job_id=posting.external_job_id,
-                )
-            if existing is not None:
-                posting = replace(posting, id=existing.id)
-
-            saved_posting = self._job_repository.save(posting)
-            persisted_jobs.append(saved_posting)
             logger.info(
-                "linkedin_job_captured",
+                "linkedin_search_campaign_completed",
                 extra={
-                    "job_posting_id": str(saved_posting.id),
-                    "external_job_id": saved_posting.external_job_id,
-                    "company_name": saved_posting.company_name,
-                    "title": saved_posting.title,
-                    "easy_apply": saved_posting.easy_apply,
+                    **criteria.to_log_payload(),
+                    "campaign_index": campaign_index,
+                    "campaign_count": len(criteria_set),
+                    "persisted_jobs": len(persisted_jobs),
                 },
             )
 
-        logger.info("linkedin_search_completed", extra={"jobs_seen": len(persisted_jobs)})
+        logger.info(
+            "linkedin_search_completed",
+            extra={"jobs_seen": len(persisted_jobs), "campaign_count": len(criteria_set)},
+        )
         return persisted_jobs
 
     async def fetch_incremental(
@@ -603,63 +701,128 @@ class LinkedInJobFetcher(JobFetcher):
     ) -> int:
         """Persist jobs incrementally and hand them to the orchestrator immediately."""
 
-        criteria = build_search_criteria(settings, self._runtime_settings, stage=stage)
-        logger.info("linkedin_search_started", extra=criteria.to_log_payload())
-
+        criteria_set = build_search_campaign_criteria(
+            settings,
+            self._runtime_settings,
+            stage=stage,
+        )
         seen_keys: set[str] = set()
         persisted_count = 0
+        logger.info(
+            "linkedin_search_started",
+            extra={
+                "campaign_count": len(criteria_set),
+                "role_targets": list(settings.search.keywords),
+                "location": settings.search.location,
+            },
+        )
 
-        async def persist_and_forward(collected_job: LinkedInCollectedJob) -> bool:
-            nonlocal persisted_count
+        if not isinstance(self._client, IncrementalLinkedInJobsClient):
+            persisted_jobs = await self.fetch_for_stage(settings, stage=stage)
+            return len(persisted_jobs)
 
-            try:
-                posting = self._parser.parse(collected_job)
-            except ValueError:
-                logger.exception(
-                    "linkedin_job_parse_failed",
-                    extra={
-                        "external_job_id": collected_job.external_job_id,
-                        "url": collected_job.url,
-                    },
-                )
-                return True
-
-            dedupe_key = posting.external_job_id or posting.url
-            if dedupe_key in seen_keys:
-                return True
-            seen_keys.add(dedupe_key)
-
-            existing = None
-            if posting.external_job_id:
-                existing = self._job_repository.find_by_external_job_id(
-                    platform=posting.platform.value,
-                    external_job_id=posting.external_job_id,
-                )
-            if existing is not None:
-                posting = replace(posting, id=existing.id)
-
-            saved_posting = self._job_repository.save(posting)
-            persisted_count += 1
+        global_stop_requested = False
+        staged_campaign_job_budget = (
+            1
+            if stage
+            in {
+                DebugExecutionStage.SEARCH,
+                DebugExecutionStage.SCORE,
+            }
+            else None
+        )
+        for campaign_index, criteria in enumerate(criteria_set, start=1):
+            active_role_target = criteria.active_role_target
+            campaign_persisted_count = 0
             logger.info(
-                "linkedin_job_captured",
+                "linkedin_search_campaign_started",
                 extra={
-                    "job_posting_id": str(saved_posting.id),
-                    "external_job_id": saved_posting.external_job_id,
-                    "company_name": saved_posting.company_name,
-                    "title": saved_posting.title,
-                    "easy_apply": saved_posting.easy_apply,
+                    **criteria.to_log_payload(),
+                    "campaign_index": campaign_index,
+                    "campaign_count": len(criteria_set),
                     "incremental": True,
                 },
             )
-            return await on_job(saved_posting)
 
-        if isinstance(self._client, IncrementalLinkedInJobsClient):
+            async def persist_and_forward(
+                collected_job: LinkedInCollectedJob,
+                active_role_target: str | None = active_role_target,
+            ) -> bool:
+                nonlocal campaign_persisted_count, global_stop_requested, persisted_count
+
+                try:
+                    posting = self._parser.parse(collected_job)
+                except ValueError:
+                    logger.exception(
+                        "linkedin_job_parse_failed",
+                        extra={
+                            "external_job_id": collected_job.external_job_id,
+                            "url": collected_job.url,
+                            "active_role_target": active_role_target,
+                        },
+                    )
+                    return True
+
+                dedupe_key = posting.external_job_id or posting.url
+                if dedupe_key in seen_keys:
+                    return True
+                seen_keys.add(dedupe_key)
+
+                existing = None
+                if posting.external_job_id:
+                    existing = self._job_repository.find_by_external_job_id(
+                        platform=posting.platform.value,
+                        external_job_id=posting.external_job_id,
+                    )
+                if existing is not None:
+                    posting = replace(posting, id=existing.id)
+
+                saved_posting = self._job_repository.save(posting)
+                persisted_count += 1
+                campaign_persisted_count += 1
+                logger.info(
+                    "linkedin_job_captured",
+                    extra={
+                        "job_posting_id": str(saved_posting.id),
+                        "external_job_id": saved_posting.external_job_id,
+                        "company_name": saved_posting.company_name,
+                        "title": saved_posting.title,
+                        "easy_apply": saved_posting.easy_apply,
+                        "incremental": True,
+                        "active_role_target": active_role_target,
+                    },
+                )
+                should_continue = await on_job(saved_posting)
+                if not should_continue:
+                    global_stop_requested = True
+                    return False
+                if (
+                    staged_campaign_job_budget is not None
+                    and campaign_persisted_count >= staged_campaign_job_budget
+                ):
+                    return False
+                return True
+
             await self._client.stream_jobs(criteria, persist_and_forward)
-            logger.info("linkedin_search_completed", extra={"jobs_seen": persisted_count})
-            return persisted_count
+            logger.info(
+                "linkedin_search_campaign_completed",
+                extra={
+                    **criteria.to_log_payload(),
+                    "campaign_index": campaign_index,
+                    "campaign_count": len(criteria_set),
+                    "persisted_jobs": persisted_count,
+                    "campaign_persisted_jobs": campaign_persisted_count,
+                    "incremental": True,
+                },
+            )
+            if global_stop_requested:
+                break
 
-        persisted_jobs = await self.fetch(settings)
-        return len(persisted_jobs)
+        logger.info(
+            "linkedin_search_completed",
+            extra={"jobs_seen": persisted_count, "campaign_count": len(criteria_set)},
+        )
+        return persisted_count
 
 
 class PlaywrightLinkedInJobsClient:
@@ -2515,7 +2678,23 @@ class PlaywrightLinkedInJobsClient:
 
     async def _capture_screenshot(self, page: Page, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        await page.screenshot(path=str(path), full_page=True)
+        try:
+            await page.screenshot(path=str(path), full_page=True)
+        except PlaywrightTimeoutError as exc:
+            append_output_jsonl(
+                "run.log",
+                {
+                    "source": "linkedin_search",
+                    "kind": "screenshot_capture_skipped",
+                    "path": str(path),
+                    "message": str(exc),
+                },
+            )
+            logger.warning(
+                "linkedin_search_screenshot_timeout",
+                extra={"path": str(path)},
+            )
+            return
         append_artifact_reference(
             artifact_type="screenshot",
             label=path.stem,
