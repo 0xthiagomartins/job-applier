@@ -460,6 +460,19 @@ def merge_job_detail_payload(
         for candidate in (_collapse_text(item) for item in title_candidates_source)
         if candidate
     )
+    document_title_segments_source = detail_payload.get("document_title_segments")
+    document_title_segments = tuple(
+        candidate
+        for candidate in (
+            _collapse_text(item)
+            for item in (
+                document_title_segments_source
+                if isinstance(document_title_segments_source, (list, tuple))
+                else ()
+            )
+        )
+        if candidate
+    )
 
     normalized_listing_title = _collapse_text(listing.title)
     normalized_listing_company = _collapse_text(listing.company_name)
@@ -478,26 +491,13 @@ def merge_job_detail_payload(
         normalized_listing_title or "LinkedIn job",
     )
 
-    title_line_index = next(
-        (
-            index
-            for index, candidate in enumerate(top_card_lines)
-            if _collapse_text(candidate).lower() == title.lower()
-        ),
-        None,
-    )
-    top_card_lines_after_title = (
-        top_card_lines[title_line_index + 1 :] if title_line_index is not None else top_card_lines
-    )
-
     company_name = ""
     for candidate in (
         _collapse_text(detail_payload.get("structured_company_name")),
         _collapse_text(detail_payload.get("company_name")),
         normalized_listing_company,
+        *document_title_segments[1:3],
         *company_candidates,
-        *top_card_lines_after_title,
-        *top_card_lines,
     ):
         if not candidate or _looks_like_placeholder_label(candidate):
             continue
@@ -522,7 +522,18 @@ def merge_job_detail_payload(
     )
 
     detail_text = _collapse_text(detail_payload.get("metadata_text"))
-    description_raw = _collapse_text(detail_payload.get("description_raw"))
+    description_raw = next(
+        (
+            candidate
+            for candidate in (
+                _collapse_text(detail_payload.get("description_raw")),
+                _collapse_text(detail_payload.get("structured_description")),
+                _collapse_text(listing.description_raw),
+            )
+            if candidate
+        ),
+        "",
+    )
 
     return LinkedInCollectedJob(
         external_job_id=listing.external_job_id,
@@ -2041,6 +2052,14 @@ class PlaywrightLinkedInJobsClient:
                     const scripts = Array.from(
                       document.querySelectorAll('script[type="application/ld+json"]')
                     );
+                    const htmlToText = (value) => {
+                      if (!value) return "";
+                      const container = document.createElement("div");
+                      container.innerHTML = String(value);
+                      return (container.innerText || container.textContent || "")
+                        .replace(/\\s+/g, " ")
+                        .trim();
+                    };
                     const flatten = (value) => {
                       if (!value) return [];
                       if (Array.isArray(value)) return value.flatMap(flatten);
@@ -2067,6 +2086,7 @@ class PlaywrightLinkedInJobsClient:
                               || item.directApplyCompany
                               || ""
                             ).trim(),
+                            structured_description: htmlToText(item.description || ""),
                             structured_location: (
                               address.addressLocality
                               || address.addressRegion
@@ -2082,6 +2102,7 @@ class PlaywrightLinkedInJobsClient:
                     return {
                       structured_title: "",
                       structured_company_name: "",
+                      structured_description: "",
                       structured_location: "",
                     };
                   };
@@ -2109,6 +2130,12 @@ class PlaywrightLinkedInJobsClient:
                     }
                     return values;
                   };
+                  const nodeText = (node) => {
+                    if (!node) return "";
+                    return (node.innerText || node.textContent || "")
+                      .replace(/\\s+/g, " ")
+                      .trim();
+                  };
                   const firstNode = (selectors) => {
                     for (const selector of selectors) {
                       const node = document.querySelector(selector);
@@ -2119,12 +2146,12 @@ class PlaywrightLinkedInJobsClient:
                     return null;
                   };
 
-                  const description = firstText([
+                  const descriptionRoot = firstNode([
                     ".jobs-description-content__text",
                     "#job-details",
                     "[data-job-detail-container] .jobs-box__html-content",
-                    "main",
                   ]);
+                  const description = nodeText(descriptionRoot);
                   const title = firstText([
                     ".job-details-jobs-unified-top-card__job-title",
                     ".jobs-unified-top-card h1",
@@ -2143,7 +2170,10 @@ class PlaywrightLinkedInJobsClient:
                     ".job-details-jobs-unified-top-card__container--two-pane",
                     ".job-details-jobs-unified-top-card__container",
                     ".jobs-search__job-details--container",
-                    "main",
+                  ]);
+                  const primaryDescription = firstNode([
+                    ".job-details-jobs-unified-top-card__primary-description-container",
+                    ".jobs-unified-top-card__primary-description",
                   ]);
                   const topCardLines = (topCard?.innerText || "")
                     .split("\\n")
@@ -2154,33 +2184,51 @@ class PlaywrightLinkedInJobsClient:
                     ".job-details-jobs-unified-top-card__company-name",
                     ".jobs-unified-top-card__company-name a",
                     ".jobs-unified-top-card__company-name",
-                    ".job-details-jobs-unified-top-card__primary-description-container a",
-                    ".job-details-jobs-unified-top-card__primary-description-container span",
-                    ".jobs-unified-top-card__primary-description a",
-                    ".jobs-unified-top-card__primary-description span",
                   ]);
-                  const location = firstText([
+                  const locationCandidates = collectTexts([
+                    ".job-details-jobs-unified-top-card__primary-description-container span",
                     ".job-details-jobs-unified-top-card__primary-description-container",
+                    ".jobs-unified-top-card__primary-description span",
                     ".jobs-unified-top-card__primary-description",
                     ".jobs-unified-top-card__bullet",
                   ]);
-                  const bodyText = document.body ? document.body.innerText : "";
+                  const location = locationCandidates[0] || "";
+                  const applyLabels = collectTexts([
+                    ".jobs-apply-button",
+                    ".jobs-apply-button span",
+                    ".jobs-apply-button--top-card",
+                    ".jobs-apply-button--top-card span",
+                    ".jobs-s-apply button",
+                    ".jobs-s-apply button span",
+                    ".jobs-details-top-card__apply-error",
+                  ]);
 
-                  const documentTitle = (document.title || "").split("|")[0].trim();
+                  const rawDocumentTitle = (document.title || "").trim();
+                  const documentTitleSegments = rawDocumentTitle
+                    .split("|")
+                    .map((item) => item.trim())
+                    .filter(Boolean);
+                  const documentTitle = documentTitleSegments[0] || "";
                   const structuredJob = extractStructuredJobPosting();
+                  const metadataSegments = [
+                    nodeText(topCard),
+                    nodeText(primaryDescription),
+                  ].filter(Boolean);
 
                   return {
                     title: title || documentTitle,
                     structured_title: structuredJob.structured_title,
                     title_candidates: [title, documentTitle, ...topCardLines.slice(0, 2)],
+                    document_title_segments: documentTitleSegments,
                     company_name: companyName,
                     structured_company_name: structuredJob.structured_company_name,
                     company_candidates: companyCandidates,
                     location: location || structuredJob.structured_location,
                     top_card_lines: topCardLines,
-                    description_raw: description,
-                    metadata_text: bodyText,
-                    easy_apply: /easy apply/i.test(bodyText),
+                    structured_description: structuredJob.structured_description,
+                    description_raw: description || structuredJob.structured_description,
+                    metadata_text: metadataSegments.join(" | "),
+                    easy_apply: applyLabels.some((label) => /easy apply/i.test(label)),
                   };
                 }
                 """,
