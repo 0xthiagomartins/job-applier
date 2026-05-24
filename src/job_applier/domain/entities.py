@@ -18,6 +18,7 @@ from job_applier.domain.enums import (
     QuestionType,
     RecruiterAction,
     RecruiterInteractionStatus,
+    ResumeMode,
     SeniorityLevel,
     SubmissionStatus,
     WorkplaceType,
@@ -101,6 +102,9 @@ class ApplicationSubmission:
     status: SubmissionStatus = SubmissionStatus.PENDING
     started_at: datetime = field(default_factory=utc_now)
     submitted_at: datetime | None = None
+    resume_mode: ResumeMode = ResumeMode.STATIC
+    matched_role_target: str | None = None
+    matched_specializations: tuple[str, ...] = ()
     cv_version: str | None = None
     cover_letter_version: str | None = None
     profile_snapshot_id: UUID | None = None
@@ -142,6 +146,20 @@ class ApplicationSubmission:
                 "ruleset_version",
                 ensure_non_empty(self.ruleset_version, "ruleset_version"),
             )
+        if self.matched_role_target is not None:
+            object.__setattr__(
+                self,
+                "matched_role_target",
+                ensure_non_empty(self.matched_role_target, "matched_role_target"),
+            )
+        object.__setattr__(
+            self,
+            "matched_specializations",
+            tuple(
+                ensure_non_empty(specialization, "matched_specializations")
+                for specialization in self.matched_specializations
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

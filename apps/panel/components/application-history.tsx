@@ -262,6 +262,8 @@ export function ApplicationHistory(): React.JSX.Element {
                     </div>
                     <div className="mt-3 flex flex-wrap gap-2 text-xs text-muted-foreground">
                       {item.location ? <span>{item.location}</span> : null}
+                      <span>Mode: {item.resume_mode}</span>
+                      {item.matched_role_target ? <span>Target: {item.matched_role_target}</span> : null}
                       {item.cv_version ? <span>CV: {item.cv_version}</span> : null}
                       {item.external_job_id ? <span>ID: {item.external_job_id}</span> : null}
                     </div>
@@ -330,6 +332,10 @@ export function ApplicationHistory(): React.JSX.Element {
                   </Badge>
                 </div>
                 <div className="grid gap-3 text-sm text-muted-foreground md:grid-cols-2">
+                  <div>Resume mode: {selectedApplication.submission.resume_mode}</div>
+                  <div>
+                    Matched target: {selectedApplication.submission.matched_role_target || "Not informed"}
+                  </div>
                   <div>CV used: {selectedApplication.submission.cv_version || "Not informed"}</div>
                   <div>Origin: {selectedApplication.submission.execution_origin}</div>
                   <div>
@@ -339,6 +345,11 @@ export function ApplicationHistory(): React.JSX.Element {
                     AI model: {selectedApplication.submission.ai_model_used || "Not informed"}
                   </div>
                 </div>
+                {selectedApplication.submission.matched_specializations.length ? (
+                  <p className="text-sm text-muted-foreground">
+                    Specializations: {selectedApplication.submission.matched_specializations.join(", ")}
+                  </p>
+                ) : null}
                 {selectedApplication.submission.notes ? (
                   <p className="rounded-2xl bg-secondary/60 px-4 py-3 text-sm text-foreground">
                     {selectedApplication.submission.notes}

@@ -14,6 +14,7 @@ export type ProfileSection = {
   default_responses: Record<string, string>;
   cv_path: string | null;
   cv_filename: string | null;
+  resume_mode: "static" | "dynamic";
   resume_css: string | null;
 };
 
@@ -68,6 +69,8 @@ export type ApplicationHistoryListItem = {
   job_url: string;
   location: string | null;
   external_job_id: string | null;
+  resume_mode: "static" | "dynamic";
+  matched_role_target: string | null;
   cv_version: string | null;
   execution_origin: string;
   notes: string | null;
@@ -130,6 +133,9 @@ export type ApplicationHistoryDetail = {
     status: string;
     started_at: string;
     submitted_at: string | null;
+    resume_mode: "static" | "dynamic";
+    matched_role_target: string | null;
+    matched_specializations: string[];
     cv_version: string | null;
     cover_letter_version: string | null;
     profile_snapshot_id: string | null;

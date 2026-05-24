@@ -102,6 +102,8 @@ class ScoredJobPosting:
     selected: bool = True
     score: float | None = None
     reason: str | None = None
+    matched_role_target: str | None = None
+    matched_specializations: tuple[str, ...] = ()
 
 
 class JobFetcher(Protocol):
@@ -168,6 +170,7 @@ class JobSubmitter(Protocol):
         self,
         settings: UserAgentSettings,
         posting: JobPosting,
+        scored_job: ScoredJobPosting,
         *,
         execution_id: UUID,
         origin: ExecutionOrigin,
@@ -229,7 +232,14 @@ class PassThroughJobScorer:
                 "ai_model": settings.ai.model,
             },
         )
-        return ScoredJobPosting(posting=posting, selected=True, score=1.0, reason="default-pass")
+        matched_role_target = settings.search.keywords[0] if settings.search.keywords else None
+        return ScoredJobPosting(
+            posting=posting,
+            selected=True,
+            score=1.0,
+            reason="default-pass",
+            matched_role_target=matched_role_target,
+        )
 
 
 class NoOpJobSubmitter:
@@ -239,11 +249,13 @@ class NoOpJobSubmitter:
         self,
         settings: UserAgentSettings,
         posting: JobPosting,
+        scored_job: ScoredJobPosting,
         *,
         execution_id: UUID,
         origin: ExecutionOrigin,
     ) -> SubmissionAttempt:
         del execution_id
+        del scored_job
         logger.info(
             "job_submit_stage",
             extra={
@@ -256,6 +268,7 @@ class NoOpJobSubmitter:
             submission=ApplicationSubmission(
                 job_posting_id=posting.id,
                 status=SubmissionStatus.SKIPPED,
+                resume_mode=settings.profile.resume_mode,
                 execution_origin=origin,
                 notes="Application submitter is not configured yet.",
             ),
@@ -297,6 +310,7 @@ def build_user_agent_settings(document: PanelSettingsDocument) -> UserAgentSetti
                 default_responses=document.profile.default_responses,
                 cv_path=document.profile.cv_path,
                 cv_filename=document.profile.cv_filename,
+                resume_mode=document.profile.resume_mode,
                 resume_css=document.profile.resume_css,
                 positive_filters=document.preferences.positive_keywords,
                 blacklist=document.preferences.negative_keywords,
@@ -792,6 +806,7 @@ class AgentExecutionOrchestrator:
                 attempt = await self._job_submitter.submit(
                     settings,
                     posting,
+                    scored_job,
                     execution_id=execution_id,
                     origin=origin,
                 )

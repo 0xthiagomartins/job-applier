@@ -20,6 +20,7 @@ from job_applier.domain.enums import (
     QuestionType,
     RecruiterAction,
     RecruiterInteractionStatus,
+    ResumeMode,
     ScheduleFrequency,
     SeniorityLevel,
     SubmissionStatus,
@@ -69,6 +70,9 @@ class ApplicationSubmissionCreate(BaseModel):
     status: SubmissionStatus = SubmissionStatus.PENDING
     started_at: datetime | None = None
     submitted_at: datetime | None = None
+    resume_mode: ResumeMode = ResumeMode.STATIC
+    matched_role_target: str | None = None
+    matched_specializations: tuple[str, ...] = ()
     cv_version: str | None = None
     cover_letter_version: str | None = None
     profile_snapshot_id: UUID | None = None
@@ -84,6 +88,9 @@ class ApplicationSubmissionRead(ReadSchema):
     status: SubmissionStatus
     started_at: datetime
     submitted_at: datetime | None
+    resume_mode: ResumeMode
+    matched_role_target: str | None
+    matched_specializations: tuple[str, ...]
     cv_version: str | None
     cover_letter_version: str | None
     profile_snapshot_id: UUID | None
@@ -222,6 +229,8 @@ class ApplicationHistoryListItemRead(BaseModel):
     job_url: str
     location: str | None = None
     external_job_id: str | None = None
+    resume_mode: ResumeMode = ResumeMode.STATIC
+    matched_role_target: str | None = None
     cv_version: str | None = None
     execution_origin: ExecutionOrigin
     notes: str | None = None
@@ -238,6 +247,8 @@ class ApplicationHistoryListItemRead(BaseModel):
             job_url=entry.job_posting.url,
             location=entry.job_posting.location,
             external_job_id=entry.job_posting.external_job_id,
+            resume_mode=entry.submission.resume_mode,
+            matched_role_target=entry.submission.matched_role_target,
             cv_version=entry.submission.cv_version,
             execution_origin=entry.submission.execution_origin,
             notes=entry.submission.notes,
@@ -317,6 +328,7 @@ class UserProfileConfigSchema(BaseModel):
     default_responses: dict[str, str] = Field(default_factory=dict)
     cv_path: str | None = None
     cv_filename: str | None = None
+    resume_mode: ResumeMode = ResumeMode.STATIC
     positive_filters: tuple[str, ...] = ()
     blacklist: tuple[str, ...] = ()
 

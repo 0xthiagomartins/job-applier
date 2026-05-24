@@ -36,6 +36,11 @@ class SubmissionStatus(StrEnum):
     SKIPPED = "skipped"
 
 
+class ResumeMode(StrEnum):
+    STATIC = "static"
+    DYNAMIC = "dynamic"
+
+
 class QuestionType(StrEnum):
     FIRST_NAME = "first_name"
     LAST_NAME = "last_name"

@@ -19,10 +19,11 @@ from pathlib import Path
 from typing import cast
 from uuid import UUID
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 from job_applier.application.config import UserAgentSettings
 from job_applier.domain.entities import JobPosting
+from job_applier.domain.enums import ResumeMode
 from job_applier.resume_theme import DEFAULT_OH_MY_CV_RESUME_CSS
 from job_applier.settings import RuntimeSettings
 
@@ -75,6 +76,7 @@ _RESUME_ADAPTATION_SCHEMA: dict[str, object] = {
 
 _TARGET_KEYWORD_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("automation engineer", (r"\bautomation (engineer|developer|specialist)\b",)),
+    ("automation developer", (r"\bautomation developer\b",)),
     ("rpa developer", (r"\brpa\b", r"\brobotic process automation\b")),
     ("backend developer", (r"\bbackend\b", r"\bserver[\s\-]?side\b")),
     ("full stack developer", (r"\bfull[\s\-]?stack\b", r"\bfullstack\b")),
@@ -87,6 +89,7 @@ _TARGET_KEYWORD_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("typescript", (r"\btypescript\b",)),
     ("javascript", (r"\bjavascript\b", r"\bnode\.?js\b")),
     ("python", (r"\bpython\b",)),
+    ("java", (r"\bjava\b",)),
     ("langchain", (r"\blangchain\b",)),
     ("llm", (r"\bllm\b",)),
     ("rag", (r"\brag\b", r"\bretrieval[\s\-]augmented generation\b")),
@@ -122,6 +125,13 @@ _ROLE_TARGET_PROFILE_KEYWORDS: dict[str, tuple[str, ...]] = {
         "process orchestration",
         "observability",
     ),
+    "automation developer": (
+        "automation",
+        "workflow automation",
+        "system integrations",
+        "process orchestration",
+        "observability",
+    ),
     "rpa developer": (
         "automation",
         "workflow automation",
@@ -150,6 +160,11 @@ _ROLE_TARGET_ALIAS_PATTERNS: dict[str, tuple[str, ...]] = {
         r"\bautomation (engineer|developer|specialist)\b",
         r"\bintelligent automation\b",
     ),
+    "automation developer": (
+        r"\bautomation developer\b",
+        r"\bautomation engineer\b",
+        r"\bintelligent automation\b",
+    ),
     "rpa developer": (
         r"\brpa\b",
         r"\brobotic process automation\b",
@@ -171,25 +186,38 @@ _SPECIALIZATION_FALLBACK_KEYWORDS: dict[str, tuple[str, ...]] = {
     "langchain": ("applied ai", "rag", "ai-assisted workflows", "chatbot systems"),
     "typescript": ("typescript", "javascript", "api"),
     "javascript": ("javascript", "typescript", "api"),
+    "java": ("java", "backend", "api", "microservices"),
 }
 
 _ROLE_TARGET_ALIGNMENT_SENTENCES: dict[str, str] = {
     "automation engineer": (
-        "Recent work is especially relevant to teams building workflow automation, "
-        "integrations, and reliable operational tooling."
+        "Recent work includes workflow automation, integrations, and operational tooling "
+        "for complex business systems."
+    ),
+    "automation developer": (
+        "Recent work includes workflow automation, integrations, and operational tooling "
+        "for complex business systems."
     ),
     "rpa developer": (
-        "Recent work is especially relevant to automation teams working on process "
-        "orchestration, integrations, and operational efficiency."
+        "Recent work includes automation, integrations, and process orchestration "
+        "for business-critical operations."
     ),
     "backend developer": (
-        "Recent work is especially relevant to backend teams building APIs, "
-        "microservices, and observable production systems."
+        "Recent work includes backend services, APIs, and production support "
+        "for operationally critical platforms."
     ),
     "full stack developer": (
-        "Recent work is especially relevant to full-stack teams shipping TypeScript "
-        "applications, APIs, and product workflows end to end."
+        "Recent work spans product delivery across web applications, backend services, "
+        "APIs, and operational workflows."
     ),
+}
+
+_ROLE_TARGET_SUMMARY_SCOPES: dict[str, str] = {
+    "automation engineer": "workflow automation, integrations, and operational tooling",
+    "automation developer": "workflow automation, integrations, and operational tooling",
+    "rpa developer": "automation delivery, orchestration, and business workflows",
+    "backend developer": "backend services, internal tooling, and production support",
+    "full stack developer": "product delivery, backend services, and operational workflows",
 }
 
 _EDITORIAL_BANNED_PHRASES: tuple[str, ...] = (
@@ -221,6 +249,41 @@ _CANONICAL_TEXT_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     (r"\blangchain\b", "LangChain"),
 )
 
+_HEADLINE_SPECIALIZATION_KEYWORDS = frozenset(
+    {
+        "python",
+        "java",
+        "typescript",
+        "javascript",
+        "aws",
+        "gcp",
+        "azure",
+        "react",
+        "react native",
+        "fastapi",
+        "uipath",
+        "langchain",
+        "rag",
+        "applied ai",
+        "ai",
+        "llm",
+        "mobile",
+    },
+)
+
+_SUMMARY_DETAIL_KEYWORDS = frozenset(
+    {
+        *tuple(_HEADLINE_SPECIALIZATION_KEYWORDS),
+        "api",
+        "microservices",
+        "system integrations",
+        "workflow automation",
+        "observability",
+        "database modeling",
+        "automation",
+    },
+)
+
 
 @dataclass(frozen=True, slots=True)
 class DynamicResumeBuildResult:
@@ -229,6 +292,9 @@ class DynamicResumeBuildResult:
     source_cv_path: Path
     submission_cv_path: Path
     cv_version: str
+    resume_mode: ResumeMode = ResumeMode.STATIC
+    matched_role_target: str | None = None
+    matched_specializations: tuple[str, ...] = ()
     markdown_path: Path | None = None
     css_path: Path | None = None
     used_dynamic_variant: bool = False
@@ -333,6 +399,8 @@ class OhMyCvDynamicResumeBuilder:
         *,
         settings: UserAgentSettings,
         posting: JobPosting,
+        matched_role_target: str | None = None,
+        matched_specializations: tuple[str, ...] = (),
         run_dir: Path,
         submission_id: UUID,
     ) -> DynamicResumeBuildResult | None:
@@ -347,12 +415,26 @@ class OhMyCvDynamicResumeBuilder:
             submission_id=submission_id,
             filename=settings.profile.cv_filename,
         )
+        requested_resume_mode = settings.profile.resume_mode
+        if requested_resume_mode is ResumeMode.STATIC:
+            return DynamicResumeBuildResult(
+                source_cv_path=source_cv_path,
+                submission_cv_path=base_copy,
+                cv_version=base_copy.name,
+                resume_mode=ResumeMode.STATIC,
+                matched_role_target=matched_role_target,
+                matched_specializations=matched_specializations,
+                notes="static_resume_mode_selected",
+            )
         if not self._runtime_settings.resume_dynamic_enabled:
             return DynamicResumeBuildResult(
                 source_cv_path=source_cv_path,
                 submission_cv_path=base_copy,
                 cv_version=base_copy.name,
-                notes="dynamic_resume_feature_flag_disabled",
+                resume_mode=requested_resume_mode,
+                matched_role_target=matched_role_target,
+                matched_specializations=matched_specializations,
+                notes="dynamic_resume_runtime_disabled",
             )
 
         resume_text = self._extract_resume_text(source_cv_path)
@@ -363,6 +445,8 @@ class OhMyCvDynamicResumeBuilder:
         resume_markdown = self._build_tailored_markdown(
             settings=settings,
             posting=posting,
+            matched_role_target=matched_role_target,
+            matched_specializations=matched_specializations,
             resume_text=resume_text,
             resume_snapshot=resume_snapshot,
         )
@@ -371,6 +455,9 @@ class OhMyCvDynamicResumeBuilder:
                 source_cv_path=source_cv_path,
                 submission_cv_path=base_copy,
                 cv_version=base_copy.name,
+                resume_mode=requested_resume_mode,
+                matched_role_target=matched_role_target,
+                matched_specializations=matched_specializations,
                 notes="dynamic_resume_markdown_generation_failed",
             )
 
@@ -396,6 +483,9 @@ class OhMyCvDynamicResumeBuilder:
                 source_cv_path=source_cv_path,
                 submission_cv_path=base_copy,
                 cv_version=base_copy.name,
+                resume_mode=requested_resume_mode,
+                matched_role_target=matched_role_target,
+                matched_specializations=matched_specializations,
                 markdown_path=markdown_path,
                 css_path=css_path,
                 notes=render_notes or "dynamic_resume_pdf_render_failed",
@@ -405,6 +495,9 @@ class OhMyCvDynamicResumeBuilder:
             source_cv_path=source_cv_path,
             submission_cv_path=pdf_path,
             cv_version=pdf_path.name,
+            resume_mode=requested_resume_mode,
+            matched_role_target=matched_role_target,
+            matched_specializations=matched_specializations,
             markdown_path=markdown_path,
             css_path=css_path,
             used_dynamic_variant=True,
@@ -453,12 +546,16 @@ class OhMyCvDynamicResumeBuilder:
         *,
         settings: UserAgentSettings,
         posting: JobPosting,
+        matched_role_target: str | None,
+        matched_specializations: tuple[str, ...],
         resume_text: str | None,
         resume_snapshot: ResumeSourceSnapshot,
     ) -> str | None:
         fallback_markdown = self._build_fallback_markdown(
             settings=settings,
             posting=posting,
+            matched_role_target=matched_role_target,
+            matched_specializations=matched_specializations,
             resume_text=resume_text,
             resume_snapshot=resume_snapshot,
         )
@@ -468,6 +565,8 @@ class OhMyCvDynamicResumeBuilder:
         heuristic_plan = self._build_heuristic_adaptation_plan(
             settings=settings,
             posting=posting,
+            matched_role_target=matched_role_target,
+            matched_specializations=matched_specializations,
             resume_snapshot=resume_snapshot,
         )
         adaptation_plan = heuristic_plan
@@ -479,6 +578,8 @@ class OhMyCvDynamicResumeBuilder:
             prompt_payload = self._build_prompt_payload(
                 settings=settings,
                 posting=posting,
+                matched_role_target=matched_role_target,
+                matched_specializations=matched_specializations,
                 resume_text=resume_text,
                 resume_snapshot=resume_snapshot,
                 fallback_markdown=fallback_markdown,
@@ -534,6 +635,8 @@ class OhMyCvDynamicResumeBuilder:
         *,
         settings: UserAgentSettings,
         posting: JobPosting,
+        matched_role_target: str | None,
+        matched_specializations: tuple[str, ...],
         resume_text: str | None,
         resume_snapshot: ResumeSourceSnapshot,
         fallback_markdown: str,
@@ -555,6 +658,7 @@ class OhMyCvDynamicResumeBuilder:
                 "availability": settings.profile.availability,
                 "salary_expectation": settings.profile.salary_expectation,
                 "default_responses": settings.profile.default_responses,
+                "resume_mode": settings.profile.resume_mode.value,
             },
             "job_target": {
                 "title": posting.title,
@@ -563,9 +667,12 @@ class OhMyCvDynamicResumeBuilder:
                 "description_raw": posting.description_raw[:20_000],
                 "positive_filters": list(settings.profile.positive_filters),
                 "role_targets": list(settings.search.keywords),
+                "matched_role_target": matched_role_target,
+                "matched_specializations": list(matched_specializations),
                 "target_keywords": list(_extract_posting_keywords(posting)),
             },
             "allowed_focus_keywords": list(heuristic_plan.focus_keywords),
+            "allowed_skill_focus_keywords": list(heuristic_plan.skill_focus),
             "resume_evidence_keywords": list(resume_evidence_keywords),
             "source_resume_text": resume_text or "",
             "source_resume_snapshot": _resume_snapshot_to_payload(resume_snapshot),
@@ -577,18 +684,29 @@ class OhMyCvDynamicResumeBuilder:
         *,
         settings: UserAgentSettings,
         posting: JobPosting,
+        matched_role_target: str | None,
+        matched_specializations: tuple[str, ...],
         resume_snapshot: ResumeSourceSnapshot,
     ) -> ResumeAdaptationPlan:
-        role_target = self._select_primary_role_target(settings=settings, posting=posting)
-        focus_keywords = self._build_target_stack_hints(
+        role_target = matched_role_target or self._select_primary_role_target(
+            settings=settings,
+            posting=posting,
+        )
+        broad_focus_keywords = self._build_target_stack_hints(
             settings=settings,
             posting=posting,
             resume_snapshot=resume_snapshot,
             role_target=role_target,
+            matched_specializations=matched_specializations,
+        )
+        focus_keywords = self._build_editorial_focus_keywords(
+            posting=posting,
+            broad_focus_keywords=broad_focus_keywords,
+            matched_specializations=matched_specializations,
         )
         primary_focus_keywords = self._build_primary_focus_keywords(
             role_target=role_target,
-            focus_keywords=focus_keywords,
+            focus_keywords=broad_focus_keywords,
         )
         headline = self._build_targeted_headline(
             resume_snapshot=resume_snapshot,
@@ -607,20 +725,23 @@ class OhMyCvDynamicResumeBuilder:
                 keywords=tuple(
                     self._keywords_for_experience_entry(
                         entry=entry,
-                        focus_keywords=primary_focus_keywords or focus_keywords,
+                        focus_keywords=(
+                            primary_focus_keywords or broad_focus_keywords or focus_keywords
+                        ),
                     ),
                 ),
             )
             for entry in resume_snapshot.experience_entries
         )
+        adaptation_focus = focus_keywords or primary_focus_keywords or broad_focus_keywords
         return ResumeAdaptationPlan(
             headline=headline,
             summary=summary,
             focus_keywords=focus_keywords,
-            skill_focus=primary_focus_keywords or focus_keywords,
+            skill_focus=primary_focus_keywords or broad_focus_keywords or focus_keywords,
             experience_focus=experience_focus,
             adaptation_summary=(
-                f"Emphasize {', '.join(focus_keywords[:4])} for {posting.title} "
+                f"Emphasize {', '.join(adaptation_focus[:4])} for {posting.title} "
                 f"while preserving the source resume facts."
             ),
         )
@@ -640,15 +761,28 @@ class OhMyCvDynamicResumeBuilder:
                 "automation, and applied AI."
             )
         ).strip()
-        if _summary_focus_coverage(base_summary, focus_keywords) >= 2:
-            return base_summary
-        alignment_sentence = _build_role_alignment_sentence(
+        base_sentences = _split_summary_sentences(base_summary)
+        if not base_sentences:
+            return _trim_summary_text(base_summary)
+        lead_sentence = base_sentences[0]
+        focus_sentence = _build_summary_focus_sentence(
             role_target=role_target,
             focus_keywords=focus_keywords,
+            posting_keywords=_extract_posting_keywords(posting),
         )
-        if not alignment_sentence:
-            return base_summary
-        return _normalize_resume_copy(f"{base_summary} {alignment_sentence}")
+        closing_sentence = _select_summary_closing_sentence(
+            base_sentences=base_sentences,
+            existing_sentences=(lead_sentence, focus_sentence),
+        )
+        summary_sentences = [lead_sentence]
+        if focus_sentence:
+            summary_sentences.append(focus_sentence)
+        if closing_sentence:
+            summary_sentences.append(closing_sentence)
+        assembled_summary = _assemble_summary_sentences(tuple(summary_sentences))
+        if not assembled_summary:
+            return _trim_summary_text(base_summary)
+        return _trim_summary_text(assembled_summary)
 
     def _build_targeted_headline(
         self,
@@ -657,16 +791,17 @@ class OhMyCvDynamicResumeBuilder:
         role_target: str | None,
         focus_keywords: tuple[str, ...],
     ) -> str:
-        base_role = resume_snapshot.header_role or "Full Stack Software Engineer"
-        headline_role = _display_role_target_label(role_target) if role_target else base_role
-        headline_keywords = tuple(
-            keyword
-            for keyword in focus_keywords
-            if _normalize_keyword(keyword) not in _normalize_keyword(headline_role)
+        del role_target
+        headline_role = _extract_base_role_identity(
+            resume_snapshot.header_role or "Full Stack Software Engineer",
+        )
+        headline_keywords = _select_headline_specializations(
+            headline_role=headline_role,
+            focus_keywords=focus_keywords,
         )
         if not headline_keywords:
             return headline_role
-        suffix = _format_keyword_phrase(headline_keywords[:3])
+        suffix = _format_keyword_phrase(headline_keywords[:2])
         return f"{headline_role} | {suffix}"
 
     def _keywords_for_experience_entry(
@@ -775,7 +910,7 @@ class OhMyCvDynamicResumeBuilder:
     ) -> ResumeAdaptationPlan:
         return ResumeAdaptationPlan(
             headline=baseline.headline,
-            summary=baseline.summary or override.summary,
+            summary=override.summary or baseline.summary,
             focus_keywords=_merge_keyword_sequences(
                 baseline.focus_keywords,
                 override.focus_keywords,
@@ -795,11 +930,15 @@ class OhMyCvDynamicResumeBuilder:
         heuristic_plan: ResumeAdaptationPlan,
         settings: UserAgentSettings,
     ) -> ResumeAdaptationPlan | None:
-        allowed_keywords = {
+        allowed_summary_keywords = {
             _normalize_keyword(keyword)
-            for keyword in (*heuristic_plan.focus_keywords, *heuristic_plan.skill_focus)
+            for keyword in heuristic_plan.focus_keywords
             if keyword.strip()
         }
+        allowed_skill_keywords = {
+            _normalize_keyword(keyword) for keyword in heuristic_plan.skill_focus if keyword.strip()
+        }
+        allowed_keywords = allowed_summary_keywords | allowed_skill_keywords
         allowed_role_targets = {
             _normalize_keyword(keyword) for keyword in settings.search.keywords if keyword.strip()
         }
@@ -808,7 +947,7 @@ class OhMyCvDynamicResumeBuilder:
             for keyword in _extract_keyword_labels(ai_plan.summary or "")
         }
         if any(
-            keyword not in allowed_keywords and keyword not in allowed_role_targets
+            keyword not in allowed_summary_keywords and keyword not in allowed_role_targets
             for keyword in recognized_summary_keywords
         ) or not _summary_passes_editorial_checks(ai_plan.summary):
             sanitized_summary = None
@@ -833,7 +972,7 @@ class OhMyCvDynamicResumeBuilder:
             focus_keywords=tuple(
                 keyword
                 for keyword in ai_plan.focus_keywords
-                if _normalize_keyword(keyword) in allowed_keywords
+                if _normalize_keyword(keyword) in allowed_summary_keywords
             ),
             skill_focus=tuple(
                 keyword
@@ -856,6 +995,8 @@ class OhMyCvDynamicResumeBuilder:
         *,
         settings: UserAgentSettings,
         posting: JobPosting,
+        matched_role_target: str | None,
+        matched_specializations: tuple[str, ...],
         resume_text: str | None,
         resume_snapshot: ResumeSourceSnapshot,
     ) -> str:
@@ -880,13 +1021,17 @@ class OhMyCvDynamicResumeBuilder:
                 reverse=True,
             )[:8]
         )
-        role_target = self._select_primary_role_target(settings=settings, posting=posting)
+        role_target = matched_role_target or self._select_primary_role_target(
+            settings=settings,
+            posting=posting,
+        )
         stacks = ", ".join(
             self._build_target_stack_hints(
                 settings=settings,
                 posting=posting,
                 resume_snapshot=resume_snapshot,
                 role_target=role_target,
+                matched_specializations=matched_specializations,
             )
         )
         sanitized_resume_excerpt = self._resume_excerpt(resume_text)
@@ -921,6 +1066,7 @@ class OhMyCvDynamicResumeBuilder:
         posting: JobPosting,
         resume_snapshot: ResumeSourceSnapshot,
         role_target: str | None,
+        matched_specializations: tuple[str, ...],
     ) -> tuple[str, ...]:
         resume_evidence_keywords = self._build_resume_evidence_keywords(
             settings=settings,
@@ -930,19 +1076,13 @@ class OhMyCvDynamicResumeBuilder:
         merged: list[str] = []
         seen: set[str] = set()
 
-        role_target_display = _display_role_target_label(role_target) if role_target else None
-        if role_target_display:
-            role_token = _normalize_keyword(role_target_display)
-            if role_token and role_token not in seen:
-                seen.add(role_token)
-                merged.append(role_target_display)
-
         profile_keywords = _ROLE_TARGET_PROFILE_KEYWORDS.get(
             _normalize_keyword(role_target or ""),
             (),
         )
         posting_keywords = _extract_posting_keywords(posting)
         desired_keywords = _merge_keyword_sequences(
+            matched_specializations,
             tuple(profile_keywords),
             tuple(
                 specialization
@@ -987,12 +1127,53 @@ class OhMyCvDynamicResumeBuilder:
                 )
                 if _normalize_keyword(keyword) in evidence_tokens
             )
-            if role_target_display:
-                return _merge_keyword_sequences((role_target_display,), fallback_keywords[:4])
             if fallback_keywords:
                 return fallback_keywords[:5]
-            return ("Automation Engineer", "automation", "system integrations")
+            return ("automation", "system integrations", "Python")
         return tuple(merged[:12])
+
+    def _build_editorial_focus_keywords(
+        self,
+        *,
+        posting: JobPosting,
+        broad_focus_keywords: tuple[str, ...],
+        matched_specializations: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        allowed_tokens = {
+            *(_normalize_keyword(keyword) for keyword in _HEADLINE_SPECIALIZATION_KEYWORDS),
+            *(_normalize_keyword(keyword) for keyword in _SUMMARY_DETAIL_KEYWORDS),
+        }
+        normalized_broad_focus = {
+            _normalize_keyword(keyword): keyword
+            for keyword in broad_focus_keywords
+            if _normalize_keyword(keyword)
+        }
+        title_keywords = _extract_keyword_labels(posting.title)
+        title_specializations = tuple(
+            specialization
+            for title_keyword in title_keywords
+            for specialization in _SPECIALIZATION_FALLBACK_KEYWORDS.get(
+                _normalize_keyword(title_keyword),
+                (title_keyword,),
+            )
+        )
+        desired_keywords = _merge_keyword_sequences(
+            matched_specializations,
+            title_specializations,
+            title_keywords,
+        )
+        editorial_focus: list[str] = []
+        seen: set[str] = set()
+        for keyword in desired_keywords:
+            token = _normalize_keyword(keyword)
+            if not token or token in seen or token not in allowed_tokens:
+                continue
+            resolved_keyword = normalized_broad_focus.get(token)
+            if resolved_keyword is None:
+                continue
+            seen.add(token)
+            editorial_focus.append(resolved_keyword)
+        return tuple(editorial_focus[:3])
 
     def _build_resume_evidence_keywords(
         self,
@@ -1046,11 +1227,7 @@ class OhMyCvDynamicResumeBuilder:
         if not role_targets:
             return None
         title_text = _normalize_comparison_text(posting.title)
-        searchable_text = _normalize_comparison_text(
-            " ".join(filter(None, (posting.title, posting.description_raw))),
-        )
         title_tokens = set(title_text.split())
-        searchable_tokens = set(searchable_text.split())
         best_target = role_targets[0]
         best_score = -1.0
         for role_target in role_targets:
@@ -1065,20 +1242,11 @@ class OhMyCvDynamicResumeBuilder:
             else:
                 target_tokens = [token for token in normalized_target.split() if token]
                 title_overlap = 0.0
-                searchable_overlap = 0.0
                 if target_tokens:
                     title_overlap = sum(token in title_tokens for token in target_tokens) / len(
                         target_tokens
                     )
-                    searchable_overlap = sum(
-                        token in searchable_tokens for token in target_tokens
-                    ) / len(target_tokens)
-                if alias_patterns and any(
-                    re.search(pattern, searchable_text) for pattern in alias_patterns
-                ):
-                    score = max(0.85, searchable_overlap)
-                else:
-                    score = max(title_overlap * 0.95, searchable_overlap * 0.75)
+                score = title_overlap
             if score > best_score:
                 best_score = score
                 best_target = role_target
@@ -1159,20 +1327,23 @@ class OhMyCvDynamicResumeBuilder:
                 "delivery, automation, and applied AI."
             ),
         )
-        header_items = [
+        header_items: list[tuple[str, str | None, str | None]] = [
             (
                 "  - text: |",
-                (f'      <span style="font-size: 1.15em; font-weight: bold;">{header_role}</span>'),
+                f'      <span style="font-size: 1.15em; font-weight: bold;">{header_role}</span>',
+                None,
             ),
             (
                 f'  - text: "{location}"',
                 "    newLine: true",
+                None,
             ),
         ]
         if phone:
             header_items.append(
                 (
                     f'  - text: "{phone}"',
+                    None,
                     None,
                 ),
             )
@@ -1181,6 +1352,7 @@ class OhMyCvDynamicResumeBuilder:
                 (
                     f'  - text: "{email}"',
                     f"    link: mailto:{email}",
+                    None,
                 ),
             )
         if settings.profile.linkedin_url:
@@ -1200,12 +1372,14 @@ class OhMyCvDynamicResumeBuilder:
                 (
                     f'  - text: "GitHub: {github_label}"',
                     f"    link: {github_url}",
+                    None,
                 ),
             )
         elif resume_snapshot.portfolio_hint:
             header_items.append(
                 (
                     f'  - text: "{_escape_yaml_scalar(resume_snapshot.portfolio_hint)}"',
+                    None,
                     None,
                 ),
             )
@@ -1215,6 +1389,7 @@ class OhMyCvDynamicResumeBuilder:
                 (
                     f'  - text: "{_escape_yaml_scalar(_display_label_for_url(portfolio_url))}"',
                     f"    link: {portfolio_url}",
+                    None,
                 ),
             )
 
@@ -1335,13 +1510,33 @@ class OhMyCvDynamicResumeBuilder:
             _normalize_keyword(role_target or ""),
             (),
         )
+        normalized_profile_keywords = {
+            _normalize_keyword(item) for item in profile_keywords if _normalize_keyword(item)
+        }
+        specialization_keywords = tuple(
+            keyword
+            for keyword in focus_keywords
+            if _normalize_keyword(keyword) not in normalized_profile_keywords
+            and _normalize_keyword(keyword)
+            not in {
+                "automation engineer",
+                "automation developer",
+                "rpa developer",
+                "backend developer",
+                "full stack developer",
+            }
+        )
         if not profile_keywords:
-            return focus_keywords[:5]
+            return specialization_keywords[:5] or focus_keywords[:5]
         focus_tokens = {_normalize_keyword(keyword) for keyword in focus_keywords}
-        matched = tuple(
+        matched_profile_keywords = tuple(
             keyword for keyword in profile_keywords if _normalize_keyword(keyword) in focus_tokens
         )
-        return matched or focus_keywords[:5]
+        return _merge_keyword_sequences(
+            specialization_keywords[:5],
+            matched_profile_keywords[:3],
+            focus_keywords[:5],
+        )[:5]
 
     def _prioritize_skill_lines(
         self,
@@ -1458,12 +1653,25 @@ class OhMyCvDynamicResumeBuilder:
                                 "invented claims. Optimize only by adjusting the headline, "
                                 "rewriting the professional summary, and highlighting truthful "
                                 "target-relevant keywords, skills, and experience emphasis. "
+                                "Do not replace the candidate's base professional identity with "
+                                "a different role family unless the source resume itself already "
+                                "uses that identity. Treat role family and stack emphasis as "
+                                "separate decisions. "
+                                "Keep the headline concise: preserve the base role identity and "
+                                "append at most two concrete stack specializations when they are "
+                                "truthfully supported. Keep the summary to two or three concise "
+                                "sentences."
+                                " "
                                 "Prefer minimal edits to the summary when the source version is "
                                 "already strong. Avoid recruiter cliches, keyword stuffing, and "
                                 "phrases like 'Targeted for' or 'Selected fit areas'. "
                                 "Never introduce frameworks, stacks, seniority claims, or tools "
-                                "outside the allowed_focus_keywords and resume_evidence_keywords "
-                                "provided in the payload. "
+                                "outside the allowed_focus_keywords, "
+                                "allowed_skill_focus_keywords, and "
+                                "resume_evidence_keywords provided in the payload. "
+                                "Use allowed_focus_keywords only for the headline and summary. "
+                                "Use allowed_skill_focus_keywords only to prioritize skills and "
+                                "experience emphasis. "
                                 "Focus on improving match for the target job without changing the "
                                 "candidate's story. Return "
                                 "only valid JSON matching the schema."
@@ -1729,6 +1937,100 @@ def _normalize_resume_copy(text: str) -> str:
     return normalized.strip()
 
 
+def _extract_base_role_identity(header_role: str) -> str:
+    normalized = _normalize_resume_copy(header_role)
+    primary_segment = normalized.split("|", maxsplit=1)[0].strip()
+    return primary_segment or normalized
+
+
+def _select_headline_specializations(
+    *,
+    headline_role: str,
+    focus_keywords: tuple[str, ...],
+) -> tuple[str, ...]:
+    normalized_role = _normalize_keyword(headline_role)
+    selected: list[str] = []
+    seen: set[str] = set()
+    for keyword in focus_keywords:
+        normalized_keyword = _normalize_keyword(keyword)
+        if not normalized_keyword or normalized_keyword in seen:
+            continue
+        if normalized_keyword in normalized_role:
+            continue
+        if normalized_keyword not in _HEADLINE_SPECIALIZATION_KEYWORDS:
+            continue
+        seen.add(normalized_keyword)
+        selected.append(keyword)
+    return tuple(selected[:2])
+
+
+def _split_summary_sentences(summary: str) -> tuple[str, ...]:
+    normalized = _normalize_resume_copy(summary)
+    if not normalized:
+        return ()
+    sentence_matches = re.findall(r"[^.!?]+[.!?]?", normalized)
+    sentences: list[str] = []
+    for sentence in sentence_matches:
+        candidate = sentence.strip()
+        if not candidate:
+            continue
+        if candidate[-1] not in ".!?":
+            candidate += "."
+        sentences.append(_normalize_resume_copy(candidate))
+    return tuple(sentences)
+
+
+def _sentence_signature(sentence: str) -> str:
+    return _normalize_comparison_text(sentence)
+
+
+def _trim_summary_text(summary: str, *, max_words: int = 52, max_sentences: int = 3) -> str:
+    normalized = _normalize_resume_copy(summary)
+    if not normalized:
+        return normalized
+    sentences = list(_split_summary_sentences(normalized))
+    if sentences:
+        limited_sentences = sentences[:max_sentences]
+        candidate = " ".join(limited_sentences).strip()
+    else:
+        candidate = normalized
+    words = candidate.split()
+    if len(words) > max_words:
+        candidate = " ".join(words[:max_words]).rstrip(",;:")
+        if candidate and candidate[-1] not in ".!?":
+            candidate += "."
+    return _normalize_resume_copy(candidate)
+
+
+def _assemble_summary_sentences(
+    sentences: tuple[str, ...],
+    *,
+    max_words: int = 52,
+    max_sentences: int = 3,
+) -> str:
+    selected: list[str] = []
+    seen: set[str] = set()
+    word_count = 0
+    for sentence in sentences:
+        candidate = _normalize_resume_copy(sentence)
+        if not candidate:
+            continue
+        signature = _sentence_signature(candidate)
+        if not signature or signature in seen:
+            continue
+        sentence_words = len(candidate.split())
+        if selected and word_count + sentence_words > max_words:
+            continue
+        if not selected and sentence_words > max_words:
+            return _trim_summary_text(candidate, max_words=max_words, max_sentences=max_sentences)
+        selected.append(candidate)
+        seen.add(signature)
+        word_count += sentence_words
+        if len(selected) >= max_sentences:
+            break
+    return _normalize_resume_copy(" ".join(selected))
+
+
 def _summary_focus_coverage(summary: str, focus_keywords: tuple[str, ...]) -> int:
     normalized_summary = _normalize_comparison_text(summary)
     matches = 0
@@ -1737,6 +2039,145 @@ def _summary_focus_coverage(summary: str, focus_keywords: tuple[str, ...]) -> in
         if token and token in normalized_summary:
             matches += 1
     return matches
+
+
+def _select_summary_focus_keywords(
+    *,
+    focus_keywords: tuple[str, ...],
+    posting_keywords: tuple[str, ...],
+) -> tuple[str, ...]:
+    posting_tokens = {
+        _normalize_keyword(keyword) for keyword in posting_keywords if keyword.strip()
+    }
+    selected: list[str] = []
+    seen: set[str] = set()
+
+    def add_keyword(candidate: str) -> None:
+        normalized_candidate = _normalize_keyword(candidate)
+        if not normalized_candidate or normalized_candidate in seen:
+            return
+        seen.add(normalized_candidate)
+        selected.append(candidate)
+
+    for keyword in focus_keywords:
+        normalized_keyword = _normalize_keyword(keyword)
+        if (
+            normalized_keyword
+            and normalized_keyword in posting_tokens
+            and normalized_keyword in _HEADLINE_SPECIALIZATION_KEYWORDS
+        ):
+            add_keyword(keyword)
+
+    for keyword in focus_keywords:
+        normalized_keyword = _normalize_keyword(keyword)
+        if normalized_keyword and normalized_keyword in _HEADLINE_SPECIALIZATION_KEYWORDS:
+            add_keyword(keyword)
+
+    for keyword in focus_keywords:
+        normalized_keyword = _normalize_keyword(keyword)
+        if (
+            normalized_keyword
+            and normalized_keyword in posting_tokens
+            and normalized_keyword in _SUMMARY_DETAIL_KEYWORDS
+        ):
+            add_keyword(keyword)
+
+    for keyword in focus_keywords:
+        normalized_keyword = _normalize_keyword(keyword)
+        if normalized_keyword and normalized_keyword in _SUMMARY_DETAIL_KEYWORDS:
+            add_keyword(keyword)
+
+    return tuple(selected[:3])
+
+
+def _build_summary_focus_sentence(
+    *,
+    role_target: str | None,
+    focus_keywords: tuple[str, ...],
+    posting_keywords: tuple[str, ...],
+) -> str:
+    selected_focus = _select_summary_focus_keywords(
+        focus_keywords=focus_keywords,
+        posting_keywords=posting_keywords,
+    )
+    normalized_role_target = _normalize_keyword(role_target or "")
+    scope = _ROLE_TARGET_SUMMARY_SCOPES.get(normalized_role_target)
+    if selected_focus:
+        focus_phrase = _format_keyword_phrase(selected_focus)
+        if scope:
+            return _normalize_resume_copy(
+                f"Recent work emphasizes {focus_phrase} across {scope}.",
+            )
+        return _normalize_resume_copy(
+            f"Recent work emphasizes {focus_phrase} across production software delivery.",
+        )
+    return _build_role_alignment_sentence(
+        role_target=role_target,
+        focus_keywords=focus_keywords,
+    )
+
+
+def _select_summary_closing_sentence(
+    *,
+    base_sentences: tuple[str, ...],
+    existing_sentences: tuple[str, ...],
+) -> str:
+    existing_signatures = {
+        _sentence_signature(sentence)
+        for sentence in existing_sentences
+        if _sentence_signature(sentence)
+    }
+    candidates: list[tuple[int, int, str]] = []
+    for index, sentence in enumerate(base_sentences[1:], start=1):
+        signature = _sentence_signature(sentence)
+        if not signature or signature in existing_signatures:
+            continue
+        score = _summary_sentence_quality_score(sentence)
+        if score <= 0:
+            continue
+        candidates.append((score, -index, sentence))
+    if not candidates:
+        return ""
+    candidates.sort(reverse=True)
+    return candidates[0][2]
+
+
+def _summary_sentence_quality_score(sentence: str) -> int:
+    normalized_sentence = _normalize_comparison_text(sentence)
+    if not normalized_sentence:
+        return 0
+    score = 0
+    if any(
+        token in normalized_sentence
+        for token in (
+            "impact",
+            "delivery",
+            "reliable",
+            "products",
+            "platforms",
+            "systems",
+            "integrations",
+            "automation",
+            "production",
+            "business",
+        )
+    ):
+        score += 6
+    if any(
+        token in normalized_sentence
+        for token in (
+            "enthusiast",
+            "interest",
+            "interested",
+            "passion",
+            "curiosity",
+        )
+    ):
+        score -= 8
+    word_count = len(sentence.split())
+    if 8 <= word_count <= 20:
+        score += 2
+    return score
 
 
 def _build_role_alignment_sentence(
@@ -1764,10 +2205,10 @@ def _summary_passes_editorial_checks(summary: str | None) -> bool:
         return False
     if any(phrase in normalized_summary for phrase in _EDITORIAL_BANNED_PHRASES):
         return False
-    if len(summary.split()) > 90:
+    if len(summary.split()) > 70:
         return False
     sentence_count = len(re.findall(r"[.!?]+", summary))
-    if sentence_count > 4:
+    if sentence_count > 3:
         return False
     return True
 
@@ -1814,6 +2255,7 @@ def _display_keyword_label(keyword: str) -> str:
         "aws": "AWS",
         "azure": "Azure",
         "automation engineer": "Automation Engineer",
+        "automation developer": "Automation Developer",
         "docker": "Docker",
         "database modeling": "database modeling",
         "expo": "Expo",
@@ -1823,6 +2265,7 @@ def _display_keyword_label(keyword: str) -> str:
         "full stack developer": "Full Stack Developer",
         "gcp": "GCP",
         "internal tools": "internal tools",
+        "java": "Java",
         "javascript": "JavaScript",
         "kubernetes": "Kubernetes",
         "langchain": "LangChain",
@@ -1977,10 +2420,11 @@ def _extract_email(text: str) -> str | None:
 
 def _extract_portfolio_hint(text: str) -> str | None:
     for match in re.findall(r"\b(?:https?://)?([A-Z0-9.-]+\.[A-Z]{2,})\b", text, re.IGNORECASE):
-        lowered = match.lower()
+        match_text = str(match)
+        lowered = match_text.lower()
         if lowered.endswith("outlook.com"):
             continue
-        return match
+        return match_text
     return None
 
 

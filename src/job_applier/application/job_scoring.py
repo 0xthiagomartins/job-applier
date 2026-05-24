@@ -23,6 +23,11 @@ _ROLE_TARGET_ALIAS_PATTERNS: dict[str, tuple[str, ...]] = {
         r"\bautomation (engineer|developer|specialist)\b",
         r"\bintelligent automation\b",
     ),
+    "automation developer": (
+        r"\bautomation developer\b",
+        r"\bautomation engineer\b",
+        r"\bintelligent automation\b",
+    ),
     "rpa developer": (
         r"\brpa\b",
         r"\brobotic process automation\b",
@@ -47,6 +52,8 @@ class ScoreComputation:
     score: float
     selected: bool
     reason: str
+    matched_role_target: str | None
+    matched_specializations: tuple[str, ...]
     title_matches: tuple[str, ...]
     stack_matches: tuple[str, ...]
     positive_matches: tuple[str, ...]
@@ -70,6 +77,8 @@ class RuleBasedJobScorer(JobScorer):
                 "selected": computation.selected,
                 "score": computation.score,
                 "threshold": computation.threshold,
+                "matched_role_target": computation.matched_role_target,
+                "matched_specializations": list(computation.matched_specializations),
                 "title_matches": list(computation.title_matches),
                 "stack_matches": list(computation.stack_matches),
                 "positive_matches": list(computation.positive_matches),
@@ -82,6 +91,8 @@ class RuleBasedJobScorer(JobScorer):
             selected=computation.selected,
             score=computation.score,
             reason=computation.reason,
+            matched_role_target=computation.matched_role_target,
+            matched_specializations=computation.matched_specializations,
         )
 
     def compute(self, settings: UserAgentSettings, posting: JobPosting) -> ScoreComputation:
@@ -110,6 +121,8 @@ class RuleBasedJobScorer(JobScorer):
                 score=0.0,
                 selected=False,
                 reason=reason,
+                matched_role_target=None,
+                matched_specializations=(),
                 title_matches=(),
                 stack_matches=(),
                 positive_matches=(),
@@ -127,6 +140,8 @@ class RuleBasedJobScorer(JobScorer):
                 score=0.0,
                 selected=False,
                 reason=hard_rejection_reason,
+                matched_role_target=None,
+                matched_specializations=(),
                 title_matches=(),
                 stack_matches=(),
                 positive_matches=(),
@@ -138,25 +153,28 @@ class RuleBasedJobScorer(JobScorer):
                 threshold=threshold,
             )
 
-        title_matches, title_component = match_role_targets(
+        role_target_match = match_role_targets(
             settings.search.keywords,
             normalized_title,
             searchable_text,
         )
-        if settings.search.keywords and not title_matches:
+        title_component = role_target_match.best_score
+        if settings.search.keywords and not role_target_match.matching_targets:
             reason = (
                 "Rejected because the job title does not map clearly to the configured role "
-                f"targets; title={title_component:.2f}."
+                f"targets; title={role_target_match.best_score:.2f}."
             )
             return ScoreComputation(
                 score=0.0,
                 selected=False,
                 reason=reason,
+                matched_role_target=None,
+                matched_specializations=(),
                 title_matches=(),
                 stack_matches=(),
                 positive_matches=(),
                 blacklist_matches=(),
-                title_component=title_component,
+                title_component=role_target_match.best_score,
                 stack_component=0.0,
                 location_component=0.0,
                 positive_component=0.0,
@@ -165,6 +183,18 @@ class RuleBasedJobScorer(JobScorer):
         stack_terms = tuple(settings.profile.years_experience_by_stack.keys())
         stack_matches = match_terms(stack_terms, searchable_text)
         positive_matches = match_terms(settings.profile.positive_filters, searchable_text)
+        matched_specializations = match_specializations(
+            stack_terms=tuple(
+                stack_name
+                for stack_name, _years in sorted(
+                    settings.profile.years_experience_by_stack.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )
+            ),
+            positive_terms=settings.profile.positive_filters,
+            searchable_text=searchable_text,
+        )
         stack_component = fraction(len(stack_matches), len(stack_terms))
         location_component = compute_location_component(settings, posting, searchable_text)
         positive_component = fraction(len(positive_matches), len(settings.profile.positive_filters))
@@ -207,12 +237,13 @@ class RuleBasedJobScorer(JobScorer):
             reason = f"Rejected with score {score:.2f} < {threshold:.2f}; " + "; ".join(
                 reason_parts
             )
-
         return ScoreComputation(
             score=score,
             selected=selected,
             reason=reason,
-            title_matches=title_matches,
+            matched_role_target=role_target_match.best_target,
+            matched_specializations=matched_specializations,
+            title_matches=role_target_match.matching_targets,
             stack_matches=stack_matches,
             positive_matches=positive_matches,
             blacklist_matches=(),
@@ -251,7 +282,7 @@ def match_role_targets(
     role_targets: tuple[str, ...],
     normalized_title: str,
     searchable_text: str,
-) -> tuple[tuple[str, ...], float]:
+) -> RoleTargetMatchResult:
     """Return matching role targets plus the strongest match score."""
 
     scored_matches = [
@@ -260,8 +291,49 @@ def match_role_targets(
         if target.strip()
     ]
     title_matches = tuple(target for target, score in scored_matches if score >= 0.55)
-    title_component = max((score for _target, score in scored_matches), default=0.0)
-    return title_matches, title_component
+    best_target = None
+    best_score = 0.0
+    for target, score in scored_matches:
+        if score > best_score:
+            best_target = target
+            best_score = score
+    if best_target is not None and best_score < 0.55:
+        best_target = None
+    return RoleTargetMatchResult(
+        matching_targets=title_matches,
+        best_target=best_target,
+        best_score=best_score,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RoleTargetMatchResult:
+    """Best-fit mapping between a vacancy title and configured role families."""
+
+    matching_targets: tuple[str, ...]
+    best_target: str | None
+    best_score: float
+
+
+def match_specializations(
+    *,
+    stack_terms: tuple[str, ...],
+    positive_terms: tuple[str, ...],
+    searchable_text: str,
+) -> tuple[str, ...]:
+    """Return matched stack/specialization terms already grounded in user profile data."""
+
+    matched_from_stack = match_terms(stack_terms, searchable_text)
+    matched_from_positive = match_terms(positive_terms, searchable_text)
+    merged_matches: list[str] = []
+    seen: set[str] = set()
+    for term in (*matched_from_stack, *matched_from_positive):
+        normalized_term = normalize_text(term)
+        if not normalized_term or normalized_term in seen:
+            continue
+        seen.add(normalized_term)
+        merged_matches.append(term)
+    return tuple(merged_matches)
 
 
 def compute_role_target_match_score(

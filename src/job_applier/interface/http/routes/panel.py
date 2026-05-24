@@ -20,7 +20,7 @@ from job_applier.application.panel import (
     parse_int_mapping_lines,
     parse_text_mapping_lines,
 )
-from job_applier.domain.enums import ScheduleFrequency, SeniorityLevel, WorkplaceType
+from job_applier.domain.enums import ResumeMode, ScheduleFrequency, SeniorityLevel, WorkplaceType
 from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
 from job_applier.interface.http.dependencies import get_panel_settings_store
 
@@ -88,6 +88,7 @@ async def save_profile(
     salary_expectation: Annotated[int | None, Form()] = None,
     availability: Annotated[str, Form()] = "",
     default_responses: Annotated[str, Form()] = "",
+    resume_mode: Annotated[ResumeMode, Form()] = ResumeMode.STATIC,
     resume_css: Annotated[str, Form()] = "",
     cv_file: Annotated[UploadFile | None, File()] = None,
 ) -> JSONResponse:
@@ -108,6 +109,7 @@ async def save_profile(
             salary_expectation=salary_expectation,
             availability=availability,
             default_responses=parse_text_mapping_lines(default_responses),
+            resume_mode=resume_mode,
             resume_css=resume_css.strip() or None,
         )
     except ValueError as exc:

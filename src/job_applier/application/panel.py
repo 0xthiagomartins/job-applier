@@ -18,7 +18,7 @@ from pydantic import (
     field_validator,
 )
 
-from job_applier.domain.enums import ScheduleFrequency, SeniorityLevel, WorkplaceType
+from job_applier.domain.enums import ResumeMode, ScheduleFrequency, SeniorityLevel, WorkplaceType
 
 MODEL_OPTIONS = ("o3-mini", "gpt-4.1-mini", "gpt-4o-mini")
 SCHEDULE_FREQUENCY_OPTIONS = (ScheduleFrequency.DAILY,)
@@ -115,6 +115,7 @@ class StoredProfileSection(PanelModel):
     default_responses: dict[str, str] = Field(default_factory=dict)
     cv_path: str | None = None
     cv_filename: str | None = None
+    resume_mode: ResumeMode = ResumeMode.STATIC
     resume_css: str | None = None
 
 
@@ -134,6 +135,7 @@ class ProfileFormInput(BaseModel):
     salary_expectation: int | None = None
     availability: str = Field(min_length=1)
     default_responses: dict[str, str] = Field(default_factory=dict)
+    resume_mode: ResumeMode = ResumeMode.STATIC
     resume_css: str | None = None
 
 

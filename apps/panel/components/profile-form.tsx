@@ -28,6 +28,7 @@ export function ProfileForm(): React.JSX.Element {
     salary_expectation: "",
     availability: "",
     default_responses: "",
+    resume_mode: "static",
     resume_css: "",
   });
   const [cvFile, setCvFile] = useState<File | null>(null);
@@ -56,6 +57,7 @@ export function ProfileForm(): React.JSX.Element {
           default_responses: Object.entries(state.profile.default_responses)
             .map(([key, value]) => `${key}=${value}`)
             .join("\n"),
+          resume_mode: state.profile.resume_mode ?? "static",
           resume_css: state.profile.resume_css ?? "",
         });
         setCurrentCvName(state.profile.cv_filename);
@@ -198,6 +200,16 @@ export function ProfileForm(): React.JSX.Element {
             />
           </Field>
           {currentCvName ? <p className="text-sm text-muted-foreground">Current file: {currentCvName}</p> : null}
+          <Field label="Resume mode">
+            <select
+              className="flex h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              value={form.resume_mode}
+              onChange={(event) => updateField("resume_mode", event.target.value)}
+            >
+              <option value="static">Static: upload the base CV exactly as provided</option>
+              <option value="dynamic">Dynamic: tailor a CV variant per matched vacancy</option>
+            </select>
+          </Field>
           <Field label="Resume CSS override">
             <Textarea
               placeholder="#resume-preview h2 { color: #4f8d34; }"

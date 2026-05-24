@@ -25,7 +25,11 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
-from job_applier.application.agent_execution import JobSubmitter, SubmissionAttempt
+from job_applier.application.agent_execution import (
+    JobSubmitter,
+    ScoredJobPosting,
+    SubmissionAttempt,
+)
 from job_applier.application.config import UserAgentSettings
 from job_applier.application.repositories import (
     AnswerRepository,
@@ -55,6 +59,7 @@ from job_applier.domain.enums import (
     ExecutionOrigin,
     FillStrategy,
     QuestionType,
+    ResumeMode,
     SubmissionStatus,
 )
 from job_applier.infrastructure.linkedin.auth import (
@@ -123,6 +128,9 @@ class EasyApplyExecutionResult:
     submission_id: UUID
     started_at: datetime
     status: SubmissionStatus
+    resume_mode: ResumeMode = ResumeMode.STATIC
+    matched_role_target: str | None = None
+    matched_specializations: tuple[str, ...] = ()
     notes: str | None = None
     answers: tuple[ApplicationAnswer, ...] = ()
     execution_events: tuple[ExecutionEvent, ...] = ()
@@ -157,6 +165,9 @@ class PreparedSubmissionCv:
 
     path: Path
     cv_version: str
+    resume_mode: ResumeMode = ResumeMode.STATIC
+    matched_role_target: str | None = None
+    matched_specializations: tuple[str, ...] = ()
     artifacts: tuple[ArtifactSnapshot, ...] = ()
     used_dynamic_variant: bool = False
     notes: str | None = None
@@ -260,6 +271,7 @@ class EasyApplyExecutor(Protocol):
         self,
         settings: UserAgentSettings,
         posting: JobPosting,
+        scored_job: ScoredJobPosting,
         *,
         execution_id: UUID,
         origin: ExecutionOrigin,
@@ -290,6 +302,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         self,
         settings: UserAgentSettings,
         posting: JobPosting,
+        scored_job: ScoredJobPosting,
         *,
         execution_id: UUID,
         origin: ExecutionOrigin,
@@ -316,6 +329,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         context,
                         settings,
                         posting,
+                        scored_job,
                         execution_id=execution_id,
                         origin=origin,
                         submission_id=submission_id,
@@ -351,6 +365,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         context: BrowserContext,
         settings: UserAgentSettings,
         posting: JobPosting,
+        scored_job: ScoredJobPosting,
         *,
         execution_id: UUID,
         origin: ExecutionOrigin,
@@ -365,6 +380,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
         page = await context.new_page()
         page.set_default_timeout(self._runtime_settings.linkedin_default_timeout_ms)
         recruiter_interactions: list[RecruiterInteraction] = []
+        resume_mode = settings.profile.resume_mode
+        matched_role_target = scored_job.matched_role_target
+        matched_specializations = scored_job.matched_specializations
 
         try:
             with bind_submission_context(submission_id):
@@ -456,6 +474,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         submission_id=submission_id,
                         started_at=started_at,
                         status=SubmissionStatus.SKIPPED,
+                        resume_mode=resume_mode,
+                        matched_role_target=matched_role_target,
+                        matched_specializations=matched_specializations,
                         notes=notes,
                         execution_events=tuple(execution_events),
                         artifacts=tuple(artifacts),
@@ -465,6 +486,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 prepared_submission_cv = await self._prepare_submission_cv_path(
                     settings=settings,
                     posting=posting,
+                    scored_job=scored_job,
                     execution_id=execution_id,
                     run_dir=run_dir,
                     submission_id=submission_id,
@@ -476,6 +498,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     if prepared_submission_cv is not None
                     else settings.profile.cv_filename
                 )
+                if prepared_submission_cv is not None:
+                    resume_mode = prepared_submission_cv.resume_mode
+                    matched_role_target = prepared_submission_cv.matched_role_target
+                    matched_specializations = prepared_submission_cv.matched_specializations
                 if prepared_submission_cv is not None:
                     artifacts.extend(prepared_submission_cv.artifacts)
 
@@ -526,6 +552,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             submission_id=submission_id,
                             started_at=started_at,
                             status=SubmissionStatus.SKIPPED,
+                            resume_mode=resume_mode,
+                            matched_role_target=matched_role_target,
+                            matched_specializations=matched_specializations,
                             notes=already_applied_notes,
                             execution_events=tuple(execution_events),
                             artifacts=tuple(artifacts),
@@ -564,6 +593,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         submission_id=submission_id,
                         started_at=started_at,
                         status=SubmissionStatus.FAILED,
+                        resume_mode=resume_mode,
+                        matched_role_target=matched_role_target,
+                        matched_specializations=matched_specializations,
                         notes=notes,
                         execution_events=tuple(execution_events),
                         artifacts=tuple(artifacts),
@@ -717,6 +749,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             submission_id=submission_id,
                             started_at=started_at,
                             status=SubmissionStatus.FAILED,
+                            resume_mode=resume_mode,
+                            matched_role_target=matched_role_target,
+                            matched_specializations=matched_specializations,
                             notes=notes,
                         )
 
@@ -862,6 +897,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                 submission_id=submission_id,
                                 started_at=started_at,
                                 status=SubmissionStatus.SUBMITTED,
+                                resume_mode=resume_mode,
+                                matched_role_target=matched_role_target,
+                                matched_specializations=matched_specializations,
                                 notes=outcome_notes
                                 or "LinkedIn Easy Apply submitted successfully.",
                                 answers=tuple(answers),
@@ -895,6 +933,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             submission_id=submission_id,
                             started_at=started_at,
                             status=SubmissionStatus.FAILED,
+                            resume_mode=resume_mode,
+                            matched_role_target=matched_role_target,
+                            matched_specializations=matched_specializations,
                             notes=outcome_notes or "LinkedIn did not confirm the application.",
                         )
 
@@ -963,6 +1004,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             submission_id=submission_id,
                             started_at=started_at,
                             status=SubmissionStatus.FAILED,
+                            resume_mode=resume_mode,
+                            matched_role_target=matched_role_target,
+                            matched_specializations=matched_specializations,
                             notes=remediation_notes or assessment_notes,
                         )
 
@@ -989,6 +1033,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     submission_id=submission_id,
                     started_at=started_at,
                     status=SubmissionStatus.FAILED,
+                    resume_mode=resume_mode,
+                    matched_role_target=matched_role_target,
+                    matched_specializations=matched_specializations,
                     notes="LinkedIn Easy Apply exceeded the maximum number of steps.",
                 )
         except Exception as exc:  # noqa: BLE001
@@ -1035,6 +1082,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 submission_id=submission_id,
                 started_at=started_at,
                 status=SubmissionStatus.FAILED,
+                resume_mode=resume_mode,
+                matched_role_target=matched_role_target,
+                matched_specializations=matched_specializations,
                 notes=str(exc),
             )
         finally:
@@ -4558,6 +4608,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         *,
         settings: UserAgentSettings,
         posting: JobPosting,
+        scored_job: ScoredJobPosting,
         execution_id: UUID,
         run_dir: Path,
         submission_id: UUID,
@@ -4567,6 +4618,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
             self._dynamic_resume_builder.build_for_job,
             settings=settings,
             posting=posting,
+            matched_role_target=scored_job.matched_role_target,
+            matched_specializations=scored_job.matched_specializations,
             run_dir=run_dir,
             submission_id=submission_id,
         )
@@ -4586,6 +4639,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 "job_posting_id": str(posting.id),
                 "source_cv_path": str(prepared.source_cv_path),
                 "submission_cv_path": str(prepared.submission_cv_path),
+                "resume_mode": prepared.resume_mode.value,
+                "matched_role_target": prepared.matched_role_target,
+                "matched_specializations": list(prepared.matched_specializations),
                 "cv_version": prepared.cv_version,
                 "used_dynamic_variant": prepared.used_dynamic_variant,
                 "notes": prepared.notes,
@@ -4594,6 +4650,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
         return PreparedSubmissionCv(
             path=prepared.submission_cv_path,
             cv_version=prepared.cv_version,
+            resume_mode=prepared.resume_mode,
+            matched_role_target=prepared.matched_role_target,
+            matched_specializations=prepared.matched_specializations,
             artifacts=artifacts,
             used_dynamic_variant=prepared.used_dynamic_variant,
             notes=prepared.notes,
@@ -4765,6 +4824,7 @@ class LinkedInEasyApplySubmitter(JobSubmitter):
         self,
         settings: UserAgentSettings,
         posting: JobPosting,
+        scored_job: ScoredJobPosting,
         *,
         execution_id: UUID,
         origin: ExecutionOrigin,
@@ -4772,6 +4832,7 @@ class LinkedInEasyApplySubmitter(JobSubmitter):
         result = await self._executor.execute(
             settings,
             posting,
+            scored_job,
             execution_id=execution_id,
             origin=origin,
         )
@@ -4791,6 +4852,9 @@ class LinkedInEasyApplySubmitter(JobSubmitter):
             job_posting_id=posting.id,
             status=result.status,
             started_at=result.started_at,
+            resume_mode=result.resume_mode,
+            matched_role_target=result.matched_role_target,
+            matched_specializations=result.matched_specializations,
             cv_version=result.cv_version or settings.profile.cv_filename,
             cover_letter_version=result.cover_letter_version,
             execution_origin=origin,
@@ -4810,6 +4874,9 @@ class LinkedInEasyApplySubmitter(JobSubmitter):
             job_posting_id=posting.id,
             status=SubmissionStatus.PENDING,
             started_at=result.started_at,
+            resume_mode=result.resume_mode,
+            matched_role_target=result.matched_role_target,
+            matched_specializations=result.matched_specializations,
             cv_version=result.cv_version or settings.profile.cv_filename,
             cover_letter_version=result.cover_letter_version,
             execution_origin=origin,
