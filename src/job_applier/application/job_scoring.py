@@ -44,6 +44,39 @@ _ROLE_TARGET_ALIAS_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+_ROLE_TARGET_SPECIALIZATION_HINTS: dict[str, tuple[str, ...]] = {
+    "automation engineer": ("uipath", "langchain", "rag"),
+    "automation developer": ("uipath", "langchain", "rag"),
+    "rpa developer": ("uipath",),
+    "backend developer": ("python", "java", "fastapi"),
+    "full stack developer": ("javascript", "typescript", "react", "react native"),
+}
+
+_GENERIC_ENGINEERING_ROLE_PATTERNS: tuple[str, ...] = (
+    r"\bengineer\b",
+    r"\bdeveloper\b",
+    r"\bspecialist\b",
+    r"\bprogrammer\b",
+)
+
+_GENERIC_ROLE_TARGET_TOKENS = frozenset({"engineer", "developer", "specialist", "programmer"})
+
+_TITLE_ROLE_HARD_EXCLUSION_PATTERNS: tuple[str, ...] = (
+    r"\bsdet\b",
+    r"\bsoftware engineer in test\b",
+    r"\bengineer in test\b",
+    r"\btest engineer\b",
+    r"\bqa engineer\b",
+    r"\bquality assurance\b",
+    r"\bquality engineer\b",
+    r"\btester\b",
+    r"\bsupport engineer\b",
+    r"\bnetwork support\b",
+    r"\bcustomer support\b",
+    r"\bit support\b",
+    r"\bhelp desk\b",
+)
+
 _TITLE_SPECIALIZATION_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("python", (r"\bpython\b",)),
     ("javascript", (r"\bjavascript\b", r"\bnode\.?js\b")),
@@ -387,9 +420,17 @@ def compute_role_target_match_score(
     if not canonical_target:
         return 0.0
 
+    if _title_has_hard_exclusion(normalized_title):
+        return 0.0
+
     title_tokens = set(normalized_title.split())
-    target_tokens = tuple(token for token in canonical_target.split() if token)
+    target_tokens = tuple(
+        token
+        for token in canonical_target.split()
+        if token and token not in _GENERIC_ROLE_TARGET_TOKENS
+    )
     alias_patterns = _ROLE_TARGET_ALIAS_PATTERNS.get(canonical_target, ())
+    title_specializations = extract_title_specializations(normalized_title)
 
     if canonical_target in normalized_title:
         return 1.0
@@ -400,9 +441,49 @@ def compute_role_target_match_score(
         sum(token in title_tokens for token in target_tokens),
         len(target_tokens),
     )
+    inferred_score = _infer_role_target_score_from_title(
+        canonical_target=canonical_target,
+        normalized_title=normalized_title,
+        title_specializations=title_specializations,
+    )
     if title_overlap >= 0.5:
-        return round(title_overlap, 4)
-    return 0.0
+        return round(max(title_overlap, inferred_score), 4)
+    return round(inferred_score, 4)
+
+
+def _infer_role_target_score_from_title(
+    *,
+    canonical_target: str,
+    normalized_title: str,
+    title_specializations: tuple[str, ...],
+) -> float:
+    """Infer role-family fit from generic engineering titles plus explicit stack cues."""
+
+    if not any(
+        re.search(pattern, normalized_title) for pattern in _GENERIC_ENGINEERING_ROLE_PATTERNS
+    ):
+        return 0.0
+
+    specialization_hints = _ROLE_TARGET_SPECIALIZATION_HINTS.get(canonical_target, ())
+    if not specialization_hints:
+        return 0.0
+
+    matched_hints = [
+        hint for hint in specialization_hints if normalize_text(hint) in title_specializations
+    ]
+    if not matched_hints:
+        return 0.0
+
+    hint_coverage = fraction(len(matched_hints), len(specialization_hints))
+    return min(0.85, round(0.65 + 0.20 * hint_coverage, 4))
+
+
+def _title_has_hard_exclusion(normalized_title: str) -> bool:
+    """Return whether the title belongs to a role category we should reject outright."""
+
+    return any(
+        re.search(pattern, normalized_title) for pattern in _TITLE_ROLE_HARD_EXCLUSION_PATTERNS
+    )
 
 
 def fraction(matches: int, total: int) -> float:
