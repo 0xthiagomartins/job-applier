@@ -2050,6 +2050,7 @@ class PlaywrightLinkedInJobsClient:
             detail_payload = await detail_page.evaluate(
                 """
                 () => {
+                  const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
                   const extractStructuredJobPosting = () => {
                     const scripts = Array.from(
                       document.querySelectorAll('script[type="application/ld+json"]')
@@ -2122,9 +2123,7 @@ class PlaywrightLinkedInJobsClient:
                     for (const selector of selectors) {
                       const nodes = document.querySelectorAll(selector);
                       for (const node of nodes) {
-                        const text = (node.innerText || node.textContent || "")
-                          .replace(/\\s+/g, " ")
-                          .trim();
+                        const text = collapse(node.innerText || node.textContent || "");
                         if (text && !values.includes(text)) {
                           values.push(text);
                         }
@@ -2134,9 +2133,22 @@ class PlaywrightLinkedInJobsClient:
                   };
                   const nodeText = (node) => {
                     if (!node) return "";
-                    return (node.innerText || node.textContent || "")
-                      .replace(/\\s+/g, " ")
-                      .trim();
+                    return collapse(node.innerText || node.textContent || "");
+                  };
+                  const isVisible = (element) => {
+                    if (!element) {
+                      return false;
+                    }
+                    const style = window.getComputedStyle(element);
+                    if (
+                      style.display === "none"
+                      || style.visibility === "hidden"
+                      || style.opacity === "0"
+                    ) {
+                      return false;
+                    }
+                    const rect = element.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
                   };
                   const firstNode = (selectors) => {
                     for (const selector of selectors) {
@@ -2195,15 +2207,46 @@ class PlaywrightLinkedInJobsClient:
                     ".jobs-unified-top-card__bullet",
                   ]);
                   const location = locationCandidates[0] || "";
-                  const applyLabels = collectTexts([
-                    ".jobs-apply-button",
-                    ".jobs-apply-button span",
-                    ".jobs-apply-button--top-card",
-                    ".jobs-apply-button--top-card span",
-                    ".jobs-s-apply button",
-                    ".jobs-s-apply button span",
-                    ".jobs-details-top-card__apply-error",
-                  ]);
+                  const visibleApplyControls = Array.from(
+                    document.querySelectorAll("button, a[href], [role='button']"),
+                  )
+                    .filter(isVisible)
+                    .map((element) => {
+                      const text = collapse(element.innerText || element.textContent || "");
+                      const ariaLabel = collapse(element.getAttribute("aria-label") || "");
+                      const title = collapse(element.getAttribute("title") || "");
+                      const href =
+                        element instanceof HTMLAnchorElement
+                          ? element.href || element.getAttribute("href") || ""
+                          : element.getAttribute("href") || "";
+                      const target = collapse(element.getAttribute("target") || "");
+                      const combined = collapse(
+                        [text, ariaLabel, title].filter(Boolean).join(" "),
+                      );
+                      return {
+                        label: combined,
+                        href: collapse(href),
+                        target,
+                      };
+                    })
+                    .filter((item) => item.label || item.href);
+                  const applyLabels = [
+                    ...collectTexts([
+                      ".jobs-apply-button",
+                      ".jobs-apply-button span",
+                      ".jobs-apply-button--top-card",
+                      ".jobs-apply-button--top-card span",
+                      ".jobs-s-apply button",
+                      ".jobs-s-apply button span",
+                      ".jobs-details-top-card__apply-error",
+                    ]),
+                    ...visibleApplyControls
+                      .map((item) => item.label)
+                      .filter((label) => /apply/i.test(label)),
+                  ];
+                  const easyApplyVisible = visibleApplyControls.some((control) =>
+                    /easy apply/i.test(control.label),
+                  );
 
                   const rawDocumentTitle = (document.title || "").trim();
                   const documentTitleSegments = rawDocumentTitle
@@ -2230,7 +2273,9 @@ class PlaywrightLinkedInJobsClient:
                     structured_description: structuredJob.structured_description,
                     description_raw: description || structuredJob.structured_description,
                     metadata_text: metadataSegments.join(" | "),
-                    easy_apply: applyLabels.some((label) => /easy apply/i.test(label)),
+                    easy_apply:
+                      easyApplyVisible
+                      || applyLabels.some((label) => /easy apply/i.test(label)),
                   };
                 }
                 """,
