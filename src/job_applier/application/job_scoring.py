@@ -44,6 +44,22 @@ _ROLE_TARGET_ALIAS_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+_TITLE_SPECIALIZATION_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("python", (r"\bpython\b",)),
+    ("javascript", (r"\bjavascript\b", r"\bnode\.?js\b")),
+    ("typescript", (r"\btypescript\b",)),
+    ("java", (r"\bjava\b",)),
+    ("aws", (r"\baws\b",)),
+    ("gcp", (r"\bgcp\b", r"\bgoogle cloud\b")),
+    ("azure", (r"\bazure\b",)),
+    ("react", (r"\breact\b",)),
+    ("react native", (r"\breact[\s\-]?native\b",)),
+    ("fastapi", (r"\bfastapi\b",)),
+    ("uipath", (r"\buipath\b",)),
+    ("langchain", (r"\blangchain\b",)),
+    ("rag", (r"\brag\b", r"\bretrieval[\s\-]augmented generation\b")),
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ScoreComputation:
@@ -193,6 +209,7 @@ class RuleBasedJobScorer(JobScorer):
                 )
             ),
             positive_terms=settings.profile.positive_filters,
+            normalized_title=normalized_title,
             searchable_text=searchable_text,
         )
         stack_component = fraction(len(stack_matches), len(stack_terms))
@@ -319,21 +336,43 @@ def match_specializations(
     *,
     stack_terms: tuple[str, ...],
     positive_terms: tuple[str, ...],
+    normalized_title: str,
     searchable_text: str,
 ) -> tuple[str, ...]:
-    """Return matched stack/specialization terms already grounded in user profile data."""
+    """Return target stack cues enriched by profile-aligned filters when available."""
 
+    title_specializations = extract_title_specializations(normalized_title)
     matched_from_stack = match_terms(stack_terms, searchable_text)
     matched_from_positive = match_terms(positive_terms, searchable_text)
     merged_matches: list[str] = []
     seen: set[str] = set()
-    for term in (*matched_from_stack, *matched_from_positive):
+    for term in (*title_specializations, *matched_from_stack, *matched_from_positive):
         normalized_term = normalize_text(term)
         if not normalized_term or normalized_term in seen:
             continue
         seen.add(normalized_term)
         merged_matches.append(term)
     return tuple(merged_matches)
+
+
+def extract_title_specializations(normalized_title: str) -> tuple[str, ...]:
+    """Return explicit stack cues found in the vacancy title in title order."""
+
+    positioned_matches: list[tuple[int, int, str]] = []
+    for pattern_index, (label, patterns) in enumerate(_TITLE_SPECIALIZATION_PATTERNS):
+        earliest_position: int | None = None
+        for pattern in patterns:
+            match = re.search(pattern, normalized_title)
+            if match is None:
+                continue
+            position = match.start()
+            if earliest_position is None or position < earliest_position:
+                earliest_position = position
+        if earliest_position is None:
+            continue
+        positioned_matches.append((earliest_position, pattern_index, label))
+    positioned_matches.sort()
+    return tuple(label for _, _, label in positioned_matches)
 
 
 def compute_role_target_match_score(

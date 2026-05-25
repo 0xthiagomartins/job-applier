@@ -1081,9 +1081,14 @@ class OhMyCvDynamicResumeBuilder:
             (),
         )
         posting_keywords = _extract_posting_keywords(posting)
+        title_keywords = _extract_keyword_labels(posting.title)
         desired_keywords = _merge_keyword_sequences(
+            tuple(
+                keyword
+                for keyword in title_keywords
+                if _normalize_keyword(keyword) in _SUMMARY_DETAIL_KEYWORDS
+            ),
             matched_specializations,
-            tuple(profile_keywords),
             tuple(
                 specialization
                 for posting_keyword in posting_keywords
@@ -1092,6 +1097,7 @@ class OhMyCvDynamicResumeBuilder:
                     (posting_keyword,),
                 )
             ),
+            tuple(profile_keywords),
             posting_keywords,
             tuple(
                 stack_name
@@ -1149,6 +1155,9 @@ class OhMyCvDynamicResumeBuilder:
             if _normalize_keyword(keyword)
         }
         title_keywords = _extract_keyword_labels(posting.title)
+        title_exact_focus = tuple(
+            keyword for keyword in title_keywords if _normalize_keyword(keyword) in allowed_tokens
+        )
         title_specializations = tuple(
             specialization
             for title_keyword in title_keywords
@@ -1158,6 +1167,7 @@ class OhMyCvDynamicResumeBuilder:
             )
         )
         desired_keywords = _merge_keyword_sequences(
+            title_exact_focus,
             matched_specializations,
             title_specializations,
             title_keywords,
@@ -1888,13 +1898,21 @@ def _extract_posting_keywords(posting: JobPosting) -> tuple[str, ...]:
 
 def _extract_keyword_labels(text: str) -> tuple[str, ...]:
     haystack = text.lower()
-    matches: list[str] = []
-    for label, patterns in _TARGET_KEYWORD_PATTERNS:
+    matches: list[tuple[int, int, str]] = []
+    for pattern_index, (label, patterns) in enumerate(_TARGET_KEYWORD_PATTERNS):
+        earliest_position: int | None = None
         for pattern in patterns:
-            if re.search(pattern, haystack):
-                matches.append(label)
-                break
-    return tuple(matches)
+            match = re.search(pattern, haystack)
+            if match is None:
+                continue
+            position = match.start()
+            if earliest_position is None or position < earliest_position:
+                earliest_position = position
+        if earliest_position is None:
+            continue
+        matches.append((earliest_position, pattern_index, label))
+    matches.sort()
+    return tuple(label for _, _, label in matches)
 
 
 def _normalize_keyword(value: str) -> str:
@@ -2070,16 +2088,19 @@ def _select_summary_focus_keywords(
 
     for keyword in focus_keywords:
         normalized_keyword = _normalize_keyword(keyword)
-        if normalized_keyword and normalized_keyword in _HEADLINE_SPECIALIZATION_KEYWORDS:
-            add_keyword(keyword)
-
-    for keyword in focus_keywords:
-        normalized_keyword = _normalize_keyword(keyword)
         if (
             normalized_keyword
             and normalized_keyword in posting_tokens
             and normalized_keyword in _SUMMARY_DETAIL_KEYWORDS
         ):
+            add_keyword(keyword)
+
+    if selected:
+        return tuple(selected[:3])
+
+    for keyword in focus_keywords:
+        normalized_keyword = _normalize_keyword(keyword)
+        if normalized_keyword and normalized_keyword in _HEADLINE_SPECIALIZATION_KEYWORDS:
             add_keyword(keyword)
 
     for keyword in focus_keywords:
