@@ -62,6 +62,9 @@ _NON_EASY_APPLY_SELECTED_JOB_RELEASE_MARKERS = (
     "does not have an easy apply control",
     "available application button redirects externally",
     "required easy apply modal cannot be opened",
+    "no longer accepting applications",
+    "job is no longer available",
+    "does not allow a new application to be started",
 )
 
 

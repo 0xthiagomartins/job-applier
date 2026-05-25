@@ -534,6 +534,8 @@ def merge_job_detail_payload(
         ),
         "",
     )
+    detail_easy_apply = detail_payload.get("easy_apply")
+    easy_apply = detail_easy_apply if isinstance(detail_easy_apply, bool) else listing.easy_apply
 
     return LinkedInCollectedJob(
         external_job_id=listing.external_job_id,
@@ -542,7 +544,7 @@ def merge_job_detail_payload(
         company_name=company_name or normalized_listing_company or "LinkedIn company",
         location=location or listing.location,
         description_raw=description_raw or listing.description_raw,
-        easy_apply=listing.easy_apply or bool(detail_payload.get("easy_apply")),
+        easy_apply=easy_apply,
         metadata_text=f"{listing.metadata_text} {detail_text}".strip(),
         workplace_type=infer_workplace_type(detail_text) or listing.workplace_type,
         seniority=infer_seniority(detail_text) or listing.seniority,

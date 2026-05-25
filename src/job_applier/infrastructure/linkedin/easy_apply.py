@@ -155,6 +155,7 @@ class JobApplyEntrypointAssessment:
 
     easy_apply_available: bool
     external_apply_only: bool
+    terminally_unavailable: bool = False
     labels: tuple[str, ...] = ()
     notes: str | None = None
 
@@ -425,6 +426,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "job_posting_id": str(posting.id),
                         "easy_apply_available": entrypoint_assessment.easy_apply_available,
                         "external_apply_only": entrypoint_assessment.external_apply_only,
+                        "terminally_unavailable": (entrypoint_assessment.terminally_unavailable),
                         "labels": list(entrypoint_assessment.labels[:6]),
                         "notes": entrypoint_assessment.notes,
                     },
@@ -436,6 +438,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "submission_id": str(submission_id),
                         "easy_apply_available": entrypoint_assessment.easy_apply_available,
                         "external_apply_only": entrypoint_assessment.external_apply_only,
+                        "terminally_unavailable": (entrypoint_assessment.terminally_unavailable),
                         "labels": list(entrypoint_assessment.labels[:6]),
                         "notes": entrypoint_assessment.notes,
                     },
@@ -482,28 +485,139 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         artifacts=tuple(artifacts),
                         recruiter_interactions=tuple(recruiter_interactions),
                     )
+                if entrypoint_assessment.terminally_unavailable:
+                    notes = (
+                        entrypoint_assessment.notes
+                        or "The current LinkedIn job page is no longer accepting applications."
+                    )
+                    update_progress_snapshot(
+                        {
+                            "current_stage": "submit_skipped",
+                            "current_job": self._build_progress_job(
+                                posting,
+                                submission_id,
+                                status=SubmissionStatus.SKIPPED.value,
+                            ),
+                            "current_step": None,
+                            "last_error": notes,
+                        },
+                    )
+                    self._record_event(
+                        execution_events,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
+                        event_type=ExecutionEventType.JOB_PROCESSED,
+                        payload={
+                            "job_posting_id": str(posting.id),
+                            "origin": origin.value,
+                            "reason": "job_unavailable",
+                            "status": SubmissionStatus.SKIPPED.value,
+                            "notes": notes,
+                        },
+                    )
+                    return EasyApplyExecutionResult(
+                        submission_id=submission_id,
+                        started_at=started_at,
+                        status=SubmissionStatus.SKIPPED,
+                        resume_mode=resume_mode,
+                        matched_role_target=matched_role_target,
+                        matched_specializations=matched_specializations,
+                        notes=notes,
+                        execution_events=tuple(execution_events),
+                        artifacts=tuple(artifacts),
+                        recruiter_interactions=tuple(recruiter_interactions),
+                    )
+                if not entrypoint_assessment.easy_apply_available:
+                    blocker_assessment = await self._assess_job_page_apply_blocker_with_agent(
+                        page,
+                        settings=settings,
+                    )
+                    if blocker_assessment is not None:
+                        blocker_notes = blocker_assessment.summary.strip()
+                        if blocker_assessment.status == "complete":
+                            notes = (
+                                blocker_notes
+                                or "LinkedIn indicates this job was already applied to."
+                            )
+                            artifacts.extend(
+                                await self._capture_debug_bundle(
+                                    page,
+                                    run_dir=run_dir,
+                                    submission_id=submission_id,
+                                    label="skip_already_applied",
+                                ),
+                            )
+                            self._record_event(
+                                execution_events,
+                                execution_id=execution_id,
+                                submission_id=submission_id,
+                                event_type=ExecutionEventType.JOB_PROCESSED,
+                                payload={
+                                    "job_posting_id": str(posting.id),
+                                    "origin": origin.value,
+                                    "reason": "already_applied",
+                                    "status": SubmissionStatus.SKIPPED.value,
+                                    "notes": notes,
+                                },
+                            )
+                            return EasyApplyExecutionResult(
+                                submission_id=submission_id,
+                                started_at=started_at,
+                                status=SubmissionStatus.SKIPPED,
+                                resume_mode=resume_mode,
+                                matched_role_target=matched_role_target,
+                                matched_specializations=matched_specializations,
+                                notes=notes,
+                                execution_events=tuple(execution_events),
+                                artifacts=tuple(artifacts),
+                                recruiter_interactions=tuple(recruiter_interactions),
+                            )
+                        if blocker_assessment.status == "blocked":
+                            notes = (
+                                blocker_notes
+                                or entrypoint_assessment.notes
+                                or (
+                                    "The current LinkedIn job page does not allow a new "
+                                    "application to be started."
+                                )
+                            )
+                            artifacts.extend(
+                                await self._capture_debug_bundle(
+                                    page,
+                                    run_dir=run_dir,
+                                    submission_id=submission_id,
+                                    label="skip_unavailable",
+                                ),
+                            )
+                            self._record_event(
+                                execution_events,
+                                execution_id=execution_id,
+                                submission_id=submission_id,
+                                event_type=ExecutionEventType.JOB_PROCESSED,
+                                payload={
+                                    "job_posting_id": str(posting.id),
+                                    "origin": origin.value,
+                                    "reason": "job_page_blocked",
+                                    "status": SubmissionStatus.SKIPPED.value,
+                                    "notes": notes,
+                                },
+                            )
+                            return EasyApplyExecutionResult(
+                                submission_id=submission_id,
+                                started_at=started_at,
+                                status=SubmissionStatus.SKIPPED,
+                                resume_mode=resume_mode,
+                                matched_role_target=matched_role_target,
+                                matched_specializations=matched_specializations,
+                                notes=notes,
+                                execution_events=tuple(execution_events),
+                                artifacts=tuple(artifacts),
+                                recruiter_interactions=tuple(recruiter_interactions),
+                            )
                 recruiter_candidate = await self._recruiter_candidate_finder.find(page, settings)
-                prepared_submission_cv = await self._prepare_submission_cv_path(
-                    settings=settings,
-                    posting=posting,
-                    scored_job=scored_job,
-                    execution_id=execution_id,
-                    run_dir=run_dir,
-                    submission_id=submission_id,
-                    execution_events=execution_events,
-                )
-                submission_cv_path = prepared_submission_cv.path if prepared_submission_cv else None
-                submission_cv_version = (
-                    prepared_submission_cv.cv_version
-                    if prepared_submission_cv is not None
-                    else settings.profile.cv_filename
-                )
-                if prepared_submission_cv is not None:
-                    resume_mode = prepared_submission_cv.resume_mode
-                    matched_role_target = prepared_submission_cv.matched_role_target
-                    matched_specializations = prepared_submission_cv.matched_specializations
-                if prepared_submission_cv is not None:
-                    artifacts.extend(prepared_submission_cv.artifacts)
+                prepared_submission_cv: PreparedSubmissionCv | None = None
+                submission_cv_path: Path | None = None
+                submission_cv_version = settings.profile.cv_filename
 
                 try:
                     update_progress_snapshot(
@@ -522,11 +636,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     )
                 except LinkedInEasyApplyError as exc:
                     notes = str(exc) or "Browser agent could not open the Easy Apply modal."
-                    already_applied_notes = await self._detect_existing_application_on_job_page(
+                    blocker_assessment = await self._assess_job_page_apply_blocker_with_agent(
                         page,
                         settings=settings,
                     )
-                    if already_applied_notes is not None:
+                    if blocker_assessment is not None and blocker_assessment.status == "complete":
+                        already_applied_notes = blocker_assessment.summary.strip() or (
+                            "LinkedIn indicates this job was already applied to."
+                        )
                         artifacts.extend(
                             await self._capture_debug_bundle(
                                 page,
@@ -556,6 +673,41 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             matched_role_target=matched_role_target,
                             matched_specializations=matched_specializations,
                             notes=already_applied_notes,
+                            execution_events=tuple(execution_events),
+                            artifacts=tuple(artifacts),
+                            recruiter_interactions=tuple(recruiter_interactions),
+                        )
+                    if blocker_assessment is not None and blocker_assessment.status == "blocked":
+                        blocked_notes = blocker_assessment.summary.strip() or notes
+                        artifacts.extend(
+                            await self._capture_debug_bundle(
+                                page,
+                                run_dir=run_dir,
+                                submission_id=submission_id,
+                                label="skip_unavailable",
+                            ),
+                        )
+                        self._record_event(
+                            execution_events,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            event_type=ExecutionEventType.JOB_PROCESSED,
+                            payload={
+                                "job_posting_id": str(posting.id),
+                                "origin": origin.value,
+                                "reason": "job_page_blocked",
+                                "status": SubmissionStatus.SKIPPED.value,
+                                "notes": blocked_notes,
+                            },
+                        )
+                        return EasyApplyExecutionResult(
+                            submission_id=submission_id,
+                            started_at=started_at,
+                            status=SubmissionStatus.SKIPPED,
+                            resume_mode=resume_mode,
+                            matched_role_target=matched_role_target,
+                            matched_specializations=matched_specializations,
+                            notes=blocked_notes,
                             execution_events=tuple(execution_events),
                             artifacts=tuple(artifacts),
                             recruiter_interactions=tuple(recruiter_interactions),
@@ -615,6 +767,26 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "submission_id": str(submission_id),
                     },
                 )
+                prepared_submission_cv = await self._prepare_submission_cv_path(
+                    settings=settings,
+                    posting=posting,
+                    scored_job=scored_job,
+                    execution_id=execution_id,
+                    run_dir=run_dir,
+                    submission_id=submission_id,
+                    execution_events=execution_events,
+                )
+                submission_cv_path = prepared_submission_cv.path if prepared_submission_cv else None
+                submission_cv_version = (
+                    prepared_submission_cv.cv_version
+                    if prepared_submission_cv is not None
+                    else settings.profile.cv_filename
+                )
+                if prepared_submission_cv is not None:
+                    resume_mode = prepared_submission_cv.resume_mode
+                    matched_role_target = prepared_submission_cv.matched_role_target
+                    matched_specializations = prepared_submission_cv.matched_specializations
+                    artifacts.extend(prepared_submission_cv.artifacts)
 
                 max_steps = 10
                 last_known_step_index = 0
@@ -2884,26 +3056,44 @@ class PlaywrightLinkedInEasyApplyExecutor:
         *,
         settings: UserAgentSettings,
     ) -> str | None:
+        assessment = await self._assess_job_page_apply_blocker_with_agent(
+            page,
+            settings=settings,
+        )
+        if assessment is None or assessment.status != "complete":
+            return None
+        return assessment.summary or "LinkedIn indicates this job was already applied to."
+
+    async def _assess_job_page_apply_blocker_with_agent(
+        self,
+        page: Page,
+        *,
+        settings: UserAgentSettings,
+    ) -> BrowserTaskAssessment | None:
         try:
             assessment = await self._assess_browser_state_with_agent(
                 page,
                 settings=settings,
-                task_name="linkedin_job_page_existing_application",
+                task_name="linkedin_job_page_apply_availability",
                 goal=(
-                    "Determine whether the current LinkedIn job page already shows that this "
-                    "account previously applied to the job. Do not try to start the application "
-                    "flow during this assessment."
+                    "Determine whether the current LinkedIn job page can start a new LinkedIn "
+                    "Easy Apply application right now. Do not click application controls during "
+                    "this assessment."
                 ),
                 extra_rules=(
                     (
-                        "Use complete only when the visible page explicitly indicates an existing "
-                        "application for this account, such as application submitted, already "
-                        "applied, or a dedicated application status tied to this job."
+                        "Use complete only when the visible page explicitly indicates that this "
+                        "account already applied to the job, such as application submitted, "
+                        "already applied, or a dedicated application status tied to this job."
                     ),
                     (
-                        "Use blocked when the page lacks an Easy Apply entry point for another "
-                        "visible reason such as external application, no longer accepting "
-                        "applications, or another non-account-specific blocker."
+                        "Use blocked when the page clearly prevents starting a new application "
+                        "from this page, such as external apply only, no longer accepting "
+                        "applications, job unavailable, or another visible blocker."
+                    ),
+                    (
+                        "Use pending only when a visible LinkedIn Easy Apply control is ready "
+                        "or the Easy Apply modal is already open."
                     ),
                     "Use unknown when the evidence is mixed or insufficient.",
                     (
@@ -2914,9 +3104,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
             )
         except LinkedInEasyApplyError:
             return None
-        if assessment.status != "complete":
-            return None
-        return assessment.summary or "LinkedIn indicates this job was already applied to."
+        if assessment.status in {"complete", "blocked"}:
+            return assessment
+        return None
 
     async def _assess_job_apply_entrypoint(self, page: Page) -> JobApplyEntrypointAssessment:
         if await self._easy_apply_modal_visible(page):
@@ -2926,7 +3116,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 notes="The LinkedIn Easy Apply modal is already visible on the page.",
             )
 
-        controls_payload = await page.evaluate(
+        scan_payload = await page.evaluate(
             """
             () => {
               const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
@@ -2945,14 +3135,25 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 const rect = element.getBoundingClientRect();
                 if (rect.width <= 0 || rect.height <= 0) {
                   return false;
-                }
-                return rect.bottom >= 0 && rect.top <= window.innerHeight;
+                  }
+                  return rect.bottom >= 0 && rect.top <= window.innerHeight;
               };
+              const collectTexts = (selectors) =>
+                selectors
+                  .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+                  .filter(isVisible)
+                  .map((element) => collapse(
+                    element.innerText
+                    || element.textContent
+                    || element.getAttribute("aria-label")
+                    || "",
+                  ))
+                  .filter(Boolean);
 
               const candidates = Array.from(
                 document.querySelectorAll("button, a[href], [role='button']"),
               );
-              return candidates
+              const controls = candidates
                 .filter(isVisible)
                 .map((element) => {
                   const rect = element.getBoundingClientRect();
@@ -2979,13 +3180,49 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 })
                 .sort((left, right) => left.top - right.top)
                 .slice(0, 80);
+              const statusTexts = collectTexts([
+                ".jobs-details-top-card__apply-error",
+                ".jobs-unified-top-card__job-insight",
+                ".jobs-unified-top-card__job-insight-view-model-secondary",
+                ".artdeco-inline-feedback__message",
+                "[data-test-job-details-apply-message]",
+                "[data-test-job-unavailable-message]",
+              ]).slice(0, 24);
+              return { controls, status_texts: statusTexts };
             }
             """,
         )
+        controls_payload = scan_payload.get("controls") if isinstance(scan_payload, dict) else None
         controls = controls_payload if isinstance(controls_payload, list) else []
+        status_texts_payload = (
+            scan_payload.get("status_texts") if isinstance(scan_payload, dict) else None
+        )
+        status_texts = tuple(
+            dict.fromkeys(
+                normalize_text(str(raw_text or ""))
+                for raw_text in (
+                    status_texts_payload if isinstance(status_texts_payload, list) else ()
+                )
+                if str(raw_text or "").strip()
+            )
+        )
         relevant_labels: list[str] = []
         easy_apply_labels: list[str] = []
         external_apply_labels: list[str] = []
+        unavailable_status_labels: list[str] = []
+
+        for status_text in status_texts:
+            if any(
+                marker in status_text
+                for marker in (
+                    "no longer accepting applications",
+                    "job is no longer available",
+                    "position has been filled",
+                    "this job is closed",
+                    "this position is no longer available",
+                )
+            ):
+                unavailable_status_labels.append(status_text)
 
         for raw_control in controls:
             if not isinstance(raw_control, dict):
@@ -3034,6 +3271,18 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 notes=(
                     "The only visible apply button leads to the company website and no control "
                     "is available on this page to open the LinkedIn Easy Apply modal."
+                ),
+            )
+
+        if unavailable_status_labels:
+            return JobApplyEntrypointAssessment(
+                easy_apply_available=False,
+                external_apply_only=False,
+                terminally_unavailable=True,
+                labels=tuple(dict.fromkeys(unavailable_status_labels))[:8],
+                notes=(
+                    "The current LinkedIn job page is no longer accepting applications and "
+                    "does not allow a new Easy Apply flow to be started."
                 ),
             )
 
