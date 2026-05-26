@@ -508,6 +508,13 @@ class LinkedInQuestionClassifier:
                 confidence=0.95,
                 matched_rule="start_date",
             )
+        if self._looks_like_experience_duration_question(normalized):
+            return QuestionClassification(
+                question_type=QuestionType.YEARS_EXPERIENCE,
+                normalized_key=default_key,
+                confidence=0.9,
+                matched_rule="years_experience_duration",
+            )
         if self._contains_any(normalized, "city", "cidade", "municipio") or (
             self._contains_any(normalized, "location", "localizacao", "localidade")
             and control_kind in {"text", "textarea"}
@@ -550,6 +557,64 @@ class LinkedInQuestionClassifier:
 
     def _contains_any(self, value: str, *terms: str) -> bool:
         return any(term in value for term in terms)
+
+    def _looks_like_experience_duration_question(self, normalized: str) -> bool:
+        experience_terms = (
+            "experience",
+            "experiencia",
+            "expérience",
+            "erfahrung",
+            "esperienza",
+        )
+        duration_terms = (
+            "year",
+            "years",
+            "yr",
+            "yrs",
+            "ano",
+            "anos",
+            "tempo",
+            "time",
+            "duration",
+            "duracao",
+            "duracion",
+            "tiempo",
+            "long",
+        )
+        how_long_phrases = (
+            "how long",
+            "for how long",
+            "how many years",
+            "since when",
+            "ha quanto tempo",
+            "quanto tempo",
+            "quantos anos",
+            "desde quando",
+            "cuanto tiempo",
+            "cuantos anos",
+            "combien de temps",
+            "seit wann",
+        )
+        role_terms = (
+            "developer",
+            "software",
+            "engineer",
+            "programmer",
+            "desenvolvedor",
+            "desenvolvimento",
+            "engenheiro",
+            "programador",
+            "desarrollador",
+            "ingeniero",
+            "entwickler",
+        )
+        has_experience_and_duration = any(term in normalized for term in experience_terms) and any(
+            term in normalized for term in duration_terms
+        )
+        has_how_long_role_prompt = any(phrase in normalized for phrase in how_long_phrases) and any(
+            term in normalized for term in role_terms
+        )
+        return has_experience_and_duration or has_how_long_role_prompt
 
     def _is_binary_option_set(self, options: set[str]) -> bool:
         if not options:
@@ -1740,6 +1805,10 @@ class LinkedInAnswerResolver:
 
         if matched_years:
             return str(max(matched_years))
+        if self._looks_like_total_development_experience_question(normalized_question):
+            total_years = self._resolve_total_development_years(settings)
+            if total_years is not None:
+                return str(total_years)
         return None
 
     def _resolve_competitive_years_experience(
@@ -1760,6 +1829,12 @@ class LinkedInAnswerResolver:
             ),
         )
         if capability_range is None:
+            if self._looks_like_total_development_experience_question(
+                normalize_text(f"{field.question_raw} {field.normalized_key}")
+            ):
+                total_years = self._resolve_total_development_years(settings)
+                if total_years is not None:
+                    return str(total_years)
             return None
         return str(capability_range.recommended_years)
 
@@ -1993,21 +2068,7 @@ class LinkedInAnswerResolver:
             QuestionType.YES_NO_GENERIC,
             QuestionType.FREE_TEXT_GENERIC,
         }:
-            if any(
-                token in normalized_question
-                for token in (
-                    "experience",
-                    "years",
-                    "anos",
-                    "automation",
-                    "framework",
-                    "langchain",
-                    "python",
-                    "sql",
-                    "java",
-                    "javascript",
-                )
-            ):
+            if self._looks_like_experience_duration_question(normalized_question):
                 adapted_question_type = QuestionType.YEARS_EXPERIENCE
             elif any(
                 token in normalized_question
@@ -2033,6 +2094,106 @@ class LinkedInAnswerResolver:
         settings: UserAgentSettings,
     ) -> str | None:
         return self._resolve_competitive_years_experience(field, settings)
+
+    def _looks_like_experience_duration_question(self, normalized: str) -> bool:
+        experience_terms = (
+            "experience",
+            "experiencia",
+            "expérience",
+            "erfahrung",
+            "esperienza",
+        )
+        duration_terms = (
+            "year",
+            "years",
+            "yr",
+            "yrs",
+            "ano",
+            "anos",
+            "tempo",
+            "time",
+            "duration",
+            "duracao",
+            "duracion",
+            "tiempo",
+            "long",
+        )
+        how_long_phrases = (
+            "how long",
+            "for how long",
+            "how many years",
+            "since when",
+            "ha quanto tempo",
+            "quanto tempo",
+            "quantos anos",
+            "desde quando",
+            "cuanto tiempo",
+            "cuantos anos",
+            "combien de temps",
+            "seit wann",
+        )
+        role_terms = (
+            "developer",
+            "software",
+            "engineer",
+            "programmer",
+            "desenvolvedor",
+            "desenvolvimento",
+            "engenheiro",
+            "programador",
+            "desarrollador",
+            "ingeniero",
+            "entwickler",
+        )
+        has_experience_and_duration = any(term in normalized for term in experience_terms) and any(
+            term in normalized for term in duration_terms
+        )
+        has_how_long_role_prompt = any(phrase in normalized for phrase in how_long_phrases) and any(
+            term in normalized for term in role_terms
+        )
+        return has_experience_and_duration or has_how_long_role_prompt
+
+    def _resolve_total_development_years(
+        self,
+        settings: UserAgentSettings,
+    ) -> int | None:
+        capability_profile = build_candidate_capability_profile(settings)
+        if capability_profile.total_career_years > 0:
+            return capability_profile.total_career_years
+        known_years = [
+            item.recommended_years
+            for item in capability_profile.capabilities.values()
+            if item.max_years
+        ]
+        if known_years:
+            return max(known_years)
+        explicit_years = [
+            years for years in settings.profile.years_experience_by_stack.values() if years > 0
+        ]
+        if explicit_years:
+            return max(explicit_years)
+        return None
+
+    def _looks_like_total_development_experience_question(
+        self,
+        normalized_question: str,
+    ) -> bool:
+        role_terms = (
+            "developer",
+            "software",
+            "engineer",
+            "programmer",
+            "desenvolvedor",
+            "desenvolvimento",
+            "engenheiro",
+            "programador",
+            "desarrollador",
+            "ingeniero",
+            "entwickler",
+        )
+        return self._looks_like_experience_duration_question(normalized_question) and any(
+            token in normalized_question for token in role_terms
+        )
 
     def _first_default_response(self, settings: UserAgentSettings) -> str | None:
         for value in settings.profile.default_responses.values():

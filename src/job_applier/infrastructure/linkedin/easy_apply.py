@@ -1913,7 +1913,26 @@ class PlaywrightLinkedInEasyApplyExecutor:
                   return true;
                 }
                 const tagName = (candidate.tagName || "").toLowerCase();
-                return tagName === "li";
+                if (tagName !== "li") {
+                  return false;
+                }
+                const parent = candidate.parentElement;
+                const parentRole = collapse(parent?.getAttribute("role"));
+                const metadata = collapse(
+                  [
+                    candidate.getAttribute("class"),
+                    parent?.getAttribute("class"),
+                    parent?.getAttribute("id"),
+                    parent?.getAttribute("aria-label"),
+                  ]
+                    .filter(Boolean)
+                    .join(" ")
+                );
+                return (
+                  parentRole === "listbox"
+                  || parentRole === "menu"
+                  || /option|select|dropdown|autocomplete|typeahead|suggest/i.test(metadata)
+                );
               };
               const isNearbyOptionForField = (candidate) => {
                 if (
@@ -2088,14 +2107,6 @@ class PlaywrightLinkedInEasyApplyExecutor:
                   pushOption(optionNode);
                 }
               }
-              if (
-                optionTexts.length === 0 &&
-                document.activeElement === node
-              ) {
-                for (const optionNode of document.querySelectorAll("[role='option']")) {
-                  pushOption(optionNode);
-                }
-              }
               explicitValidationTexts.sort((left, right) => {
                 if (left.verticalGap !== right.verticalGap) {
                   return left.verticalGap - right.verticalGap;
@@ -2174,13 +2185,21 @@ class PlaywrightLinkedInEasyApplyExecutor:
         self,
         state: TextFieldInteractionState,
     ) -> bool:
+        autocomplete_binding = bool(
+            state.aria_autocomplete is not None
+            and (
+                state.has_popup_binding
+                or state.aria_expanded
+                or state.active_descendant
+                or state.role == "combobox"
+            )
+        )
         return bool(
             state.visible_option_count
             or state.aria_expanded
             or state.active_descendant
             or state.role == "combobox"
-            or state.aria_autocomplete is not None
-            or state.has_popup_binding
+            or autocomplete_binding
         )
 
     async def _apply_resume_choice_field(
