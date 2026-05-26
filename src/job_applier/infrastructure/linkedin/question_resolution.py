@@ -14,6 +14,11 @@ from urllib import error, request
 from job_applier.application.config import UserAgentSettings
 from job_applier.domain.entities import JobPosting
 from job_applier.domain.enums import AnswerSource, FillStrategy, QuestionType
+from job_applier.infrastructure.candidate_capabilities import (
+    build_candidate_capability_profile,
+    capability_profile_to_payload,
+    find_capability_range_for_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -650,6 +655,7 @@ class LinkedInQuestionExtractor:
 
 
 def _build_candidate_profile_payload(settings: UserAgentSettings) -> dict[str, object]:
+    capability_profile = build_candidate_capability_profile(settings)
     return {
         "name": settings.profile.name,
         "first_name": _profile_first_name(settings.profile.name),
@@ -670,6 +676,7 @@ def _build_candidate_profile_payload(settings: UserAgentSettings) -> dict[str, o
         "salary_expectation": settings.profile.salary_expectation,
         "availability": settings.profile.availability,
         "default_responses": settings.profile.default_responses,
+        "capability_profile": capability_profile_to_payload(capability_profile),
     }
 
 
@@ -1191,15 +1198,18 @@ class OpenAIResponsesAnswerGenerator:
             ),
             "inference_policy": [
                 "Prefer exact profile facts when they exist.",
-                "When exact data is missing, choose a conservative plausible answer.",
+                (
+                    "When exact data is missing, choose the highest plausible screening answer "
+                    "supported by the candidate profile and resume evidence."
+                ),
                 (
                     "If a tool or framework is implied by a broader stack, infer from that "
-                    "stack conservatively."
+                    "stack competitively but stay within a realistic range."
                 ),
                 "Never exceed the candidate's broader stack experience or total experience.",
                 (
-                    "For newer frameworks, prefer a modest number such as 1, 2, or 3 instead "
-                    "of an aggressive claim."
+                    "When a range is available, prefer the top plausible value for screening "
+                    "questions about experience."
                 ),
                 (
                     "If visible options exist, choose the closest plausible visible option "
@@ -1338,6 +1348,10 @@ class LinkedInAnswerResolver:
                 fill_strategy=FillStrategy.DETERMINISTIC,
                 confidence=0.9,
             )
+
+        competitive_years_value = self._resolve_competitive_years_field_value(field, settings)
+        if competitive_years_value is not None:
+            return competitive_years_value
 
         if not settings.ruleset.allow_best_effort_autofill:
             return None
@@ -1725,8 +1739,67 @@ class LinkedInAnswerResolver:
                 matched_years.append(years)
 
         if matched_years:
-            return str(matched_years[0] if len(matched_years) == 1 else min(matched_years))
+            return str(max(matched_years))
         return None
+
+    def _resolve_competitive_years_experience(
+        self,
+        field: EasyApplyField,
+        settings: UserAgentSettings,
+    ) -> str | None:
+        exact_match = self._resolve_exact_years_experience(field, settings)
+        if exact_match is not None:
+            return exact_match
+        capability_range = find_capability_range_for_text(
+            settings=settings,
+            text_fragments=(
+                field.question_raw,
+                field.normalized_key,
+                field.field_context,
+                field.helper_text or "",
+            ),
+        )
+        if capability_range is None:
+            return None
+        return str(capability_range.recommended_years)
+
+    def _resolve_competitive_years_field_value(
+        self,
+        field: EasyApplyField,
+        settings: UserAgentSettings,
+    ) -> ResolvedFieldValue | None:
+        if field.question_type is not QuestionType.YEARS_EXPERIENCE:
+            return None
+        if self._resolve_exact_years_experience(field, settings) is not None:
+            return None
+        competitive_value = self._resolve_competitive_years_experience(field, settings)
+        if competitive_value is None:
+            return None
+        capability_range = find_capability_range_for_text(
+            settings=settings,
+            text_fragments=(
+                field.question_raw,
+                field.normalized_key,
+                field.field_context,
+                field.helper_text or "",
+            ),
+        )
+        return ResolvedFieldValue(
+            value=competitive_value,
+            answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
+            fill_strategy=FillStrategy.BEST_EFFORT,
+            ambiguity_flag=True,
+            confidence=capability_range.confidence if capability_range is not None else 0.54,
+            reasoning=(
+                "competitive_capability_profile"
+                if capability_range is None
+                else (
+                    f"{capability_range.capability}: screening answer uses the top plausible "
+                    f"value within a {capability_range.min_years}-{capability_range.max_years} "
+                    "year range inferred from the base CV."
+                )
+            ),
+        )
 
     def _resolve_guardrail_fallback(
         self,
@@ -1759,8 +1832,8 @@ class LinkedInAnswerResolver:
                     resolved_value = numeric_option
             return GuardrailAnswer(
                 value=resolved_value,
-                confidence=0.42,
-                reasoning="plausible_profile_inference",
+                confidence=0.58,
+                reasoning="competitive_capability_inference",
             )
         normalized_key = normalize_key(field.normalized_key)
         if normalized_key in {"first_name", "given_name", "forename"}:
@@ -1893,8 +1966,8 @@ class LinkedInAnswerResolver:
                 return None
             return GuardrailAnswer(
                 value=inferred_years,
-                confidence=0.38,
-                reasoning="plausible_profile_inference",
+                confidence=0.54,
+                reasoning="competitive_capability_inference",
             )
         if field.question_type is QuestionType.FREE_TEXT_GENERIC:
             free_text_value = self._first_default_response(settings) or "Open to discuss."
@@ -1959,15 +2032,7 @@ class LinkedInAnswerResolver:
         field: EasyApplyField,
         settings: UserAgentSettings,
     ) -> str | None:
-        exact_match = self._resolve_exact_years_experience(field, settings)
-        if exact_match is not None:
-            return exact_match
-        inferred_years = _infer_conservative_related_years(
-            settings.profile.years_experience_by_stack
-        )
-        if inferred_years is None:
-            return None
-        return str(inferred_years)
+        return self._resolve_competitive_years_experience(field, settings)
 
     def _first_default_response(self, settings: UserAgentSettings) -> str | None:
         for value in settings.profile.default_responses.values():
@@ -2015,6 +2080,17 @@ def _build_experience_inference_context(
     settings: UserAgentSettings,
     posting: JobPosting,
 ) -> dict[str, object]:
+    capability_profile = build_candidate_capability_profile(settings)
+    requested_range = find_capability_range_for_text(
+        settings=settings,
+        text_fragments=(
+            field.question_raw,
+            field.normalized_key,
+            field.field_context,
+            field.helper_text or "",
+            posting.title,
+        ),
+    )
     exact_stack_matches: list[dict[str, object]] = []
     normalized_question = normalize_text(
         " ".join(
@@ -2040,9 +2116,6 @@ def _build_experience_inference_context(
             exact_stack_matches.append({"stack": stack_name, "years": years})
 
     strongest_stack = ordered_stacks[0] if ordered_stacks else None
-    conservative_years = _infer_conservative_related_years(
-        settings.profile.years_experience_by_stack
-    )
     return {
         "exact_stack_matches": exact_stack_matches,
         "top_known_stacks": [
@@ -2053,7 +2126,21 @@ def _build_experience_inference_context(
             if strongest_stack is not None
             else None
         ),
-        "conservative_inferred_years_for_related_tooling": conservative_years,
+        "candidate_capability_profile": capability_profile_to_payload(capability_profile),
+        "competitive_requested_capability_range": (
+            {
+                "capability": requested_range.capability,
+                "min_years": requested_range.min_years,
+                "max_years": requested_range.max_years,
+                "recommended_years": requested_range.recommended_years,
+                "confidence": requested_range.confidence,
+                "source": requested_range.source,
+                "evidence": list(requested_range.evidence),
+                "inferred_from": list(requested_range.inferred_from),
+            }
+            if requested_range is not None
+            else None
+        ),
     }
 
 
@@ -2252,16 +2339,6 @@ def _parse_numeric_option_bounds(option: str) -> tuple[float, float] | None:
     if any(token in normalized_option for token in {"less than", "up to", "ate ", "até ", "<"}):
         return 0.0, numbers[0]
     return numbers[0], numbers[0]
-
-
-def _infer_conservative_related_years(years_by_stack: dict[str, int]) -> int | None:
-    if not years_by_stack:
-        return None
-    strongest_years = max(years_by_stack.values())
-    if strongest_years <= 0:
-        return None
-    conservative_years = round(strongest_years * 0.25)
-    return max(1, min(3, conservative_years))
 
 
 def _prefers_negative_answer(normalized_question: str) -> bool:
