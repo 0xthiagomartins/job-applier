@@ -4,6 +4,8 @@
 
 Job Applier is an open source system for assisted job application automation with strong submission auditability.
 
+For the current internal-beta operating contract, see [docs/internal-beta.md](docs/internal-beta.md).
+
 ## What the agent does
 
 ```mermaid
@@ -32,6 +34,9 @@ The current repository bootstrap already includes:
 - lint, type-check and panel build commands
 - single-container on-premise runtime path with local SQLite fallback
 - automatic Alembic upgrade to the latest schema on startup
+- explicit `static` and `dynamic` resume modes
+- inferred candidate capability ranges that can be reviewed in the panel
+- local audit tooling for dynamic resume artifacts
 
 ## Getting started
 
@@ -108,6 +113,28 @@ The dynamic Oh-My-CV flow is guarded by a feature flag and is disabled by defaul
 - the renderer then attempts to export that markdown to PDF and uses the resulting file in Easy Apply;
 - if generation or rendering fails, the flow falls back to the original uploaded CV (safe default);
 - the profile API now accepts optional `resume_css`, so users can persist custom stylesheet rules from the panel/UI for PDF rendering.
+- the generated resume should preserve the base CV identity and only emphasize stack cues that are grounded in the uploaded CV or reviewed capability profile.
+
+The panel now exposes two explicit resume modes:
+
+- `static`: always apply with the uploaded base CV
+- `dynamic`: generate a per-job CV variant before application
+
+The `Profile` page also exposes an inferred `Capability profile` used for screening questions such as years of experience. Users can review, tighten, or disable individual capability ranges without changing the source CV.
+
+## Role target setup
+
+The search pipeline works best when `Preferences > Keywords` are broad role families rather than narrow stack-specific titles.
+
+Recommended targets:
+
+- `Automation Engineer`
+- `Automation Developer`
+- `RPA Developer`
+- `Backend Developer`
+- `Full Stack Developer`
+
+Use stack-specific detail such as `Python`, `AWS`, `TypeScript`, `JavaScript`, `UiPath`, or `LangChain` as positive signals and tailoring cues, not as the main role family.
 
 Optional custom renderer command:
 
@@ -146,6 +173,22 @@ For stage-by-stage debugging, set `JOB_APPLIER_AGENT_DEBUG_STAGE` to one of:
 - `full`: normal end-to-end execution
 
 You can also override the per-stage inspection budget with `JOB_APPLIER_AGENT_DEBUG_MAX_JOBS`, and the manual API accepts `POST /api/agent/run?stage=search` (or `score` / `apply` / `full`) so you can switch stages without editing `.env` between runs.
+
+## Dynamic resume audit
+
+Generate mock dynamic resumes for review:
+
+```bash
+uv run python scripts/generate_mock_dynamic_resumes.py --offline
+```
+
+Audit one generated resume artifact:
+
+```bash
+uv run python scripts/audit_dynamic_resume.py \
+  --submission-dir artifacts/runtime/artifacts/linkedin/submissions/<submission-dir> \
+  --job-title "Backend Engineer (Python / JavaScript)"
+```
 
 ## Quality commands
 
