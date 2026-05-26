@@ -195,15 +195,15 @@ _SPECIALIZATION_FALLBACK_KEYWORDS: dict[str, tuple[str, ...]] = {
 
 _ROLE_TARGET_ALIGNMENT_SENTENCES: dict[str, str] = {
     "automation engineer": (
-        "Recent work includes workflow automation, integrations, and operational tooling "
+        "Recent work includes workflow design, integrations, and operational tooling "
         "for complex business systems."
     ),
     "automation developer": (
-        "Recent work includes workflow automation, integrations, and operational tooling "
+        "Recent work includes workflow design, integrations, and operational tooling "
         "for complex business systems."
     ),
     "rpa developer": (
-        "Recent work includes automation, integrations, and process orchestration "
+        "Recent work includes process orchestration, integrations, and resilient workflow delivery "
         "for business-critical operations."
     ),
     "backend developer": (
@@ -217,9 +217,9 @@ _ROLE_TARGET_ALIGNMENT_SENTENCES: dict[str, str] = {
 }
 
 _ROLE_TARGET_SUMMARY_SCOPES: dict[str, str] = {
-    "automation engineer": "workflow automation, integrations, and operational tooling",
-    "automation developer": "workflow automation, integrations, and operational tooling",
-    "rpa developer": "automation delivery, orchestration, and business workflows",
+    "automation engineer": "workflow design, integrations, and operational tooling",
+    "automation developer": "workflow design, integrations, and operational tooling",
+    "rpa developer": "process orchestration, workflow reliability, and business operations",
     "backend developer": "backend services, internal tooling, and production support",
     "full stack developer": "product delivery, backend services, and operational workflows",
 }
@@ -776,6 +776,7 @@ class OhMyCvDynamicResumeBuilder:
             role_target=role_target,
             focus_keywords=focus_keywords,
             posting_keywords=_extract_posting_keywords(posting),
+            lead_sentence=lead_sentence,
         )
         closing_sentence = _select_summary_closing_sentence(
             base_sentences=base_sentences,
@@ -2058,10 +2059,12 @@ def _select_summary_focus_keywords(
     *,
     focus_keywords: tuple[str, ...],
     posting_keywords: tuple[str, ...],
+    existing_summary_text: str = "",
 ) -> tuple[str, ...]:
     posting_tokens = {
         _normalize_keyword(keyword) for keyword in posting_keywords if keyword.strip()
     }
+    normalized_existing_summary = _normalize_comparison_text(existing_summary_text)
     selected: list[str] = []
     seen: set[str] = set()
 
@@ -2071,6 +2074,35 @@ def _select_summary_focus_keywords(
             return
         seen.add(normalized_candidate)
         selected.append(candidate)
+
+    def is_fresh_keyword(candidate: str) -> bool:
+        normalized_candidate = _normalize_keyword(candidate)
+        return bool(normalized_candidate) and (
+            normalized_candidate not in normalized_existing_summary
+        )
+
+    for keyword in focus_keywords:
+        normalized_keyword = _normalize_keyword(keyword)
+        if (
+            normalized_keyword
+            and normalized_keyword in posting_tokens
+            and normalized_keyword in _HEADLINE_SPECIALIZATION_KEYWORDS
+            and is_fresh_keyword(keyword)
+        ):
+            add_keyword(keyword)
+
+    for keyword in focus_keywords:
+        normalized_keyword = _normalize_keyword(keyword)
+        if (
+            normalized_keyword
+            and normalized_keyword in posting_tokens
+            and normalized_keyword in _SUMMARY_DETAIL_KEYWORDS
+            and is_fresh_keyword(keyword)
+        ):
+            add_keyword(keyword)
+
+    if selected:
+        return tuple(selected[:3])
 
     for keyword in focus_keywords:
         normalized_keyword = _normalize_keyword(keyword)
@@ -2095,6 +2127,27 @@ def _select_summary_focus_keywords(
 
     for keyword in focus_keywords:
         normalized_keyword = _normalize_keyword(keyword)
+        if (
+            normalized_keyword
+            and normalized_keyword in _HEADLINE_SPECIALIZATION_KEYWORDS
+            and is_fresh_keyword(keyword)
+        ):
+            add_keyword(keyword)
+
+    for keyword in focus_keywords:
+        normalized_keyword = _normalize_keyword(keyword)
+        if (
+            normalized_keyword
+            and normalized_keyword in _SUMMARY_DETAIL_KEYWORDS
+            and is_fresh_keyword(keyword)
+        ):
+            add_keyword(keyword)
+
+    if selected:
+        return tuple(selected[:3])
+
+    for keyword in focus_keywords:
+        normalized_keyword = _normalize_keyword(keyword)
         if normalized_keyword and normalized_keyword in _HEADLINE_SPECIALIZATION_KEYWORDS:
             add_keyword(keyword)
 
@@ -2111,10 +2164,12 @@ def _build_summary_focus_sentence(
     role_target: str | None,
     focus_keywords: tuple[str, ...],
     posting_keywords: tuple[str, ...],
+    lead_sentence: str = "",
 ) -> str:
     selected_focus = _select_summary_focus_keywords(
         focus_keywords=focus_keywords,
         posting_keywords=posting_keywords,
+        existing_summary_text=lead_sentence,
     )
     normalized_role_target = _normalize_keyword(role_target or "")
     scope = _ROLE_TARGET_SUMMARY_SCOPES.get(normalized_role_target)
