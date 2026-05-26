@@ -60,6 +60,13 @@ _GENERIC_ENGINEERING_ROLE_PATTERNS: tuple[str, ...] = (
     r"\bprogrammer\b",
 )
 
+_GENERIC_SOFTWARE_ROLE_PATTERNS: tuple[str, ...] = (
+    r"\bsoftware engineer\b",
+    r"\bsoftware developer\b",
+    r"\bapplication developer\b",
+    r"\bapplications engineer\b",
+)
+
 _GENERIC_ROLE_TARGET_TOKENS = frozenset({"engineer", "developer", "specialist", "programmer"})
 
 _TITLE_ROLE_HARD_EXCLUSION_PATTERNS: tuple[str, ...] = (
@@ -78,6 +85,21 @@ _TITLE_ROLE_HARD_EXCLUSION_PATTERNS: tuple[str, ...] = (
     r"\bhelp desk\b",
 )
 
+_TITLE_NON_SOFTWARE_DISCIPLINE_PATTERNS: tuple[str, ...] = (
+    r"\belectrical engineer\b",
+    r"\bmechanical engineer\b",
+    r"\bcivil engineer\b",
+    r"\bstructural engineer\b",
+    r"\bmanufacturing engineer\b",
+    r"\bindustrial engineer\b",
+    r"\bpower engineer\b",
+    r"\btransmission engineer\b",
+    r"\bcontrols engineer\b",
+    r"\bautomation controls engineer\b",
+    r"\bbiomedical engineer\b",
+    r"\bchemical engineer\b",
+)
+
 _TITLE_SPECIALIZATION_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("python", (r"\bpython\b",)),
     ("javascript", (r"\bjavascript\b", r"\bnode\.?js\b")),
@@ -93,6 +115,11 @@ _TITLE_SPECIALIZATION_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("langchain", (r"\blangchain\b",)),
     ("rag", (r"\brag\b", r"\bretrieval[\s\-]augmented generation\b")),
 )
+
+_GENERIC_SOFTWARE_ROLE_TARGET_SCORES: dict[str, float] = {
+    "backend developer": 0.56,
+    "full stack developer": 0.6,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -467,6 +494,11 @@ def _infer_role_target_score_from_title(
 ) -> float:
     """Infer role-family fit from generic engineering titles plus explicit stack cues."""
 
+    if any(re.search(pattern, normalized_title) for pattern in _GENERIC_SOFTWARE_ROLE_PATTERNS):
+        software_role_score = _GENERIC_SOFTWARE_ROLE_TARGET_SCORES.get(canonical_target)
+        if software_role_score is not None:
+            return software_role_score
+
     if not any(
         re.search(pattern, normalized_title) for pattern in _GENERIC_ENGINEERING_ROLE_PATTERNS
     ):
@@ -491,6 +523,8 @@ def _title_has_hard_exclusion(normalized_title: str) -> bool:
 
     return any(
         re.search(pattern, normalized_title) for pattern in _TITLE_ROLE_HARD_EXCLUSION_PATTERNS
+    ) or any(
+        re.search(pattern, normalized_title) for pattern in _TITLE_NON_SOFTWARE_DISCIPLINE_PATTERNS
     )
 
 
