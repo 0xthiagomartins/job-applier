@@ -37,6 +37,9 @@ _ROLE_TARGET_ALIAS_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
     "backend developer": (
         r"\bbackend\b",
+        r"\bback[\s\-]?end\b",
+        r"\bbackend (engineer|developer)\b",
+        r"\bback[\s\-]?end (engineer|developer)\b",
         r"\bserver[\s\-]?side\b",
     ),
     "full stack developer": (
@@ -65,6 +68,10 @@ _GENERIC_SOFTWARE_ROLE_PATTERNS: tuple[str, ...] = (
     r"\bsoftware developer\b",
     r"\bapplication developer\b",
     r"\bapplications engineer\b",
+    r"\bengenheir(?:o|a)(?:\s+a)?\s+de\s+software\b",
+    r"\bdesenvolvedor(?:a)?(?:\s+a)?\s+de\s+software\b",
+    r"\bingenier(?:o|a)\s+de\s+software\b",
+    r"\bdesarrollador(?:a)?\s+de\s+software\b",
 )
 
 _GENERIC_ROLE_TARGET_TOKENS = frozenset({"engineer", "developer", "specialist", "programmer"})
