@@ -2630,6 +2630,115 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 return ref;
               };
 
+              const isBinaryOnlyText = (value) => {
+                const normalized = collapse(value).toLowerCase();
+                if (!normalized) {
+                  return false;
+                }
+                const tokens = normalized.split(/\\s+/).filter(Boolean);
+                if (!tokens.length || tokens.length > 6) {
+                  return false;
+                }
+                const binaryTokens = new Set([
+                  "yes",
+                  "no",
+                  "sim",
+                  "nao",
+                  "não",
+                  "si",
+                  "oui",
+                  "non",
+                  "ja",
+                  "nein",
+                ]);
+                return tokens.every((token) => binaryTokens.has(token));
+              };
+
+              const promptTextFromSibling = (element) => {
+                const candidateScopes = [];
+                const fieldset = element.closest("fieldset");
+                if (fieldset) {
+                  candidateScopes.push(fieldset);
+                  if (fieldset.parentElement) {
+                    candidateScopes.push(fieldset.parentElement);
+                  }
+                }
+                const semanticContainer = element.closest(
+                  [
+                    ".jobs-easy-apply-form-section__grouping",
+                    ".fb-form-element",
+                    ".jobs-easy-apply-form-element",
+                    "[role='group']",
+                    "section",
+                  ].join(", ")
+                );
+                if (semanticContainer) {
+                  candidateScopes.push(semanticContainer);
+                }
+
+                const seen = new Set();
+                for (const scope of candidateScopes) {
+                  if (!(scope instanceof HTMLElement) || seen.has(scope)) {
+                    continue;
+                  }
+                  seen.add(scope);
+
+                  let sibling = scope.previousElementSibling;
+                  while (sibling) {
+                    const text = collapse(sibling.innerText || sibling.textContent || "");
+                    const controlCount =
+                      sibling instanceof HTMLElement
+                        ? sibling.querySelectorAll("input, select, textarea").length
+                        : 0;
+                    if (
+                      text
+                      && !isBinaryOnlyText(text)
+                      && text.length <= 360
+                      && controlCount === 0
+                    ) {
+                      return truncate(text, 240);
+                    }
+                    sibling = sibling.previousElementSibling;
+                  }
+
+                  const parent = scope.parentElement;
+                  if (!parent) {
+                    continue;
+                  }
+                  const siblings = Array.from(parent.children);
+                  const scopeIndex = siblings.indexOf(scope);
+                  for (let index = scopeIndex - 1; index >= 0; index -= 1) {
+                    const candidate = siblings[index];
+                    const text = collapse(candidate.innerText || candidate.textContent || "");
+                    const controlCount =
+                      candidate instanceof HTMLElement
+                        ? candidate.querySelectorAll("input, select, textarea").length
+                        : 0;
+                    if (
+                      text
+                      && !isBinaryOnlyText(text)
+                      && text.length <= 360
+                      && controlCount === 0
+                    ) {
+                      return truncate(text, 240);
+                    }
+                  }
+                }
+                return "";
+              };
+
+              const descriptiveScopeText = (scope, element) => {
+                const promptText = promptTextFromSibling(element);
+                const scopeText = collapse(scope?.innerText || scope?.textContent || "");
+                if (promptText && scopeText) {
+                  return truncate(`${promptText} ${scopeText}`, 900);
+                }
+                if (scopeText && !isBinaryOnlyText(scopeText)) {
+                  return truncate(scopeText, 900);
+                }
+                return truncate(promptText, 900);
+              };
+
               const questionFor = (element) => {
                 const ariaLabel = collapse(element.getAttribute("aria-label"));
                 if (ariaLabel) {
@@ -2655,6 +2764,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
                   if (legend && collapse(legend.innerText)) {
                     return collapse(legend.innerText);
                   }
+                  const siblingPrompt = promptTextFromSibling(fieldset);
+                  if (siblingPrompt) {
+                    return siblingPrompt;
+                  }
                 }
 
                 const container = element.closest([
@@ -2670,6 +2783,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
                   );
                   if (textLabel && collapse(textLabel.innerText)) {
                     return collapse(textLabel.innerText);
+                  }
+                  const siblingPrompt = promptTextFromSibling(container);
+                  if (siblingPrompt) {
+                    return siblingPrompt;
                   }
                 }
 
@@ -2729,15 +2846,19 @@ class PlaywrightLinkedInEasyApplyExecutor:
               };
 
               const radioQuestionFor = (element) => {
+                const promptText = promptTextFromSibling(element);
+                if (promptText) {
+                  return promptText;
+                }
                 const explicit = questionFor(element);
-                if (explicit && explicit.toLowerCase() !== "radio") {
+                if (explicit && explicit.toLowerCase() !== "radio" && !isBinaryOnlyText(explicit)) {
                   return explicit;
                 }
                 const groupScope = scopeFor(element);
                 if (!groupScope) {
                   return explicit;
                 }
-                const lines = (groupScope.innerText || groupScope.textContent || "")
+                const lines = (descriptiveScopeText(groupScope, element) || "")
                   .split(/\\n+/)
                   .map((line) => collapse(line))
                   .filter(Boolean);
@@ -2802,6 +2923,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
 
               const fieldContextFor = (element) => {
                 const scope = scopeFor(element);
+                const descriptiveScope = descriptiveScopeText(scope, element);
+                if (descriptiveScope) {
+                  return descriptiveScope;
+                }
                 if (scope && collapse(scope.innerText)) {
                   return truncate(scope.innerText, 900);
                 }
@@ -2905,7 +3030,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     || /\\*/.test(radioQuestionFor(input)),
                   prefilled: Boolean(selected),
                   current_value: selected ? optionLabel(selected) : "",
-                  field_context: truncate(groupScope?.innerText || questionFor(input), 900),
+                  field_context: fieldContextFor(input),
                   helper_text: referencedTextFor(input),
                   options: optionLabels,
                   option_refs: optionRefs,
