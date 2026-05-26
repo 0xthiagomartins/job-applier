@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict
 from job_applier.application.config import (
     AgentConfig,
     AIConfig,
+    CapabilityRangeConfig,
     RulesetConfig,
     ScheduleConfig,
     SearchConfig,
@@ -306,6 +307,10 @@ def build_user_agent_settings(document: PanelSettingsDocument) -> UserAgentSetti
                 github_url=document.profile.github_url,
                 portfolio_url=document.profile.portfolio_url,
                 years_experience_by_stack=document.profile.years_experience_by_stack,
+                capability_overrides={
+                    capability: CapabilityRangeConfig(**override.model_dump())
+                    for capability, override in document.profile.capability_overrides.items()
+                },
                 work_authorized=document.profile.work_authorized,
                 needs_sponsorship=document.profile.needs_sponsorship,
                 salary_expectation=document.profile.salary_expectation,

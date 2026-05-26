@@ -10,6 +10,7 @@ from job_applier.application.agent_execution import JobScorer, ScoredJobPosting
 from job_applier.application.config import UserAgentSettings
 from job_applier.domain.entities import JobPosting
 from job_applier.domain.enums import WorkplaceType
+from job_applier.infrastructure.candidate_capabilities import build_candidate_capability_profile
 
 logger = logging.getLogger(__name__)
 
@@ -229,18 +230,25 @@ class RuleBasedJobScorer(JobScorer):
                 positive_component=0.0,
                 threshold=threshold,
             )
-        stack_terms = tuple(settings.profile.years_experience_by_stack.keys())
+        reviewed_capability_profile = build_candidate_capability_profile(settings)
+        stack_terms = tuple(
+            item.capability
+            for item in sorted(
+                reviewed_capability_profile.capabilities.values(),
+                key=lambda item: (item.recommended_years, item.confidence, item.capability),
+                reverse=True,
+            )
+            if item.source
+            in {
+                "profile_years",
+                "user_reviewed_override",
+                "user_reviewed_resume_inference",
+            }
+        )
         stack_matches = match_terms(stack_terms, searchable_text)
         positive_matches = match_terms(settings.profile.positive_filters, searchable_text)
         matched_specializations = match_specializations(
-            stack_terms=tuple(
-                stack_name
-                for stack_name, _years in sorted(
-                    settings.profile.years_experience_by_stack.items(),
-                    key=lambda item: item[1],
-                    reverse=True,
-                )
-            ),
+            stack_terms=stack_terms,
             positive_terms=settings.profile.positive_filters,
             normalized_title=normalized_title,
             searchable_text=searchable_text,

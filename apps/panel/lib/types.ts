@@ -1,3 +1,22 @@
+export type CapabilityOverride = {
+  min_years: number;
+  max_years: number;
+  recommended_years: number | null;
+  enabled: boolean;
+};
+
+export type CapabilityProfileItem = {
+  capability: string;
+  min_years: number;
+  max_years: number;
+  recommended_years: number;
+  confidence: number;
+  source: string;
+  reviewed: boolean;
+  evidence: string[];
+  inferred_from: string[];
+};
+
 export type ProfileSection = {
   name: string;
   email: string | null;
@@ -7,6 +26,7 @@ export type ProfileSection = {
   github_url: string | null;
   portfolio_url: string | null;
   years_experience_by_stack: Record<string, number>;
+  capability_overrides: Record<string, CapabilityOverride>;
   work_authorized: boolean;
   needs_sponsorship: boolean;
   salary_expectation: number | null;
@@ -45,6 +65,10 @@ export type AISection = {
 
 export type ComputedPanelState = {
   next_execution_at: string | null;
+  capability_profile: {
+    total_career_years: number;
+    capabilities: CapabilityProfileItem[];
+  } | null;
 };
 
 export type ExecutionSummary = {

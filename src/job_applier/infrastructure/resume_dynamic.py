@@ -24,6 +24,10 @@ import yaml  # type: ignore[import-untyped]
 from job_applier.application.config import UserAgentSettings
 from job_applier.domain.entities import JobPosting
 from job_applier.domain.enums import ResumeMode
+from job_applier.infrastructure.candidate_capabilities import (
+    build_candidate_capability_profile,
+    capability_profile_to_payload,
+)
 from job_applier.resume_theme import DEFAULT_OH_MY_CV_RESUME_CSS
 from job_applier.settings import RuntimeSettings
 
@@ -659,6 +663,9 @@ class OhMyCvDynamicResumeBuilder:
                 "salary_expectation": settings.profile.salary_expectation,
                 "default_responses": settings.profile.default_responses,
                 "resume_mode": settings.profile.resume_mode.value,
+                "capability_profile": capability_profile_to_payload(
+                    build_candidate_capability_profile(settings)
+                ),
             },
             "job_target": {
                 "title": posting.title,
@@ -1014,12 +1021,7 @@ class OhMyCvDynamicResumeBuilder:
             "technical evidence available in the source resume."
         )
         known_years = ", ".join(
-            f"{stack} ({years}y)"
-            for stack, years in sorted(
-                settings.profile.years_experience_by_stack.items(),
-                key=lambda item: item[1],
-                reverse=True,
-            )[:8]
+            f"{stack} ({years}y)" for stack, years in _screening_capability_years(settings)[:8]
         )
         role_target = matched_role_target or self._select_primary_role_target(
             settings=settings,
@@ -1099,14 +1101,7 @@ class OhMyCvDynamicResumeBuilder:
             ),
             tuple(profile_keywords),
             posting_keywords,
-            tuple(
-                stack_name
-                for stack_name, _years in sorted(
-                    settings.profile.years_experience_by_stack.items(),
-                    key=lambda item: item[1],
-                    reverse=True,
-                )
-            ),
+            _screening_capability_terms(settings),
         )
 
         for keyword in desired_keywords:
@@ -1224,7 +1219,7 @@ class OhMyCvDynamicResumeBuilder:
                 ),
             )
         )
-        observed.extend(stack_name for stack_name in settings.profile.years_experience_by_stack)
+        observed.extend(_screening_capability_terms(settings))
         return _merge_keyword_sequences(tuple(observed))
 
     def _select_primary_role_target(
@@ -2686,6 +2681,34 @@ def _display_label_for_url(raw_url: str) -> str:
     if hostname:
         return hostname.removeprefix("www.")
     return raw_url
+
+
+def _screening_capability_terms(settings: UserAgentSettings) -> tuple[str, ...]:
+    profile = build_candidate_capability_profile(settings)
+    return tuple(
+        item.capability
+        for item in sorted(
+            profile.capabilities.values(),
+            key=lambda item: (item.recommended_years, item.confidence, item.capability),
+            reverse=True,
+        )
+        if item.source
+        in {"profile_years", "user_reviewed_override", "user_reviewed_resume_inference"}
+    )
+
+
+def _screening_capability_years(settings: UserAgentSettings) -> list[tuple[str, int]]:
+    profile = build_candidate_capability_profile(settings)
+    return [
+        (item.capability, item.recommended_years)
+        for item in sorted(
+            profile.capabilities.values(),
+            key=lambda item: (item.recommended_years, item.confidence, item.capability),
+            reverse=True,
+        )
+        if item.source
+        in {"profile_years", "user_reviewed_override", "user_reviewed_resume_inference"}
+    ]
 
 
 def _build_resume_html_document(*, markdown_text: str, css_text: str | None) -> str:

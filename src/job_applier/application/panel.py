@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -36,6 +37,15 @@ class PanelModel(BaseModel):
     """Base model used for persisted panel sections."""
 
     model_config = ConfigDict(frozen=True)
+
+
+class CapabilityRangeInput(PanelModel):
+    """User-reviewed capability range persisted by the panel."""
+
+    min_years: int = Field(ge=0, default=0)
+    max_years: int = Field(ge=0, default=0)
+    recommended_years: int | None = Field(default=None, ge=0)
+    enabled: bool = True
 
 
 def parse_csv_lines(raw: str) -> tuple[str, ...]:
@@ -85,6 +95,32 @@ def parse_text_mapping_lines(raw: str) -> dict[str, str]:
     return cast(dict[str, str], parse_mapping_lines(raw, value_type=str))
 
 
+def parse_capability_override_json(raw: str) -> dict[str, CapabilityRangeInput]:
+    """Parse a JSON object of reviewed capability overrides."""
+
+    if not raw.strip():
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        msg = "Capability profile overrides must be valid JSON."
+        raise ValueError(msg) from exc
+    if not isinstance(payload, dict):
+        msg = "Capability profile overrides must be a JSON object."
+        raise ValueError(msg)
+
+    parsed: dict[str, CapabilityRangeInput] = {}
+    for capability, override_value in payload.items():
+        if not isinstance(capability, str) or not capability.strip():
+            msg = "Capability override keys must be non-empty strings."
+            raise ValueError(msg)
+        if not isinstance(override_value, dict):
+            msg = "Each capability override must be an object."
+            raise ValueError(msg)
+        parsed[capability.strip()] = CapabilityRangeInput.model_validate(override_value)
+    return parsed
+
+
 def mapping_to_multiline(value: dict[str, Any]) -> str:
     """Render mapping values into multiline strings for the templates."""
 
@@ -108,6 +144,7 @@ class StoredProfileSection(PanelModel):
     github_url: AnyUrl | None = None
     portfolio_url: AnyUrl | None = None
     years_experience_by_stack: dict[str, int] = Field(default_factory=dict)
+    capability_overrides: dict[str, CapabilityRangeInput] = Field(default_factory=dict)
     work_authorized: bool = False
     needs_sponsorship: bool = False
     salary_expectation: int | None = None
@@ -130,6 +167,7 @@ class ProfileFormInput(BaseModel):
     github_url: AnyUrl | None = None
     portfolio_url: AnyUrl | None = None
     years_experience_by_stack: dict[str, int] = Field(default_factory=dict)
+    capability_overrides: dict[str, CapabilityRangeInput] = Field(default_factory=dict)
     work_authorized: bool
     needs_sponsorship: bool = False
     salary_expectation: int | None = None

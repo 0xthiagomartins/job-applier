@@ -19,6 +19,15 @@ class FrozenModel(BaseModel):
     model_config = ConfigDict(frozen=True)
 
 
+class CapabilityRangeConfig(FrozenModel):
+    """User-reviewed capability range used for screening questions."""
+
+    min_years: int = Field(ge=0, default=0)
+    max_years: int = Field(ge=0, default=0)
+    recommended_years: int | None = Field(default=None, ge=0)
+    enabled: bool = True
+
+
 class UserProfileConfig(FrozenModel):
     """Candidate profile data managed by the panel."""
 
@@ -30,6 +39,7 @@ class UserProfileConfig(FrozenModel):
     github_url: AnyUrl | None = None
     portfolio_url: AnyUrl | None = None
     years_experience_by_stack: dict[str, int] = Field(default_factory=dict)
+    capability_overrides: dict[str, CapabilityRangeConfig] = Field(default_factory=dict)
     work_authorized: bool
     needs_sponsorship: bool = False
     salary_expectation: int | None = None

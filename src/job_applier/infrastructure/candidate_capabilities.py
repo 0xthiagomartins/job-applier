@@ -8,18 +8,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from job_applier.application.config import UserAgentSettings
-from job_applier.infrastructure.resume_dynamic import (
-    ResumeExperienceEntry,
-    ResumeSourceSnapshot,
-    _coalesce_wrapped_skill_lines,
-    _extract_docx_text,
-    _extract_pdf_text,
-    _normalize_extracted_resume_text,
-    _parse_experience_entries,
-    _split_resume_sections,
-)
+
+if TYPE_CHECKING:
+    from job_applier.infrastructure.resume_dynamic import (
+        ResumeExperienceEntry,
+        ResumeSourceSnapshot,
+    )
 
 _CAPABILITY_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("python", (r"\bpython\b",)),
@@ -97,6 +94,7 @@ class CapabilityExperienceRange:
     max_years: int
     confidence: float
     source: str
+    recommended_years_override: int | None = None
     evidence: tuple[str, ...] = ()
     inferred_from: tuple[str, ...] = ()
 
@@ -104,7 +102,7 @@ class CapabilityExperienceRange:
     def recommended_years(self) -> int:
         """Return the screening-optimized but plausible answer."""
 
-        return self.max_years
+        return self.recommended_years_override or self.max_years
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,11 +166,22 @@ def build_candidate_capability_profile(settings: UserAgentSettings) -> Candidate
             evidence=("summary_or_skills",),
         )
 
+    capability_ranges = _apply_reviewed_capability_overrides(
+        base_ranges=capability_ranges,
+        settings=settings,
+    )
+
     return CandidateCapabilityProfile(
         total_career_years=total_career_years,
         capabilities=capability_ranges,
         evidence_sources=tuple(
-            source for source in (settings.profile.cv_path, "years_experience_by_stack") if source
+            source
+            for source in (
+                settings.profile.cv_path,
+                "years_experience_by_stack",
+                "capability_overrides",
+            )
+            if source
         ),
     )
 
@@ -227,10 +236,11 @@ def capability_profile_to_payload(profile: CandidateCapabilityProfile) -> dict[s
                 "recommended_years": item.recommended_years,
                 "confidence": item.confidence,
                 "source": item.source,
+                "reviewed": item.source.startswith("user_reviewed"),
                 "evidence": list(item.evidence),
                 "inferred_from": list(item.inferred_from),
             }
-            for item in ordered[:24]
+            for item in ordered
         ],
     }
 
@@ -270,6 +280,16 @@ def canonicalize_capability_name(raw_value: str) -> str | None:
 
 @lru_cache(maxsize=12)
 def _load_resume_snapshot(cv_path: str | None) -> ResumeSourceSnapshot:
+    from job_applier.infrastructure.resume_dynamic import (
+        ResumeSourceSnapshot,
+        _coalesce_wrapped_skill_lines,
+        _extract_docx_text,
+        _extract_pdf_text,
+        _normalize_extracted_resume_text,
+        _parse_experience_entries,
+        _split_resume_sections,
+    )
+
     if cv_path is None:
         return ResumeSourceSnapshot()
     path = Path(cv_path)
@@ -356,6 +376,52 @@ def _collect_capability_mentions(snapshot: ResumeSourceSnapshot) -> tuple[str, .
         seen.add(capability)
         ordered.append(capability)
     return tuple(ordered)
+
+
+def _apply_reviewed_capability_overrides(
+    *,
+    base_ranges: dict[str, CapabilityExperienceRange],
+    settings: UserAgentSettings,
+) -> dict[str, CapabilityExperienceRange]:
+    merged_ranges = dict(base_ranges)
+    exact_capabilities = {
+        canonical
+        for stack_name in settings.profile.years_experience_by_stack
+        for canonical in (canonicalize_capability_name(stack_name),)
+        if canonical is not None
+    }
+
+    for raw_capability, override in settings.profile.capability_overrides.items():
+        capability = canonicalize_capability_name(raw_capability)
+        if capability is None:
+            continue
+        if capability in exact_capabilities:
+            continue
+        if not override.enabled:
+            merged_ranges.pop(capability, None)
+            continue
+
+        min_years = max(0, override.min_years)
+        max_years = max(min_years, override.max_years)
+        recommended_years = override.recommended_years
+        if recommended_years is None:
+            recommended_years = max_years
+        recommended_years = min(max_years, max(min_years, recommended_years))
+
+        existing = merged_ranges.get(capability)
+        confidence = 0.96 if existing is not None else 0.9
+        source = "user_reviewed_override" if existing is None else "user_reviewed_resume_inference"
+        merged_ranges[capability] = CapabilityExperienceRange(
+            capability=capability,
+            min_years=min_years,
+            max_years=max_years,
+            confidence=confidence,
+            source=source,
+            recommended_years_override=recommended_years,
+            evidence=((existing.source,) if existing is not None else ("panel_review",)),
+            inferred_from=(() if existing is None else existing.inferred_from),
+        )
+    return merged_ranges
 
 
 def _infer_related_capability_range(

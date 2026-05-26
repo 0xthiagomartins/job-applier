@@ -1,6 +1,9 @@
 """Application layer for Job Applier."""
 
-from job_applier.application.agent_execution import ExecutionRunSummary
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
 from job_applier.application.config import UserAgentSettings
 from job_applier.application.schemas import (
     AgentExecutionSummaryRead,
@@ -27,6 +30,9 @@ from job_applier.application.snapshotting import (
     create_successful_submission_record,
 )
 
+if TYPE_CHECKING:
+    from job_applier.application.agent_execution import ExecutionRunSummary
+
 __all__ = [
     "ApplicationAnswerCreate",
     "ApplicationAnswerRead",
@@ -51,3 +57,12 @@ __all__ = [
     "build_profile_snapshot",
     "create_successful_submission_record",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name == "ExecutionRunSummary":
+        from job_applier.application.agent_execution import ExecutionRunSummary
+
+        return ExecutionRunSummary
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg)

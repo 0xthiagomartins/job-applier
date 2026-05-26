@@ -8,6 +8,10 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import AnyUrl, SecretStr
 
+from job_applier.application.agent_execution import (
+    PanelSettingsConfigurationError,
+    build_user_agent_settings,
+)
 from job_applier.application.panel import (
     SCHEDULE_FREQUENCY_OPTIONS,
     TIMEZONE_OPTIONS,
@@ -16,11 +20,16 @@ from job_applier.application.panel import (
     ProfileFormInput,
     ScheduleFormInput,
     calculate_next_execution_at,
+    parse_capability_override_json,
     parse_csv_lines,
     parse_int_mapping_lines,
     parse_text_mapping_lines,
 )
 from job_applier.domain.enums import ResumeMode, ScheduleFrequency, SeniorityLevel, WorkplaceType
+from job_applier.infrastructure.candidate_capabilities import (
+    build_candidate_capability_profile,
+    capability_profile_to_payload,
+)
 from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
 from job_applier.interface.http.dependencies import get_panel_settings_store
 
@@ -49,6 +58,15 @@ async def get_panel_state(
     """Return the safe combined state used by the Next.js panel."""
 
     document = store.load()
+    capability_profile_payload: dict[str, object] | None = None
+    try:
+        settings = build_user_agent_settings(document)
+    except PanelSettingsConfigurationError:
+        capability_profile_payload = None
+    else:
+        capability_profile_payload = capability_profile_to_payload(
+            build_candidate_capability_profile(settings)
+        )
     return JSONResponse(
         content={
             "profile": document.profile.model_dump(mode="json"),
@@ -56,6 +74,7 @@ async def get_panel_state(
             "schedule": document.schedule.model_dump(mode="json"),
             "computed": {
                 "next_execution_at": calculate_next_execution_at(document.schedule).isoformat(),
+                "capability_profile": capability_profile_payload,
             },
             "ai": {
                 "model": document.ai.model,
@@ -88,6 +107,7 @@ async def save_profile(
     salary_expectation: Annotated[int | None, Form()] = None,
     availability: Annotated[str, Form()] = "",
     default_responses: Annotated[str, Form()] = "",
+    capability_overrides: Annotated[str, Form()] = "",
     resume_mode: Annotated[ResumeMode, Form()] = ResumeMode.STATIC,
     resume_css: Annotated[str, Form()] = "",
     cv_file: Annotated[UploadFile | None, File()] = None,
@@ -109,6 +129,7 @@ async def save_profile(
             salary_expectation=salary_expectation,
             availability=availability,
             default_responses=parse_text_mapping_lines(default_responses),
+            capability_overrides=parse_capability_override_json(capability_overrides),
             resume_mode=resume_mode,
             resume_css=resume_css.strip() or None,
         )

@@ -169,6 +169,7 @@ class LocalPanelSettingsStore:
                 github_url=settings.bootstrap_profile_github_url,
                 portfolio_url=settings.bootstrap_profile_portfolio_url,
                 years_experience_by_stack={},
+                capability_overrides={},
                 work_authorized=settings.bootstrap_profile_work_authorized,
                 needs_sponsorship=settings.bootstrap_profile_needs_sponsorship,
                 availability=settings.bootstrap_profile_availability,

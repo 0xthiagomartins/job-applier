@@ -3,6 +3,7 @@
 import { useEffect, useState, useTransition } from "react";
 
 import { FeedbackBanner } from "@/components/feedback-banner";
+import { CapabilityOverride, CapabilityProfileItem, PanelState } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -12,6 +13,44 @@ import { Textarea } from "@/components/ui/textarea";
 import { fetchPanelState, saveProfile } from "@/lib/api";
 
 type FeedbackState = { kind: "success" | "error"; message: string } | null;
+
+function defaultOverride(item: CapabilityProfileItem): CapabilityOverride {
+  return {
+    min_years: item.min_years,
+    max_years: item.max_years,
+    recommended_years: item.recommended_years,
+    enabled: true,
+  };
+}
+
+function normalizeOverrideValue(
+  draft: CapabilityOverride,
+  item: CapabilityProfileItem,
+): CapabilityOverride {
+  const minYears = Math.max(0, draft.min_years);
+  const maxYears = Math.max(minYears, draft.max_years);
+  const recommendedYears = draft.recommended_years === null
+    ? maxYears
+    : Math.min(maxYears, Math.max(minYears, draft.recommended_years));
+  const fallback = defaultOverride(item);
+  return {
+    min_years: Number.isFinite(minYears) ? minYears : fallback.min_years,
+    max_years: Number.isFinite(maxYears) ? maxYears : fallback.max_years,
+    recommended_years: Number.isFinite(recommendedYears)
+      ? recommendedYears
+      : fallback.recommended_years,
+    enabled: draft.enabled,
+  };
+}
+
+function overridesEqual(left: CapabilityOverride, right: CapabilityOverride): boolean {
+  return (
+    left.min_years === right.min_years &&
+    left.max_years === right.max_years &&
+    left.recommended_years === right.recommended_years &&
+    left.enabled === right.enabled
+  );
+}
 
 export function ProfileForm(): React.JSX.Element {
   const [form, setForm] = useState({
@@ -31,6 +70,10 @@ export function ProfileForm(): React.JSX.Element {
     resume_mode: "static",
     resume_css: "",
   });
+  const [panelState, setPanelState] = useState<PanelState | null>(null);
+  const [capabilityOverrides, setCapabilityOverrides] = useState<
+    Record<string, CapabilityOverride>
+  >({});
   const [cvFile, setCvFile] = useState<File | null>(null);
   const [currentCvName, setCurrentCvName] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<FeedbackState>(null);
@@ -39,6 +82,7 @@ export function ProfileForm(): React.JSX.Element {
   useEffect(() => {
     void fetchPanelState()
       .then((state) => {
+        setPanelState(state);
         setForm({
           name: state.profile.name ?? "",
           email: state.profile.email ?? "",
@@ -60,6 +104,7 @@ export function ProfileForm(): React.JSX.Element {
           resume_mode: state.profile.resume_mode ?? "static",
           resume_css: state.profile.resume_css ?? "",
         });
+        setCapabilityOverrides(state.profile.capability_overrides ?? {});
         setCurrentCvName(state.profile.cv_filename);
       })
       .catch((error: Error) => {
@@ -88,6 +133,7 @@ export function ProfileForm(): React.JSX.Element {
     if (cvFile) {
       payload.append("cv_file", cvFile);
     }
+    payload.append("capability_overrides", JSON.stringify(capabilityOverrides));
 
     startTransition(() => {
       void saveProfile(payload)
@@ -97,10 +143,53 @@ export function ProfileForm(): React.JSX.Element {
             setCurrentCvName(cvFile.name);
             setCvFile(null);
           }
+          return fetchPanelState();
+        })
+        .then((state) => {
+          if (!state) {
+            return;
+          }
+          setPanelState(state);
+          setCapabilityOverrides(state.profile.capability_overrides ?? {});
         })
         .catch((error: Error) => {
           setFeedback({ kind: "error", message: error.message });
         });
+    });
+  }
+
+  const capabilityItems = panelState?.computed.capability_profile?.capabilities ?? [];
+
+  function displayedOverride(item: CapabilityProfileItem): CapabilityOverride {
+    const existing = capabilityOverrides[item.capability];
+    return normalizeOverrideValue(existing ?? defaultOverride(item), item);
+  }
+
+  function updateCapabilityOverride(
+    item: CapabilityProfileItem,
+    patch: Partial<CapabilityOverride>,
+  ): void {
+    setCapabilityOverrides((current) => {
+      const next = normalizeOverrideValue(
+        {
+          ...displayedOverride(item),
+          ...patch,
+        },
+        item,
+      );
+      const fallback = defaultOverride(item);
+      if (overridesEqual(next, fallback)) {
+        const { [item.capability]: _removed, ...rest } = current;
+        return rest;
+      }
+      return { ...current, [item.capability]: next };
+    });
+  }
+
+  function resetCapabilityOverride(item: CapabilityProfileItem): void {
+    setCapabilityOverrides((current) => {
+      const { [item.capability]: _removed, ...rest } = current;
+      return rest;
     });
   }
 
@@ -218,6 +307,118 @@ export function ProfileForm(): React.JSX.Element {
               onChange={(event) => updateField("resume_css", event.target.value)}
             />
           </Field>
+        </CardContent>
+      </Card>
+
+      <Card className="bg-white/70">
+        <CardContent className="space-y-4 pt-6">
+          <div className="space-y-1">
+            <Label>Capability profile</Label>
+            <p className="text-sm text-muted-foreground">
+              These ranges are inferred from the base CV and used for screening answers like
+              years of experience. Exact values from “Experience by stack” still win when both
+              exist.
+            </p>
+          </div>
+          {panelState?.computed.capability_profile ? (
+            <div className="space-y-3">
+              <div className="rounded-xl bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+                Total career span inferred from the CV:{" "}
+                <strong>{panelState.computed.capability_profile.total_career_years} years</strong>
+              </div>
+              <div className="space-y-3">
+                {capabilityItems.map((item) => {
+                  const draft = displayedOverride(item);
+                  const isReviewed = Boolean(capabilityOverrides[item.capability]);
+                  return (
+                    <div
+                      key={item.capability}
+                      className="space-y-3 rounded-2xl border border-emerald-100 bg-white/90 p-4"
+                    >
+                      <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+                        <div>
+                          <p className="font-medium capitalize">{item.capability}</p>
+                          <p className="text-sm text-muted-foreground">
+                            Source: {item.source.replaceAll("_", " ")} · Confidence:{" "}
+                            {Math.round(item.confidence * 100)}%
+                          </p>
+                        </div>
+                        <div className="text-sm text-muted-foreground">
+                          {isReviewed ? "Reviewed override active" : "Using inferred default"}
+                        </div>
+                      </div>
+                      <div className="grid gap-3 md:grid-cols-4">
+                        <Field label="Min years">
+                          <Input
+                            min={0}
+                            type="number"
+                            value={draft.min_years}
+                            onChange={(event) =>
+                              updateCapabilityOverride(item, {
+                                min_years: Number(event.target.value || 0),
+                              })
+                            }
+                          />
+                        </Field>
+                        <Field label="Max years">
+                          <Input
+                            min={0}
+                            type="number"
+                            value={draft.max_years}
+                            onChange={(event) =>
+                              updateCapabilityOverride(item, {
+                                max_years: Number(event.target.value || 0),
+                              })
+                            }
+                          />
+                        </Field>
+                        <Field label="Recommended years">
+                          <Input
+                            min={0}
+                            type="number"
+                            value={draft.recommended_years ?? ""}
+                            onChange={(event) =>
+                              updateCapabilityOverride(item, {
+                                recommended_years: Number(event.target.value || 0),
+                              })
+                            }
+                          />
+                        </Field>
+                        <ToggleCard
+                          checked={draft.enabled}
+                          description="Disable this capability if the inferred range feels misleading."
+                          label="Use for screening"
+                          onCheckedChange={(checked) =>
+                            updateCapabilityOverride(item, { enabled: checked })
+                          }
+                        />
+                      </div>
+                      <div className="flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
+                        <span>
+                          Inferred default: {item.min_years}-{item.max_years} years, recommended{" "}
+                          {item.recommended_years}
+                        </span>
+                        {isReviewed ? (
+                          <button
+                            className="font-medium text-emerald-700 underline-offset-4 hover:underline"
+                            type="button"
+                            onClick={() => resetCapabilityOverride(item)}
+                          >
+                            Revert to inferred default
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              Upload a base CV and save the profile once to generate the inferred capability
+              profile.
+            </p>
+          )}
         </CardContent>
       </Card>
 
