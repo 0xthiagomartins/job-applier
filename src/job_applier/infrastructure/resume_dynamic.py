@@ -921,6 +921,35 @@ class OhMyCvDynamicResumeBuilder:
     ) -> dict[str, str] | None:
         if settings.ai.api_key is None:
             return None
+        batched_items = self._chunk_resume_translation_items(translation_items)
+        translated: dict[str, str] = {}
+        for batch in batched_items:
+            batch_result = self._translate_resume_items_batch(
+                settings=settings,
+                translation_items=batch,
+                source_language=source_language,
+                target_language=target_language,
+                strict_target_language=strict_target_language,
+            )
+            if batch_result is None:
+                return None
+            translated.update(batch_result)
+        expected_refs = {ref for ref, _ in translation_items}
+        if expected_refs - set(translated):
+            return None
+        return translated
+
+    def _translate_resume_items_batch(
+        self,
+        *,
+        settings: UserAgentSettings,
+        translation_items: tuple[tuple[str, str], ...],
+        source_language: SupportedLanguage,
+        target_language: SupportedLanguage,
+        strict_target_language: bool = False,
+    ) -> dict[str, str] | None:
+        if settings.ai.api_key is None:
+            return None
         payload: dict[str, object] = {
             "source_language": source_language.value,
             "source_language_name": display_name_for_language(source_language),
@@ -959,6 +988,31 @@ class OhMyCvDynamicResumeBuilder:
             response_payload=response_payload,
             expected_refs=tuple(ref for ref, _ in translation_items),
         )
+
+    def _chunk_resume_translation_items(
+        self,
+        translation_items: tuple[tuple[str, str], ...],
+    ) -> tuple[tuple[tuple[str, str], ...], ...]:
+        batches: list[tuple[tuple[str, str], ...]] = []
+        current_batch: list[tuple[str, str]] = []
+        current_chars = 0
+        max_items_per_batch = 10
+        max_chars_per_batch = 1800
+        for item in translation_items:
+            ref, text = item
+            item_chars = len(ref) + len(text)
+            if current_batch and (
+                len(current_batch) >= max_items_per_batch
+                or current_chars + item_chars > max_chars_per_batch
+            ):
+                batches.append(tuple(current_batch))
+                current_batch = []
+                current_chars = 0
+            current_batch.append(item)
+            current_chars += item_chars
+        if current_batch:
+            batches.append(tuple(current_batch))
+        return tuple(batches)
 
     def _parse_translation_response(
         self,
