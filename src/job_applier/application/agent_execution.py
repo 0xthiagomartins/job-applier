@@ -68,12 +68,27 @@ _NON_EASY_APPLY_SELECTED_JOB_RELEASE_MARKERS = (
     "does not allow a new application to be started",
 )
 
+_TERMINAL_EASY_APPLY_LIMIT_MARKERS = (
+    "easy apply limit",
+    "daily easy apply limit",
+    "daily linkedin easy apply limit",
+    "limit has been reached",
+    "maximum number of easy apply",
+)
+
 
 def _should_release_selected_job_slot(submission: ApplicationSubmission) -> bool:
     notes = (submission.notes or "").strip().lower()
     if not notes:
         return False
     return any(marker in notes for marker in _NON_EASY_APPLY_SELECTED_JOB_RELEASE_MARKERS)
+
+
+def _should_halt_execution_for_easy_apply_limit(submission: ApplicationSubmission) -> bool:
+    notes = (submission.notes or "").strip().lower()
+    if not notes:
+        return False
+    return any(marker in notes for marker in _TERMINAL_EASY_APPLY_LIMIT_MARKERS)
 
 
 class PanelSettingsConfigurationError(ValueError):
@@ -906,6 +921,41 @@ class AgentExecutionOrchestrator:
                         "error_count": error_count,
                     },
                 )
+                if _should_halt_execution_for_easy_apply_limit(submission):
+                    latest_error = submission.notes or "LinkedIn Easy Apply limit reached."
+                    summary = self._persist_running_summary(
+                        summary,
+                        jobs_selected=jobs_selected,
+                        successful_submissions=successful_submissions,
+                        error_count=error_count,
+                        last_error=latest_error,
+                    )
+                    append_timeline_event(
+                        "easy_apply_limit_reached",
+                        {
+                            **current_job,
+                            "submission_id": str(submission.id),
+                            "notes": latest_error,
+                        },
+                    )
+                    update_progress_snapshot(
+                        {
+                            "status": "running",
+                            "current_stage": "easy_apply_limit_reached",
+                            "current_job": {
+                                **current_job,
+                                "submission_id": str(submission.id),
+                                "skip_reason": "easy_apply_limit_reached",
+                            },
+                            "debug_stage": stage.value,
+                            "jobs_seen": jobs_seen,
+                            "jobs_selected": jobs_selected,
+                            "successful_submissions": successful_submissions,
+                            "error_count": error_count,
+                            "last_error": latest_error,
+                        },
+                    )
+                    return False
                 return not self._emit_selected_job_limit_if_needed(
                     execution_id=execution_id,
                     jobs=jobs_seen,
@@ -958,6 +1008,33 @@ class AgentExecutionOrchestrator:
                         "error_count": error_count,
                     },
                 )
+                if _should_halt_execution_for_easy_apply_limit(submission):
+                    append_timeline_event(
+                        "easy_apply_limit_reached",
+                        {
+                            **current_job,
+                            "submission_id": str(submission.id),
+                            "notes": latest_error,
+                        },
+                    )
+                    update_progress_snapshot(
+                        {
+                            "status": "running",
+                            "current_stage": "easy_apply_limit_reached",
+                            "current_job": {
+                                **current_job,
+                                "submission_id": str(submission.id),
+                                "skip_reason": "easy_apply_limit_reached",
+                            },
+                            "debug_stage": stage.value,
+                            "jobs_seen": jobs_seen,
+                            "jobs_selected": jobs_selected,
+                            "successful_submissions": successful_submissions,
+                            "error_count": error_count,
+                            "last_error": latest_error,
+                        },
+                    )
+                    return False
                 return not self._emit_selected_job_limit_if_needed(
                     execution_id=execution_id,
                     jobs=jobs_seen,
