@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 
 from job_applier.application.agent_execution import JobScorer, ScoredJobPosting
@@ -48,6 +49,18 @@ _ROLE_TARGET_ALIAS_PATTERNS: dict[str, tuple[str, ...]] = {
         r"\bfull[\s\-]?stack\b",
         r"\bfullstack\b",
     ),
+    "software engineer": (
+        r"\bsoftware (engineer|developer)\b",
+        r"\bapplication(s)? (engineer|developer)\b",
+        r"\bbackend (engineer|developer)\b",
+        r"\bback[\s\-]?end (engineer|developer)\b",
+        r"\bfull[\s\-]?stack\b",
+        r"\bfullstack\b",
+        r"\bengenheir(?:o|a)(?:\s+a)?\s+de\s+software\b",
+        r"\bdesenvolvedor(?:a)?(?:\s+a)?\s+de\s+software\b",
+        r"\bingenier(?:o|a)\s+de\s+software\b",
+        r"\bdesarrollador(?:a)?\s+de\s+software\b",
+    ),
 }
 
 _ROLE_TARGET_SPECIALIZATION_HINTS: dict[str, tuple[str, ...]] = {
@@ -56,6 +69,24 @@ _ROLE_TARGET_SPECIALIZATION_HINTS: dict[str, tuple[str, ...]] = {
     "rpa developer": ("uipath",),
     "backend developer": ("python", "java", "fastapi"),
     "full stack developer": ("javascript", "typescript", "react", "react native"),
+    "software engineer": (
+        "python",
+        "java",
+        "javascript",
+        "typescript",
+        "react",
+        "aws",
+        "gcp",
+        "azure",
+        "fastapi",
+    ),
+}
+
+_ROLE_TARGET_CROSS_FAMILY_FALLBACKS: dict[str, tuple[tuple[str, float], ...]] = {
+    "rpa developer": (
+        (r"\bautomation (engineer|developer|specialist)\b", 1.0),
+        (r"\bintelligent automation\b", 1.0),
+    ),
 }
 
 _ROLE_TARGET_CANONICAL_ALIASES: dict[str, str] = {
@@ -64,11 +95,18 @@ _ROLE_TARGET_CANONICAL_ALIASES: dict[str, str] = {
     "rpa developer": "rpa developer",
     "backend developer": "backend developer",
     "full stack developer": "full stack developer",
+    "software engineer": "software engineer",
+    "software developer": "software engineer",
     "engenheiro de automacao": "automation engineer",
     "desenvolvedor de automacao": "automation developer",
     "desenvolvedor rpa": "rpa developer",
     "desenvolvedor backend": "backend developer",
     "desenvolvedor full stack": "full stack developer",
+    "engenheiro de software": "software engineer",
+    "desenvolvedor de software": "software engineer",
+    "desenvolvedor software": "software engineer",
+    "desenvolvedor a de software": "software engineer",
+    "engenheiro a de software": "software engineer",
 }
 
 _GENERIC_ENGINEERING_ROLE_PATTERNS: tuple[str, ...] = (
@@ -141,6 +179,7 @@ _TITLE_SPECIALIZATION_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
 _GENERIC_SOFTWARE_ROLE_TARGET_SCORES: dict[str, float] = {
     "backend developer": 0.56,
     "full stack developer": 0.6,
+    "software engineer": 0.72,
 }
 
 
@@ -375,7 +414,9 @@ def normalize_text(value: str | None) -> str:
 
     if value is None:
         return ""
-    lowered = value.lower()
+    normalized = unicodedata.normalize("NFKD", value)
+    ascii_text = "".join(char for char in normalized if not unicodedata.combining(char))
+    lowered = ascii_text.lower()
     collapsed = re.sub(r"[^a-z0-9+#]+", " ", lowered)
     return " ".join(collapsed.split())
 
@@ -567,6 +608,11 @@ def _infer_role_target_score_from_title(
     title_specializations: tuple[str, ...],
 ) -> float:
     """Infer role-family fit from generic engineering titles plus explicit stack cues."""
+
+    cross_family_fallbacks = _ROLE_TARGET_CROSS_FAMILY_FALLBACKS.get(canonical_target, ())
+    for pattern, score in cross_family_fallbacks:
+        if re.search(pattern, normalized_title):
+            return score
 
     if any(re.search(pattern, normalized_title) for pattern in _GENERIC_SOFTWARE_ROLE_PATTERNS):
         software_role_score = _GENERIC_SOFTWARE_ROLE_TARGET_SCORES.get(canonical_target)

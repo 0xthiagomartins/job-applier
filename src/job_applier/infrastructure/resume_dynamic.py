@@ -188,6 +188,14 @@ _ROLE_TARGET_PROFILE_KEYWORDS: dict[str, tuple[str, ...]] = {
         "react",
         "api",
     ),
+    "software engineer": (
+        "backend",
+        "api",
+        "python",
+        "javascript",
+        "typescript",
+        "full stack",
+    ),
 }
 
 _ROLE_TARGET_ALIAS_PATTERNS: dict[str, tuple[str, ...]] = {
@@ -211,6 +219,14 @@ _ROLE_TARGET_ALIAS_PATTERNS: dict[str, tuple[str, ...]] = {
         r"\bserver[\s\-]?side\b",
     ),
     "full stack developer": (
+        r"\bfull[\s\-]?stack\b",
+        r"\bfullstack\b",
+    ),
+    "software engineer": (
+        r"\bsoftware (engineer|developer)\b",
+        r"\bapplication(s)? (engineer|developer)\b",
+        r"\bbackend (engineer|developer)\b",
+        r"\bback[\s\-]?end (engineer|developer)\b",
         r"\bfull[\s\-]?stack\b",
         r"\bfullstack\b",
     ),
@@ -245,6 +261,10 @@ _ROLE_TARGET_ALIGNMENT_SENTENCES: dict[str, str] = {
         "Recent work spans product delivery across web applications, backend services, "
         "APIs, and operational workflows."
     ),
+    "software engineer": (
+        "Recent work spans software delivery across application services, APIs, "
+        "product features, and operational support."
+    ),
 }
 
 _ROLE_TARGET_SUMMARY_SCOPES: dict[str, str] = {
@@ -253,6 +273,7 @@ _ROLE_TARGET_SUMMARY_SCOPES: dict[str, str] = {
     "rpa developer": "process orchestration, workflow reliability, and business operations",
     "backend developer": "backend services, internal tooling, and production support",
     "full stack developer": "product delivery, backend services, and operational workflows",
+    "software engineer": "software delivery, application services, and operational support",
 }
 
 _EDITORIAL_BANNED_PHRASES: tuple[str, ...] = (
@@ -2952,6 +2973,7 @@ def _display_keyword_label(keyword: str) -> str:
         "frontend": "frontend",
         "full stack": "full stack",
         "full stack developer": "Full Stack Developer",
+        "software engineer": "Software Engineer",
         "gcp": "GCP",
         "internal tools": "internal tools",
         "java": "Java",

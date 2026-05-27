@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import random
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -109,6 +110,63 @@ _NON_COMPANY_SUBSTRING_TOKENS = (
     "show match details",
     "resume match",
 )
+
+_ROLE_TARGET_QUERY_VARIANTS: dict[str, tuple[str, ...]] = {
+    "automation engineer": (
+        "Automation Engineer",
+        "Automation Developer",
+        "AI Automation Engineer",
+        "Engenheiro de Automação",
+    ),
+    "automation developer": (
+        "Automation Developer",
+        "Automation Engineer",
+        "AI Automation Engineer",
+        "Desenvolvedor de Automação",
+    ),
+    "rpa developer": (
+        "RPA Developer",
+        "UiPath Developer",
+        "Robotic Process Automation",
+        "Desenvolvedor RPA",
+    ),
+    "backend developer": (
+        "Backend Developer",
+        "Backend Engineer",
+        "Back End Developer",
+        "Desenvolvedor Backend",
+    ),
+    "full stack developer": (
+        "Full Stack Developer",
+        "Full Stack Engineer",
+        "Full Stack Software Engineer",
+        "Desenvolvedor Full Stack",
+    ),
+    "software engineer": (
+        "Software Engineer",
+        "Software Developer",
+        "Application Developer",
+        "Engenheiro de Software",
+        "Desenvolvedor de Software",
+    ),
+}
+
+_ROLE_TARGET_CANONICAL_ALIASES: dict[str, str] = {
+    "automation engineer": "automation engineer",
+    "automation developer": "automation developer",
+    "rpa developer": "rpa developer",
+    "backend developer": "backend developer",
+    "full stack developer": "full stack developer",
+    "software engineer": "software engineer",
+    "software developer": "software engineer",
+    "engenheiro de automacao": "automation engineer",
+    "desenvolvedor de automacao": "automation developer",
+    "desenvolvedor rpa": "rpa developer",
+    "desenvolvedor backend": "backend developer",
+    "desenvolvedor full stack": "full stack developer",
+    "engenheiro de software": "software engineer",
+    "desenvolvedor de software": "software engineer",
+}
 
 
 class LinkedInSearchError(RuntimeError):
@@ -262,7 +320,7 @@ def build_search_campaign_criteria(
     return tuple(
         LinkedInSearchCriteria(
             keywords=role_targets,
-            keywords_text=role_target,
+            keywords_text=_build_role_target_query_text(role_target),
             active_role_target=role_target,
             location=settings.search.location,
             posted_within_hours=settings.search.posted_within_hours,
@@ -337,6 +395,30 @@ def _normalize_role_targets(keywords: tuple[str, ...]) -> tuple[str, ...]:
         seen.add(token)
         normalized.append(candidate)
     return tuple(normalized)
+
+
+def _build_role_target_query_text(role_target: str) -> str:
+    normalized_target = _normalize_role_target_token(role_target)
+    canonical_target = _ROLE_TARGET_CANONICAL_ALIASES.get(normalized_target, normalized_target)
+    variants = _ROLE_TARGET_QUERY_VARIANTS.get(canonical_target)
+    if not variants:
+        return role_target
+    ordered_variants: list[str] = []
+    seen: set[str] = set()
+    for candidate in (role_target, *variants):
+        token = _normalize_role_target_token(candidate)
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        ordered_variants.append(candidate)
+    return " ".join(ordered_variants[:3]).strip() or role_target
+
+
+def _normalize_role_target_token(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    ascii_text = "".join(char for char in normalized if not unicodedata.combining(char))
+    collapsed = re.sub(r"[^a-z0-9]+", " ", ascii_text.lower())
+    return " ".join(collapsed.split())
 
 
 def infer_workplace_type(text: str) -> WorkplaceType | None:
