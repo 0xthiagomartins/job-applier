@@ -164,6 +164,20 @@ class LinkedInCollectedJob:
     metadata_text: str = ""
     workplace_type: WorkplaceType | None = None
     seniority: SeniorityLevel | None = None
+    detail_quality_score: float = 0.0
+    detail_description_score: float = 0.0
+    detail_quality_source: str = "results_listing"
+    detail_quality_signals: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class JobDetailQualityAssessment:
+    """Quality assessment for one merged LinkedIn job detail payload."""
+
+    score: float
+    description_score: float
+    source: str
+    signals: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,6 +443,147 @@ def _looks_like_noisy_listing_card(listing: LinkedInCollectedJob) -> bool:
     return False
 
 
+def _normalize_quality_text(value: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9+#]+", " ", value.lower()).split())
+
+
+def _word_count(text: str) -> int:
+    normalized = _normalize_quality_text(text)
+    if not normalized:
+        return 0
+    return len(normalized.split())
+
+
+def _overlap_ratio(left: str, right: str) -> float:
+    left_tokens = set(_normalize_quality_text(left).split())
+    right_tokens = set(_normalize_quality_text(right).split())
+    if not left_tokens or not right_tokens:
+        return 0.0
+    overlap = left_tokens & right_tokens
+    return len(overlap) / max(1, min(len(left_tokens), len(right_tokens)))
+
+
+def _description_looks_sparse_or_noisy(
+    description: str,
+    *,
+    title: str,
+    company_name: str,
+) -> bool:
+    normalized_description = _collapse_text(description)
+    if not normalized_description:
+        return True
+    description_word_count = _word_count(normalized_description)
+    if description_word_count < 10:
+        return True
+    title_company_text = " ".join(part for part in (title, company_name) if part)
+    if (
+        description_word_count < 25
+        and _overlap_ratio(normalized_description, title_company_text) >= 0.7
+    ):
+        return True
+    normalized_lower = normalized_description.lower()
+    noisy_phrase_hits = sum(
+        1 for token in _NON_COMPANY_SUBSTRING_TOKENS if token in normalized_lower
+    )
+    if noisy_phrase_hits >= 2 and description_word_count < 40:
+        return True
+    return False
+
+
+def assess_job_detail_quality(
+    listing: LinkedInCollectedJob,
+    detail_payload: dict[str, object],
+    merged_listing: LinkedInCollectedJob,
+) -> JobDetailQualityAssessment:
+    """Return one reusable quality score for merged job-detail context."""
+
+    detail_source = _collapse_text(detail_payload.get("detail_source")) or "detail_dom"
+    title = _collapse_text(merged_listing.title)
+    company_name = _collapse_text(merged_listing.company_name)
+    location = _collapse_text(merged_listing.location)
+    description = _collapse_text(merged_listing.description_raw)
+    metadata_text = _collapse_text(merged_listing.metadata_text)
+    description_word_count = _word_count(description)
+    description_sparse_or_noisy = _description_looks_sparse_or_noisy(
+        description,
+        title=title,
+        company_name=company_name,
+    )
+
+    score = 0.1
+    description_score = 0.0
+    signals: list[str] = [f"detail_source:{detail_source}"]
+
+    if title and not _looks_like_placeholder_label(title):
+        score += 0.15
+        signals.append("title_present")
+    else:
+        signals.append("title_placeholder")
+
+    if company_name and not _looks_like_non_company_line(company_name):
+        score += 0.15
+        signals.append("company_present")
+    else:
+        signals.append("company_noisy")
+
+    if location:
+        score += 0.1
+        signals.append("location_present")
+    else:
+        signals.append("location_missing")
+
+    if metadata_text:
+        score += 0.05
+        signals.append("metadata_present")
+
+    if isinstance(detail_payload.get("easy_apply"), bool):
+        score += 0.05
+        signals.append("easy_apply_explicit")
+    else:
+        signals.append("easy_apply_inherited")
+
+    if _collapse_text(detail_payload.get("structured_description")):
+        score += 0.05
+        signals.append("structured_description_present")
+    if _collapse_text(detail_payload.get("structured_company_name")):
+        score += 0.05
+        signals.append("structured_company_present")
+
+    if not description_sparse_or_noisy:
+        if description_word_count >= 60:
+            description_score = 1.0
+            score += 0.3
+            signals.append("description_rich")
+        elif description_word_count >= 30:
+            description_score = 0.75
+            score += 0.22
+            signals.append("description_usable")
+        else:
+            description_score = 0.45
+            score += 0.1
+            signals.append("description_short")
+    else:
+        description_score = 0.15 if description else 0.0
+        signals.append("description_sparse_or_noisy")
+
+    if detail_payload.get("_semantic_repair_applied") is True:
+        score += 0.1
+        signals.append("stagehand_detail_repair_applied")
+        detail_source = "detail_stagehand"
+
+    if detail_source == "listing_fallback":
+        score = min(score, 0.35)
+        description_score = min(description_score, 0.2)
+        signals.append("listing_fallback_only")
+
+    return JobDetailQualityAssessment(
+        score=round(min(max(score, 0.0), 1.0), 4),
+        description_score=round(min(max(description_score, 0.0), 1.0), 4),
+        source=detail_source,
+        signals=tuple(dict.fromkeys(signals)),
+    )
+
+
 def merge_job_detail_payload(
     listing: LinkedInCollectedJob,
     detail_payload: dict[str, object],
@@ -537,7 +692,7 @@ def merge_job_detail_payload(
     detail_easy_apply = detail_payload.get("easy_apply")
     easy_apply = detail_easy_apply if isinstance(detail_easy_apply, bool) else listing.easy_apply
 
-    return LinkedInCollectedJob(
+    merged_listing = LinkedInCollectedJob(
         external_job_id=listing.external_job_id,
         url=listing.url,
         title=title,
@@ -548,6 +703,14 @@ def merge_job_detail_payload(
         metadata_text=f"{listing.metadata_text} {detail_text}".strip(),
         workplace_type=infer_workplace_type(detail_text) or listing.workplace_type,
         seniority=infer_seniority(detail_text) or listing.seniority,
+    )
+    quality = assess_job_detail_quality(listing, detail_payload, merged_listing)
+    return replace(
+        merged_listing,
+        detail_quality_score=quality.score,
+        detail_description_score=quality.description_score,
+        detail_quality_source=quality.source,
+        detail_quality_signals=quality.signals,
     )
 
 
@@ -577,6 +740,10 @@ class LinkedInJobParser:
             seniority=payload.seniority or infer_seniority(metadata_text),
             easy_apply=payload.easy_apply,
             description_raw=description,
+            detail_quality_score=payload.detail_quality_score,
+            detail_description_score=payload.detail_description_score,
+            detail_quality_source=payload.detail_quality_source,
+            detail_quality_signals=payload.detail_quality_signals,
             captured_at=datetime.now(UTC),
         )
 
@@ -673,6 +840,9 @@ class LinkedInJobFetcher(JobFetcher):
                         "company_name": saved_posting.company_name,
                         "title": saved_posting.title,
                         "easy_apply": saved_posting.easy_apply,
+                        "detail_quality_score": saved_posting.detail_quality_score,
+                        "detail_description_score": saved_posting.detail_description_score,
+                        "detail_quality_source": saved_posting.detail_quality_source,
                         "active_role_target": criteria.active_role_target,
                     },
                 )
@@ -801,6 +971,9 @@ class LinkedInJobFetcher(JobFetcher):
                         "company_name": saved_posting.company_name,
                         "title": saved_posting.title,
                         "easy_apply": saved_posting.easy_apply,
+                        "detail_quality_score": saved_posting.detail_quality_score,
+                        "detail_description_score": saved_posting.detail_description_score,
+                        "detail_quality_source": saved_posting.detail_quality_source,
                         "incremental": True,
                         "active_role_target": active_role_target,
                     },
@@ -2261,6 +2434,7 @@ class PlaywrightLinkedInJobsClient:
                   ].filter(Boolean);
 
                   return {
+                    detail_source: "detail_dom",
                     title: title || documentTitle,
                     structured_title: structuredJob.structured_title,
                     title_candidates: [title, documentTitle, ...topCardLines.slice(0, 2)],
@@ -2288,21 +2462,24 @@ class PlaywrightLinkedInJobsClient:
                 detail_payload=detail_payload,
                 prefer_stagehand=prefer_stagehand,
             )
-            append_timeline_event(
-                "linkedin_job_detail_loaded",
-                {
-                    "external_job_id": listing.external_job_id,
-                    "title": str(detail_payload.get("title") or "").strip() or listing.title,
-                    "company_name": str(detail_payload.get("company_name") or "").strip()
-                    or listing.company_name,
-                    "url": listing.url,
-                    "description_length": len(str(detail_payload["description_raw"] or "")),
-                },
-            )
         finally:
             await detail_page.close()
-
-        return merge_job_detail_payload(listing, detail_payload)
+        merged_listing = merge_job_detail_payload(listing, detail_payload)
+        append_timeline_event(
+            "linkedin_job_detail_loaded",
+            {
+                "external_job_id": listing.external_job_id,
+                "title": merged_listing.title,
+                "company_name": merged_listing.company_name,
+                "url": listing.url,
+                "description_length": len(merged_listing.description_raw),
+                "detail_quality_score": merged_listing.detail_quality_score,
+                "detail_description_score": merged_listing.detail_description_score,
+                "detail_quality_source": merged_listing.detail_quality_source,
+                "detail_quality_signals": list(merged_listing.detail_quality_signals),
+            },
+        )
+        return merged_listing
 
     async def _load_job_details_with_resilience(
         self,
@@ -2369,7 +2546,15 @@ class PlaywrightLinkedInJobsClient:
                 "message": last_error,
             },
         )
-        return listing
+        return replace(
+            listing,
+            detail_quality_score=min(listing.detail_quality_score, 0.25),
+            detail_description_score=min(listing.detail_description_score, 0.2),
+            detail_quality_source="listing_fallback",
+            detail_quality_signals=tuple(
+                dict.fromkeys((*listing.detail_quality_signals, "detail_load_failed"))
+            ),
+        )
 
     async def _maybe_repair_listing_cards_with_stagehand(
         self,
@@ -2610,6 +2795,8 @@ class PlaywrightLinkedInJobsClient:
         merged_payload = {
             **detail_payload,
             **extraction.to_detail_payload(),
+            "detail_source": "detail_stagehand",
+            "_semantic_repair_applied": True,
         }
         append_output_jsonl(
             "run.log",
@@ -2644,17 +2831,9 @@ class PlaywrightLinkedInJobsClient:
         detail_payload: dict[str, object],
     ) -> bool:
         merged_preview = merge_job_detail_payload(listing, detail_payload)
-        company_name = _collapse_text(merged_preview.company_name)
-        title = _collapse_text(merged_preview.title)
-        location = _collapse_text(merged_preview.location)
-        description = _collapse_text(merged_preview.description_raw)
-        if _looks_like_placeholder_label(title):
+        if merged_preview.detail_quality_score < 0.6:
             return True
-        if not company_name or _looks_like_non_company_line(company_name):
-            return True
-        if not location:
-            return True
-        return len(description) < 80
+        return merged_preview.detail_description_score < 0.45
 
     def _build_search_surface_assessment_from_stagehand(
         self,

@@ -67,6 +67,10 @@ class JobPosting:
     seniority: SeniorityLevel | None = None
     easy_apply: bool = True
     description_hash: str = ""
+    detail_quality_score: float = 0.0
+    detail_description_score: float = 0.0
+    detail_quality_source: str = "unknown"
+    detail_quality_signals: tuple[str, ...] = ()
     captured_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:

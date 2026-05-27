@@ -18,6 +18,8 @@ TITLE_WEIGHT = 0.35
 STACK_WEIGHT = 0.30
 LOCATION_WEIGHT = 0.20
 POSITIVE_KEYWORD_WEIGHT = 0.15
+DETAIL_QUALITY_FOR_DESCRIPTION_MATCHING = 0.55
+DETAIL_DESCRIPTION_CONTEXT_THRESHOLD = 0.45
 
 _ROLE_TARGET_ALIAS_PATTERNS: dict[str, tuple[str, ...]] = {
     "automation engineer": (
@@ -182,7 +184,7 @@ class RuleBasedJobScorer(JobScorer):
     def compute(self, settings: UserAgentSettings, posting: JobPosting) -> ScoreComputation:
         """Return the deterministic score computation for one vacancy."""
 
-        searchable_text = normalize_text(
+        full_searchable_text = normalize_text(
             " ".join(
                 filter(
                     None,
@@ -194,6 +196,10 @@ class RuleBasedJobScorer(JobScorer):
                     ),
                 ),
             ),
+        )
+        searchable_text = _searchable_job_context(
+            posting,
+            full_searchable_text=full_searchable_text,
         )
         normalized_title = normalize_text(posting.title)
         threshold = settings.search.minimum_score_threshold
@@ -317,7 +323,11 @@ class RuleBasedJobScorer(JobScorer):
             f"stack={stack_component:.2f}",
             f"location={location_component:.2f}",
             f"positive={positive_component:.2f}",
+            f"detail_quality={posting.detail_quality_score:.2f}",
+            f"detail_description={posting.detail_description_score:.2f}",
         ]
+        if posting.detail_description_score < DETAIL_DESCRIPTION_CONTEXT_THRESHOLD:
+            reason_parts.append("description context downweighted due to sparse detail extraction")
         if positive_matches:
             reason_parts.append(f"positive matches: {', '.join(positive_matches)}")
 
@@ -368,6 +378,30 @@ def match_terms(terms: tuple[str, ...], normalized_text: str) -> tuple[str, ...]
         if normalized_term in normalized_text and normalized_term not in matches:
             matches.append(normalized_term)
     return tuple(matches)
+
+
+def _searchable_job_context(
+    posting: JobPosting,
+    *,
+    full_searchable_text: str,
+) -> str:
+    if (
+        posting.detail_quality_score >= DETAIL_QUALITY_FOR_DESCRIPTION_MATCHING
+        and posting.detail_description_score >= DETAIL_DESCRIPTION_CONTEXT_THRESHOLD
+    ):
+        return full_searchable_text
+    return normalize_text(
+        " ".join(
+            filter(
+                None,
+                (
+                    posting.title,
+                    posting.company_name,
+                    posting.location,
+                ),
+            ),
+        ),
+    )
 
 
 def match_role_targets(

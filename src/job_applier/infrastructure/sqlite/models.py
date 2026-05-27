@@ -10,6 +10,7 @@ from sqlalchemy import (
     JSON,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -51,6 +52,18 @@ class JobPostingModel(Base):
     easy_apply: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     description_raw: Mapped[str] = mapped_column(Text, nullable=False)
     description_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    detail_quality_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    detail_description_score: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=0.0,
+    )
+    detail_quality_source: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="unknown",
+    )
+    detail_quality_signals: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     submissions: Mapped[list[ApplicationSubmissionModel]] = relationship(

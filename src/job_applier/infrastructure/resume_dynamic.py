@@ -1111,7 +1111,14 @@ class OhMyCvDynamicResumeBuilder:
                 "title": posting.title,
                 "company_name": posting.company_name,
                 "location": posting.location or settings.search.location,
-                "description_raw": posting.description_raw[:20_000],
+                "description_raw": posting.description_raw[:20_000]
+                if _posting_has_usable_detail_context(posting)
+                else "",
+                "detail_quality_score": posting.detail_quality_score,
+                "detail_description_score": posting.detail_description_score,
+                "detail_quality_source": posting.detail_quality_source,
+                "detail_quality_signals": list(posting.detail_quality_signals),
+                "description_context_available": _posting_has_usable_detail_context(posting),
                 "positive_filters": list(settings.profile.positive_filters),
                 "role_targets": list(settings.search.keywords),
                 "matched_role_target": matched_role_target,
@@ -2384,7 +2391,17 @@ class OhMyCvDynamicResumeBuilder:
 
 
 def _extract_posting_keywords(posting: JobPosting) -> tuple[str, ...]:
-    return _extract_keyword_labels(f"{posting.title}\n{posting.description_raw}")
+    return _extract_keyword_labels(_resume_job_context_text(posting))
+
+
+def _posting_has_usable_detail_context(posting: JobPosting) -> bool:
+    return posting.detail_quality_score >= 0.55 and posting.detail_description_score >= 0.45
+
+
+def _resume_job_context_text(posting: JobPosting) -> str:
+    if _posting_has_usable_detail_context(posting):
+        return f"{posting.title}\n{posting.description_raw}"
+    return posting.title
 
 
 def _extract_keyword_labels(text: str) -> tuple[str, ...]:

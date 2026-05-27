@@ -100,6 +100,10 @@ def _posting_to_model(entity: JobPosting) -> JobPostingModel:
         easy_apply=entity.easy_apply,
         description_raw=entity.description_raw,
         description_hash=entity.description_hash,
+        detail_quality_score=entity.detail_quality_score,
+        detail_description_score=entity.detail_description_score,
+        detail_quality_source=entity.detail_quality_source,
+        detail_quality_signals=list(entity.detail_quality_signals),
         captured_at=entity.captured_at,
     )
 
@@ -118,6 +122,10 @@ def _posting_from_model(model: JobPostingModel) -> JobPosting:
         easy_apply=model.easy_apply,
         description_raw=model.description_raw,
         description_hash=model.description_hash,
+        detail_quality_score=model.detail_quality_score,
+        detail_description_score=model.detail_description_score,
+        detail_quality_source=model.detail_quality_source,
+        detail_quality_signals=tuple(model.detail_quality_signals),
         captured_at=_db_to_utc(model.captured_at),
     )
 

@@ -47,6 +47,10 @@ class JobPostingCreate(BaseModel):
     seniority: SeniorityLevel | None = None
     easy_apply: bool = True
     description_hash: str | None = None
+    detail_quality_score: float = 0.0
+    detail_description_score: float = 0.0
+    detail_quality_source: str = "unknown"
+    detail_quality_signals: tuple[str, ...] = ()
     captured_at: datetime | None = None
 
 
@@ -63,6 +67,10 @@ class JobPostingRead(ReadSchema):
     easy_apply: bool
     description_raw: str
     description_hash: str
+    detail_quality_score: float
+    detail_description_score: float
+    detail_quality_source: str
+    detail_quality_signals: tuple[str, ...]
     captured_at: datetime
 
 
