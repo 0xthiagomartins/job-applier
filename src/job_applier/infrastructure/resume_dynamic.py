@@ -37,6 +37,7 @@ from job_applier.infrastructure.language_support import (
     display_name_for_language,
     localized_field_label,
     localized_section_label,
+    localized_skill_category_label,
 )
 from job_applier.resume_theme import DEFAULT_OH_MY_CV_RESUME_CSS
 from job_applier.settings import RuntimeSettings
@@ -846,6 +847,7 @@ class OhMyCvDynamicResumeBuilder:
             resume_snapshot=resume_snapshot,
             adaptation_plan=adaptation_plan,
             translated_texts=translated_texts,
+            target_language=target_language,
         )
         return localized_snapshot, localized_plan, True
 
@@ -916,8 +918,11 @@ class OhMyCvDynamicResumeBuilder:
                 "You translate structured resume text from one language to another while "
                 "preserving facts exactly. Keep employers, institutions, URLs, technology names, "
                 "acronyms, dates, and certifications faithful to the source. Translate natural "
-                "language into the target_language_name only. Do not add or remove items. Return "
-                "only valid JSON matching the schema."
+                "language into the target_language_name only. Translate mixed label/value lines "
+                "too, such as skill category labels before a colon, while preserving the actual "
+                "technology tokens after the colon. Translate degree names when they are natural "
+                "language phrases, but do not invent equivalencies or new credentials. Do not add "
+                "or remove items. Return only valid JSON matching the schema."
             ),
             prompt_payload=payload,
             schema_name="resume_translation",
@@ -967,6 +972,7 @@ class OhMyCvDynamicResumeBuilder:
         resume_snapshot: ResumeSourceSnapshot,
         adaptation_plan: ResumeAdaptationPlan,
         translated_texts: dict[str, str],
+        target_language: SupportedLanguage,
     ) -> tuple[ResumeSourceSnapshot, ResumeAdaptationPlan]:
         localized_plan = replace(
             adaptation_plan,
@@ -1012,7 +1018,10 @@ class OhMyCvDynamicResumeBuilder:
             for index, education in enumerate(resume_snapshot.education_entries)
         )
         localized_skill_lines = tuple(
-            translated_texts.get(f"skill_line_{index}", skill_line)
+            self._localize_skill_line(
+                translated_texts.get(f"skill_line_{index}", skill_line),
+                target_language=target_language,
+            )
             for index, skill_line in enumerate(resume_snapshot.skill_lines)
         )
         localized_additional_sections = tuple(
@@ -1039,6 +1048,21 @@ class OhMyCvDynamicResumeBuilder:
             additional_sections=localized_additional_sections,
         )
         return localized_snapshot, localized_plan
+
+    def _localize_skill_line(
+        self,
+        skill_line: str,
+        *,
+        target_language: SupportedLanguage,
+    ) -> str:
+        prefix, separator, suffix = skill_line.partition(":")
+        if not separator:
+            return skill_line
+        localized_prefix = localized_skill_category_label(prefix, target_language)
+        normalized_suffix = suffix.strip()
+        if not normalized_suffix:
+            return localized_prefix
+        return f"{localized_prefix}: {normalized_suffix}"
 
     def _build_prompt_payload(
         self,

@@ -46,6 +46,27 @@ _FIELD_LABELS: dict[SupportedLanguage, dict[str, str]] = {
     },
 }
 
+_SKILL_CATEGORY_LABELS: dict[SupportedLanguage, dict[str, str]] = {
+    SupportedLanguage.ENGLISH: {
+        "core languages": "Core Languages",
+        "full stack & backend": "Full Stack & Backend",
+        "engineering practices": "Engineering Practices",
+        "applied ai & automation": "Applied AI & Automation",
+        "tools & platforms": "Tools & Platforms",
+        "cloud & platforms": "Cloud & Platforms",
+        "interests": "Interests",
+    },
+    SupportedLanguage.PORTUGUESE: {
+        "core languages": "Linguagens Principais",
+        "full stack & backend": "Full Stack e Backend",
+        "engineering practices": "Práticas de Engenharia",
+        "applied ai & automation": "IA Aplicada e Automação",
+        "tools & platforms": "Ferramentas e Plataformas",
+        "cloud & platforms": "Nuvem e Plataformas",
+        "interests": "Interesses",
+    },
+}
+
 _SECTION_TITLE_ALIASES: dict[str, str] = {
     "summary": "summary",
     "professional summary": "summary",
@@ -140,6 +161,14 @@ def localized_field_label(label_key: str, language: SupportedLanguage) -> str:
 
     labels = _FIELD_LABELS.get(language, _FIELD_LABELS[SupportedLanguage.ENGLISH])
     return labels.get(label_key, label_key.replace("_", " ").title())
+
+
+def localized_skill_category_label(raw_label: str, language: SupportedLanguage) -> str:
+    """Return one localized skill bucket label when the category is known."""
+
+    normalized = _normalize_language_text(raw_label)
+    labels = _SKILL_CATEGORY_LABELS.get(language, _SKILL_CATEGORY_LABELS[SupportedLanguage.ENGLISH])
+    return labels.get(normalized, raw_label.strip())
 
 
 def canonical_resume_section_title(raw_title: str) -> str | None:
