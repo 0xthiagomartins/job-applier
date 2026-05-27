@@ -68,6 +68,7 @@ export function ProfileForm(): React.JSX.Element {
     availability: "",
     default_responses: "",
     resume_mode: "static",
+    preferred_language: "en",
     resume_css: "",
   });
   const [panelState, setPanelState] = useState<PanelState | null>(null);
@@ -102,6 +103,7 @@ export function ProfileForm(): React.JSX.Element {
             .map(([key, value]) => `${key}=${value}`)
             .join("\n"),
           resume_mode: state.profile.resume_mode ?? "static",
+          preferred_language: state.profile.preferred_language ?? "en",
           resume_css: state.profile.resume_css ?? "",
         });
         setCapabilityOverrides(state.profile.capability_overrides ?? {});
@@ -299,6 +301,19 @@ export function ProfileForm(): React.JSX.Element {
               <option value="dynamic">Dynamic: tailor a CV variant per matched vacancy</option>
             </select>
           </Field>
+          <Field label="Default content language">
+            <select
+              className="flex h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              value={form.preferred_language}
+              onChange={(event) => updateField("preferred_language", event.target.value)}
+            >
+              {(panelState?.options.supported_languages ?? ["en", "pt"]).map((language) => (
+                <option key={language} value={language}>
+                  {language === "pt" ? "Portuguese" : "English"}
+                </option>
+              ))}
+            </select>
+          </Field>
           <Field label="Resume CSS override">
             <Textarea
               placeholder="#resume-preview h2 { color: #4f8d34; }"
@@ -318,6 +333,10 @@ export function ProfileForm(): React.JSX.Element {
               These ranges are inferred from the base CV and used for screening answers like
               years of experience. Exact values from “Experience by stack” still win when both
               exist.
+            </p>
+            <p className="text-sm text-muted-foreground">
+              Dynamic resumes default to this language when the job language is weak or ambiguous.
+              Static resumes always use the uploaded file unchanged.
             </p>
           </div>
           {panelState?.computed.capability_profile ? (

@@ -61,7 +61,9 @@ from job_applier.domain.enums import (
     QuestionType,
     ResumeMode,
     SubmissionStatus,
+    SupportedLanguage,
 )
+from job_applier.infrastructure.language_support import detect_job_posting_language
 from job_applier.infrastructure.linkedin.auth import (
     LinkedInAuthError,
     LinkedInCredentials,
@@ -129,6 +131,7 @@ class EasyApplyExecutionResult:
     started_at: datetime
     status: SubmissionStatus
     resume_mode: ResumeMode = ResumeMode.STATIC
+    target_language: SupportedLanguage = SupportedLanguage.ENGLISH
     matched_role_target: str | None = None
     matched_specializations: tuple[str, ...] = ()
     notes: str | None = None
@@ -167,6 +170,7 @@ class PreparedSubmissionCv:
     path: Path
     cv_version: str
     resume_mode: ResumeMode = ResumeMode.STATIC
+    target_language: SupportedLanguage = SupportedLanguage.ENGLISH
     matched_role_target: str | None = None
     matched_specializations: tuple[str, ...] = ()
     artifacts: tuple[ArtifactSnapshot, ...] = ()
@@ -384,6 +388,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
         resume_mode = settings.profile.resume_mode
         matched_role_target = scored_job.matched_role_target
         matched_specializations = scored_job.matched_specializations
+        target_language = detect_job_posting_language(
+            posting,
+            default_language=settings.profile.preferred_language,
+        ).language
 
         try:
             with bind_submission_context(submission_id):
@@ -784,6 +792,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 )
                 if prepared_submission_cv is not None:
                     resume_mode = prepared_submission_cv.resume_mode
+                    target_language = prepared_submission_cv.target_language
                     matched_role_target = prepared_submission_cv.matched_role_target
                     matched_specializations = prepared_submission_cv.matched_specializations
                     artifacts.extend(prepared_submission_cv.artifacts)
@@ -922,6 +931,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             started_at=started_at,
                             status=SubmissionStatus.FAILED,
                             resume_mode=resume_mode,
+                            target_language=target_language,
                             matched_role_target=matched_role_target,
                             matched_specializations=matched_specializations,
                             notes=notes,
@@ -1070,6 +1080,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                 started_at=started_at,
                                 status=SubmissionStatus.SUBMITTED,
                                 resume_mode=resume_mode,
+                                target_language=target_language,
                                 matched_role_target=matched_role_target,
                                 matched_specializations=matched_specializations,
                                 notes=outcome_notes
@@ -1106,6 +1117,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             started_at=started_at,
                             status=SubmissionStatus.FAILED,
                             resume_mode=resume_mode,
+                            target_language=target_language,
                             matched_role_target=matched_role_target,
                             matched_specializations=matched_specializations,
                             notes=outcome_notes or "LinkedIn did not confirm the application.",
@@ -1177,6 +1189,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             started_at=started_at,
                             status=SubmissionStatus.FAILED,
                             resume_mode=resume_mode,
+                            target_language=target_language,
                             matched_role_target=matched_role_target,
                             matched_specializations=matched_specializations,
                             notes=remediation_notes or assessment_notes,
@@ -1206,6 +1219,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     started_at=started_at,
                     status=SubmissionStatus.FAILED,
                     resume_mode=resume_mode,
+                    target_language=target_language,
                     matched_role_target=matched_role_target,
                     matched_specializations=matched_specializations,
                     notes="LinkedIn Easy Apply exceeded the maximum number of steps.",
@@ -1255,6 +1269,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 started_at=started_at,
                 status=SubmissionStatus.FAILED,
                 resume_mode=resume_mode,
+                target_language=target_language,
                 matched_role_target=matched_role_target,
                 matched_specializations=matched_specializations,
                 notes=str(exc),
@@ -5033,6 +5048,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 "source_cv_path": str(prepared.source_cv_path),
                 "submission_cv_path": str(prepared.submission_cv_path),
                 "resume_mode": prepared.resume_mode.value,
+                "target_language": prepared.target_language.value,
                 "matched_role_target": prepared.matched_role_target,
                 "matched_specializations": list(prepared.matched_specializations),
                 "cv_version": prepared.cv_version,
@@ -5044,6 +5060,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
             path=prepared.submission_cv_path,
             cv_version=prepared.cv_version,
             resume_mode=prepared.resume_mode,
+            target_language=prepared.target_language,
             matched_role_target=prepared.matched_role_target,
             matched_specializations=prepared.matched_specializations,
             artifacts=artifacts,
@@ -5246,6 +5263,7 @@ class LinkedInEasyApplySubmitter(JobSubmitter):
             status=result.status,
             started_at=result.started_at,
             resume_mode=result.resume_mode,
+            target_language=result.target_language,
             matched_role_target=result.matched_role_target,
             matched_specializations=result.matched_specializations,
             cv_version=result.cv_version or settings.profile.cv_filename,
@@ -5268,6 +5286,7 @@ class LinkedInEasyApplySubmitter(JobSubmitter):
             status=SubmissionStatus.PENDING,
             started_at=result.started_at,
             resume_mode=result.resume_mode,
+            target_language=result.target_language,
             matched_role_target=result.matched_role_target,
             matched_specializations=result.matched_specializations,
             cv_version=result.cv_version or settings.profile.cv_filename,

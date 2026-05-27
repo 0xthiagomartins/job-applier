@@ -84,6 +84,7 @@ class ApplicationSubmissionModel(Base):
         Index("ix_application_submissions_submitted_at", "submitted_at"),
         Index("ix_application_submissions_execution_origin", "execution_origin"),
         Index("ix_application_submissions_resume_mode", "resume_mode"),
+        Index("ix_application_submissions_target_language", "target_language"),
         Index("ix_application_submissions_matched_role_target", "matched_role_target"),
     )
 
@@ -97,6 +98,7 @@ class ApplicationSubmissionModel(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resume_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="static")
+    target_language: Mapped[str] = mapped_column(String(8), nullable=False, default="en")
     matched_role_target: Mapped[str | None] = mapped_column(String(255))
     matched_specializations: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     cv_version: Mapped[str | None] = mapped_column(String(255))

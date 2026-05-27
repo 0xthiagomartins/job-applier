@@ -14,7 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -23,10 +23,20 @@ import yaml  # type: ignore[import-untyped]
 
 from job_applier.application.config import UserAgentSettings
 from job_applier.domain.entities import JobPosting
-from job_applier.domain.enums import ResumeMode
+from job_applier.domain.enums import ResumeMode, SupportedLanguage
 from job_applier.infrastructure.candidate_capabilities import (
     build_candidate_capability_profile,
     capability_profile_to_payload,
+)
+from job_applier.infrastructure.language_support import (
+    LanguageDetectionResult,
+    canonical_resume_section_title,
+    combine_language_signals,
+    detect_job_posting_language,
+    detect_text_language,
+    display_name_for_language,
+    localized_field_label,
+    localized_section_label,
 )
 from job_applier.resume_theme import DEFAULT_OH_MY_CV_RESUME_CSS
 from job_applier.settings import RuntimeSettings
@@ -75,6 +85,26 @@ _RESUME_ADAPTATION_SCHEMA: dict[str, object] = {
         "experience_focus",
         "adaptation_summary",
     ],
+    "additionalProperties": False,
+}
+
+_RESUME_TRANSLATION_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "ref": {"type": "string", "minLength": 1},
+                    "text": {"type": "string", "minLength": 1},
+                },
+                "required": ["ref", "text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["items"],
     "additionalProperties": False,
 }
 
@@ -297,12 +327,24 @@ class DynamicResumeBuildResult:
     submission_cv_path: Path
     cv_version: str
     resume_mode: ResumeMode = ResumeMode.STATIC
+    target_language: SupportedLanguage = SupportedLanguage.ENGLISH
     matched_role_target: str | None = None
     matched_specializations: tuple[str, ...] = ()
     markdown_path: Path | None = None
     css_path: Path | None = None
     used_dynamic_variant: bool = False
     notes: str | None = None
+    source_resume_language: SupportedLanguage = SupportedLanguage.ENGLISH
+
+
+@dataclass(frozen=True, slots=True)
+class TailoredResumeMarkdownResult:
+    """Rendered markdown plus language metadata for one tailored resume."""
+
+    markdown: str
+    target_language: SupportedLanguage
+    source_resume_language: SupportedLanguage
+    language_alignment_satisfied: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,6 +455,10 @@ class OhMyCvDynamicResumeBuilder:
         source_cv_path = _existing_path(settings.profile.cv_path)
         if source_cv_path is None:
             return None
+        target_language_signal = self._detect_target_resume_language(
+            settings=settings,
+            posting=posting,
+        )
         base_copy = self._copy_source_cv(
             source_cv_path=source_cv_path,
             run_dir=run_dir,
@@ -426,9 +472,11 @@ class OhMyCvDynamicResumeBuilder:
                 submission_cv_path=base_copy,
                 cv_version=base_copy.name,
                 resume_mode=ResumeMode.STATIC,
+                target_language=target_language_signal.language,
                 matched_role_target=matched_role_target,
                 matched_specializations=matched_specializations,
                 notes="static_resume_mode_selected",
+                source_resume_language=settings.profile.preferred_language,
             )
         if not self._runtime_settings.resume_dynamic_enabled:
             return DynamicResumeBuildResult(
@@ -436,9 +484,11 @@ class OhMyCvDynamicResumeBuilder:
                 submission_cv_path=base_copy,
                 cv_version=base_copy.name,
                 resume_mode=requested_resume_mode,
+                target_language=target_language_signal.language,
                 matched_role_target=matched_role_target,
                 matched_specializations=matched_specializations,
                 notes="dynamic_resume_runtime_disabled",
+                source_resume_language=settings.profile.preferred_language,
             )
 
         resume_text = self._extract_resume_text(source_cv_path)
@@ -446,23 +496,44 @@ class OhMyCvDynamicResumeBuilder:
             settings=settings,
             resume_text=resume_text,
         )
-        resume_markdown = self._build_tailored_markdown(
+        source_language_signal = self._detect_resume_source_language(
+            settings=settings,
+            resume_text=resume_text,
+            resume_snapshot=resume_snapshot,
+        )
+        resume_markdown_result = self._build_tailored_markdown(
             settings=settings,
             posting=posting,
             matched_role_target=matched_role_target,
             matched_specializations=matched_specializations,
             resume_text=resume_text,
             resume_snapshot=resume_snapshot,
+            source_language=source_language_signal.language,
+            target_language=target_language_signal.language,
         )
-        if resume_markdown is None:
+        if resume_markdown_result is None:
             return DynamicResumeBuildResult(
                 source_cv_path=source_cv_path,
                 submission_cv_path=base_copy,
                 cv_version=base_copy.name,
                 resume_mode=requested_resume_mode,
+                target_language=target_language_signal.language,
                 matched_role_target=matched_role_target,
                 matched_specializations=matched_specializations,
                 notes="dynamic_resume_markdown_generation_failed",
+                source_resume_language=source_language_signal.language,
+            )
+        if not resume_markdown_result.language_alignment_satisfied:
+            return DynamicResumeBuildResult(
+                source_cv_path=source_cv_path,
+                submission_cv_path=base_copy,
+                cv_version=base_copy.name,
+                resume_mode=requested_resume_mode,
+                target_language=resume_markdown_result.target_language,
+                matched_role_target=matched_role_target,
+                matched_specializations=matched_specializations,
+                notes="dynamic_resume_language_alignment_unavailable",
+                source_resume_language=resume_markdown_result.source_resume_language,
             )
 
         variant_dir = run_dir / "dynamic-resume"
@@ -470,7 +541,7 @@ class OhMyCvDynamicResumeBuilder:
         slug = _slugify(posting.title) or "job"
         token = submission_id.hex[:8]
         markdown_path = variant_dir / f"{token}-{slug}-oh-my-cv.md"
-        markdown_path.write_text(resume_markdown, encoding="utf-8")
+        markdown_path.write_text(resume_markdown_result.markdown, encoding="utf-8")
 
         css_text = self._resolve_resume_css(settings=settings)
         css_path = variant_dir / f"{token}-resume.css"
@@ -488,11 +559,13 @@ class OhMyCvDynamicResumeBuilder:
                 submission_cv_path=base_copy,
                 cv_version=base_copy.name,
                 resume_mode=requested_resume_mode,
+                target_language=resume_markdown_result.target_language,
                 matched_role_target=matched_role_target,
                 matched_specializations=matched_specializations,
                 markdown_path=markdown_path,
                 css_path=css_path,
                 notes=render_notes or "dynamic_resume_pdf_render_failed",
+                source_resume_language=resume_markdown_result.source_resume_language,
             )
 
         return DynamicResumeBuildResult(
@@ -500,12 +573,14 @@ class OhMyCvDynamicResumeBuilder:
             submission_cv_path=pdf_path,
             cv_version=pdf_path.name,
             resume_mode=requested_resume_mode,
+            target_language=resume_markdown_result.target_language,
             matched_role_target=matched_role_target,
             matched_specializations=matched_specializations,
             markdown_path=markdown_path,
             css_path=css_path,
             used_dynamic_variant=True,
             notes="dynamic_resume_ready",
+            source_resume_language=resume_markdown_result.source_resume_language,
         )
 
     def _copy_source_cv(
@@ -545,6 +620,61 @@ class OhMyCvDynamicResumeBuilder:
         limit = max(2_000, self._runtime_settings.resume_dynamic_max_cv_chars)
         return normalized[:limit]
 
+    def _detect_target_resume_language(
+        self,
+        *,
+        settings: UserAgentSettings,
+        posting: JobPosting,
+    ) -> LanguageDetectionResult:
+        return detect_job_posting_language(
+            posting,
+            default_language=settings.profile.preferred_language,
+        )
+
+    def _detect_resume_source_language(
+        self,
+        *,
+        settings: UserAgentSettings,
+        resume_text: str | None,
+        resume_snapshot: ResumeSourceSnapshot,
+    ) -> LanguageDetectionResult:
+        snapshot_fragments = [
+            resume_snapshot.header_role or "",
+            resume_snapshot.summary or "",
+            "\n".join(resume_snapshot.skill_lines),
+        ]
+        for entry in resume_snapshot.experience_entries:
+            snapshot_fragments.append(
+                "\n".join(
+                    filter(
+                        None,
+                        (
+                            entry.title,
+                            entry.company_name or "",
+                            " ".join(entry.bullets),
+                        ),
+                    )
+                )
+            )
+        text_signal = detect_text_language(
+            resume_text or "",
+            default_language=settings.profile.preferred_language,
+            source="resume_text",
+        )
+        snapshot_signal = detect_text_language(
+            "\n".join(fragment for fragment in snapshot_fragments if fragment.strip()),
+            default_language=settings.profile.preferred_language,
+            source="resume_snapshot",
+        )
+        return combine_language_signals(
+            (
+                (snapshot_signal, 1.25),
+                (text_signal, 1.0),
+            ),
+            default_language=settings.profile.preferred_language,
+            source="resume_source",
+        )
+
     def _build_tailored_markdown(
         self,
         *,
@@ -554,7 +684,9 @@ class OhMyCvDynamicResumeBuilder:
         matched_specializations: tuple[str, ...],
         resume_text: str | None,
         resume_snapshot: ResumeSourceSnapshot,
-    ) -> str | None:
+        source_language: SupportedLanguage,
+        target_language: SupportedLanguage,
+    ) -> TailoredResumeMarkdownResult | None:
         fallback_markdown = self._build_fallback_markdown(
             settings=settings,
             posting=posting,
@@ -562,9 +694,14 @@ class OhMyCvDynamicResumeBuilder:
             matched_specializations=matched_specializations,
             resume_text=resume_text,
             resume_snapshot=resume_snapshot,
+            render_language=target_language,
         )
         if not _snapshot_has_structured_content(resume_snapshot):
-            return fallback_markdown
+            return TailoredResumeMarkdownResult(
+                markdown=fallback_markdown,
+                target_language=target_language,
+                source_resume_language=source_language,
+            )
 
         heuristic_plan = self._build_heuristic_adaptation_plan(
             settings=settings,
@@ -589,6 +726,8 @@ class OhMyCvDynamicResumeBuilder:
                 fallback_markdown=fallback_markdown,
                 heuristic_plan=heuristic_plan,
                 resume_evidence_keywords=resume_evidence_keywords,
+                source_language=source_language,
+                target_language=target_language,
             )
             try:
                 response_payload = self._create_response(
@@ -620,19 +759,286 @@ class OhMyCvDynamicResumeBuilder:
                 ):
                     adaptation_plan = self._merge_adaptation_plans(heuristic_plan, ai_plan)
 
+        localized_snapshot = resume_snapshot
+        localized_plan = adaptation_plan
+        language_alignment_satisfied = target_language is source_language
+        should_localize_resume = (
+            target_language is not SupportedLanguage.ENGLISH
+            or source_language is not target_language
+        )
+        if should_localize_resume and settings.ai.api_key is not None:
+            try:
+                (
+                    localized_snapshot,
+                    localized_plan,
+                    language_alignment_satisfied,
+                ) = self._localize_resume_snapshot(
+                    settings=settings,
+                    resume_snapshot=resume_snapshot,
+                    adaptation_plan=adaptation_plan,
+                    source_language=source_language,
+                    target_language=target_language,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "dynamic_resume_localization_failed",
+                    extra={
+                        "job_posting_id": str(posting.id),
+                        "title": posting.title,
+                        "company_name": posting.company_name,
+                        "source_language": source_language.value,
+                        "target_language": target_language.value,
+                    },
+                )
+        elif should_localize_resume:
+            language_alignment_satisfied = False
+
         markdown = self._build_preserved_resume_markdown(
             settings=settings,
             posting=posting,
-            resume_snapshot=resume_snapshot,
-            adaptation_plan=adaptation_plan,
+            resume_snapshot=localized_snapshot,
+            adaptation_plan=localized_plan,
+            render_language=target_language,
         )
         if not self._validate_generated_markdown(
             markdown=markdown,
             fallback_markdown=fallback_markdown,
             resume_snapshot=resume_snapshot,
+            render_language=target_language,
         ):
-            return fallback_markdown
-        return markdown
+            return TailoredResumeMarkdownResult(
+                markdown=fallback_markdown,
+                target_language=target_language,
+                source_resume_language=source_language,
+                language_alignment_satisfied=language_alignment_satisfied,
+            )
+        return TailoredResumeMarkdownResult(
+            markdown=markdown,
+            target_language=target_language,
+            source_resume_language=source_language,
+            language_alignment_satisfied=language_alignment_satisfied,
+        )
+
+    def _localize_resume_snapshot(
+        self,
+        *,
+        settings: UserAgentSettings,
+        resume_snapshot: ResumeSourceSnapshot,
+        adaptation_plan: ResumeAdaptationPlan,
+        source_language: SupportedLanguage,
+        target_language: SupportedLanguage,
+    ) -> tuple[ResumeSourceSnapshot, ResumeAdaptationPlan, bool]:
+        translation_items = self._build_resume_translation_items(
+            resume_snapshot=resume_snapshot,
+            adaptation_plan=adaptation_plan,
+        )
+        if not translation_items:
+            return resume_snapshot, adaptation_plan, False
+        translated_texts = self._translate_resume_items(
+            settings=settings,
+            translation_items=translation_items,
+            source_language=source_language,
+            target_language=target_language,
+        )
+        if not translated_texts:
+            return resume_snapshot, adaptation_plan, False
+        localized_snapshot, localized_plan = self._apply_translated_resume_items(
+            resume_snapshot=resume_snapshot,
+            adaptation_plan=adaptation_plan,
+            translated_texts=translated_texts,
+        )
+        return localized_snapshot, localized_plan, True
+
+    def _build_resume_translation_items(
+        self,
+        *,
+        resume_snapshot: ResumeSourceSnapshot,
+        adaptation_plan: ResumeAdaptationPlan,
+    ) -> tuple[tuple[str, str], ...]:
+        items: list[tuple[str, str]] = []
+
+        def add_item(ref: str, text: str | None) -> None:
+            candidate = _normalize_resume_copy(text or "")
+            if not candidate:
+                return
+            if not re.search(r"[A-Za-zÀ-ÿ]{3,}", candidate):
+                return
+            items.append((ref, candidate))
+
+        add_item("headline", adaptation_plan.headline or resume_snapshot.header_role)
+        add_item("summary", adaptation_plan.summary or resume_snapshot.summary)
+
+        for index, entry in enumerate(resume_snapshot.experience_entries):
+            add_item(f"experience_title_{index}", entry.title)
+            for bullet_index, bullet in enumerate(entry.bullets):
+                add_item(f"experience_bullet_{index}_{bullet_index}", bullet)
+
+        for index, certification in enumerate(resume_snapshot.certifications):
+            add_item(f"certification_name_{index}", certification.name)
+            add_item(f"certification_issuer_{index}", certification.issuer)
+
+        for index, education in enumerate(resume_snapshot.education_entries):
+            add_item(f"education_institution_{index}", education.institution)
+            add_item(f"education_degree_{index}", education.degree)
+            add_item(f"education_location_{index}", education.location)
+
+        for index, skill_line in enumerate(resume_snapshot.skill_lines):
+            add_item(f"skill_line_{index}", skill_line)
+
+        for section_index, (title, lines) in enumerate(resume_snapshot.additional_sections):
+            add_item(f"additional_title_{section_index}", title)
+            for line_index, line in enumerate(lines):
+                add_item(f"additional_line_{section_index}_{line_index}", line)
+
+        return tuple(items)
+
+    def _translate_resume_items(
+        self,
+        *,
+        settings: UserAgentSettings,
+        translation_items: tuple[tuple[str, str], ...],
+        source_language: SupportedLanguage,
+        target_language: SupportedLanguage,
+    ) -> dict[str, str] | None:
+        if settings.ai.api_key is None:
+            return None
+        payload: dict[str, object] = {
+            "source_language": source_language.value,
+            "source_language_name": display_name_for_language(source_language),
+            "target_language": target_language.value,
+            "target_language_name": display_name_for_language(target_language),
+            "items": [{"ref": ref, "text": text} for ref, text in translation_items],
+        }
+        response_payload = self._create_structured_response(
+            api_key=settings.ai.api_key.get_secret_value(),
+            model=settings.ai.model,
+            developer_text=(
+                "You translate structured resume text from one language to another while "
+                "preserving facts exactly. Keep employers, institutions, URLs, technology names, "
+                "acronyms, dates, and certifications faithful to the source. Translate natural "
+                "language into the target_language_name only. Do not add or remove items. Return "
+                "only valid JSON matching the schema."
+            ),
+            prompt_payload=payload,
+            schema_name="resume_translation",
+            schema=_RESUME_TRANSLATION_SCHEMA,
+        )
+        return self._parse_translation_response(
+            response_payload=response_payload,
+            expected_refs=tuple(ref for ref, _ in translation_items),
+        )
+
+    def _parse_translation_response(
+        self,
+        *,
+        response_payload: dict[str, object],
+        expected_refs: tuple[str, ...],
+    ) -> dict[str, str] | None:
+        output_text = self._extract_output_text(response_payload)
+        if not output_text:
+            return None
+        try:
+            payload = json.loads(output_text)
+        except json.JSONDecodeError:
+            logger.warning("dynamic_resume_translation_invalid_json", extra={"output": output_text})
+            return None
+        if not isinstance(payload, dict):
+            return None
+        items = payload.get("items")
+        if not isinstance(items, list):
+            return None
+        expected_ref_set = set(expected_refs)
+        translated: dict[str, str] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            ref = str(item.get("ref") or "").strip()
+            text = _normalize_resume_copy(str(item.get("text") or "").strip())
+            if not ref or not text or ref not in expected_ref_set:
+                continue
+            translated[ref] = text
+        if expected_ref_set - set(translated):
+            return None
+        return translated
+
+    def _apply_translated_resume_items(
+        self,
+        *,
+        resume_snapshot: ResumeSourceSnapshot,
+        adaptation_plan: ResumeAdaptationPlan,
+        translated_texts: dict[str, str],
+    ) -> tuple[ResumeSourceSnapshot, ResumeAdaptationPlan]:
+        localized_plan = replace(
+            adaptation_plan,
+            headline=translated_texts.get("headline", adaptation_plan.headline),
+            summary=translated_texts.get("summary", adaptation_plan.summary),
+        )
+
+        localized_experience_entries = tuple(
+            replace(
+                entry,
+                title=translated_texts.get(f"experience_title_{index}", entry.title),
+                bullets=tuple(
+                    translated_texts.get(
+                        f"experience_bullet_{index}_{bullet_index}",
+                        bullet,
+                    )
+                    for bullet_index, bullet in enumerate(entry.bullets)
+                ),
+            )
+            for index, entry in enumerate(resume_snapshot.experience_entries)
+        )
+        localized_certifications = tuple(
+            replace(
+                certification,
+                name=translated_texts.get(f"certification_name_{index}", certification.name),
+                issuer=translated_texts.get(
+                    f"certification_issuer_{index}",
+                    certification.issuer,
+                ),
+            )
+            for index, certification in enumerate(resume_snapshot.certifications)
+        )
+        localized_education_entries = tuple(
+            replace(
+                education,
+                institution=translated_texts.get(
+                    f"education_institution_{index}",
+                    education.institution,
+                ),
+                degree=translated_texts.get(f"education_degree_{index}", education.degree),
+                location=translated_texts.get(f"education_location_{index}", education.location),
+            )
+            for index, education in enumerate(resume_snapshot.education_entries)
+        )
+        localized_skill_lines = tuple(
+            translated_texts.get(f"skill_line_{index}", skill_line)
+            for index, skill_line in enumerate(resume_snapshot.skill_lines)
+        )
+        localized_additional_sections = tuple(
+            (
+                translated_texts.get(f"additional_title_{section_index}", title),
+                tuple(
+                    translated_texts.get(
+                        f"additional_line_{section_index}_{line_index}",
+                        line,
+                    )
+                    for line_index, line in enumerate(lines)
+                ),
+            )
+            for section_index, (title, lines) in enumerate(resume_snapshot.additional_sections)
+        )
+        localized_snapshot = replace(
+            resume_snapshot,
+            header_role=translated_texts.get("headline", resume_snapshot.header_role),
+            summary=translated_texts.get("summary", resume_snapshot.summary),
+            experience_entries=localized_experience_entries,
+            certifications=localized_certifications,
+            education_entries=localized_education_entries,
+            skill_lines=localized_skill_lines,
+            additional_sections=localized_additional_sections,
+        )
+        return localized_snapshot, localized_plan
 
     def _build_prompt_payload(
         self,
@@ -646,8 +1052,17 @@ class OhMyCvDynamicResumeBuilder:
         fallback_markdown: str,
         heuristic_plan: ResumeAdaptationPlan,
         resume_evidence_keywords: tuple[str, ...],
+        source_language: SupportedLanguage,
+        target_language: SupportedLanguage,
     ) -> dict[str, object]:
         return {
+            "language_context": {
+                "default_product_language": settings.profile.preferred_language.value,
+                "source_resume_language": source_language.value,
+                "source_resume_language_name": display_name_for_language(source_language),
+                "target_resume_language": target_language.value,
+                "target_resume_language_name": display_name_for_language(target_language),
+            },
             "candidate_profile": {
                 "name": settings.profile.name,
                 "email": settings.profile.email,
@@ -663,6 +1078,7 @@ class OhMyCvDynamicResumeBuilder:
                 "salary_expectation": settings.profile.salary_expectation,
                 "default_responses": settings.profile.default_responses,
                 "resume_mode": settings.profile.resume_mode.value,
+                "preferred_language": settings.profile.preferred_language.value,
                 "capability_profile": capability_profile_to_payload(
                     build_candidate_capability_profile(settings)
                 ),
@@ -1007,20 +1423,29 @@ class OhMyCvDynamicResumeBuilder:
         matched_specializations: tuple[str, ...],
         resume_text: str | None,
         resume_snapshot: ResumeSourceSnapshot,
+        render_language: SupportedLanguage,
     ) -> str:
         if _snapshot_has_structured_content(resume_snapshot):
             return self._build_preserved_resume_markdown(
                 settings=settings,
                 posting=posting,
                 resume_snapshot=resume_snapshot,
+                render_language=render_language,
             )
 
         location_line = _escape_yaml_scalar(settings.profile.city)
-        summary = (
-            f"Resume adapted for {posting.title} at {posting.company_name}. "
-            "This version preserves the candidate background and highlights the most relevant "
-            "technical evidence available in the source resume."
-        )
+        if render_language is SupportedLanguage.PORTUGUESE:
+            summary = (
+                f"Curriculo adaptado para {posting.title} na {posting.company_name}. "
+                "Esta versao preserva o historico do candidato e destaca as evidencias tecnicas "
+                "mais relevantes disponiveis no curriculo de origem."
+            )
+        else:
+            summary = (
+                f"Resume adapted for {posting.title} at {posting.company_name}. "
+                "This version preserves the candidate background and highlights the most relevant "
+                "technical evidence available in the source resume."
+            )
         known_years = ", ".join(
             f"{stack} ({years}y)" for stack, years in _screening_capability_years(settings)[:8]
         )
@@ -1039,6 +1464,21 @@ class OhMyCvDynamicResumeBuilder:
         )
         sanitized_resume_excerpt = self._resume_excerpt(resume_text)
         known_years_line = f"- Known years by stack: {known_years}.\n" if known_years else ""
+        if render_language is SupportedLanguage.PORTUGUESE:
+            known_years_line = (
+                f"- Anos conhecidos por stack: {known_years}.\n" if known_years else ""
+            )
+            relevant_target_label = "Alvo relevante"
+            highlighted_stacks_label = "Stacks destacadas"
+            location_target_label = "Localizacao alvo"
+            availability_label = "Disponibilidade"
+            notes_label = "Notas"
+        else:
+            relevant_target_label = "Relevant target"
+            highlighted_stacks_label = "Highlighted stacks"
+            location_target_label = "Location target"
+            availability_label = "Availability"
+            notes_label = "Notes"
         return (
             "---\n"
             f"name: {settings.profile.name}\n"
@@ -1048,17 +1488,17 @@ class OhMyCvDynamicResumeBuilder:
             f'  - text: "{settings.profile.email}"\n'
             f"    link: mailto:{settings.profile.email}\n"
             "---\n\n"
-            "## Summary\n\n"
+            f"## {localized_section_label('summary', render_language)}\n\n"
             f"{_normalize_resume_copy(summary)}\n\n"
-            "## Experience\n\n"
-            f"**Relevant target:** {posting.title} — {posting.company_name}\n\n"
-            f"- Highlighted stacks: {stacks}.\n"
+            f"## {localized_section_label('experience', render_language)}\n\n"
+            f"**{relevant_target_label}:** {posting.title} — {posting.company_name}\n\n"
+            f"- {highlighted_stacks_label}: {stacks}.\n"
             f"{known_years_line}"
-            f"- Location target: {posting.location or settings.search.location}.\n"
-            f"- Availability: {settings.profile.availability}.\n\n"
-            "## Skills\n\n"
+            f"- {location_target_label}: {posting.location or settings.search.location}.\n"
+            f"- {availability_label}: {settings.profile.availability}.\n\n"
+            f"## {localized_section_label('skills', render_language)}\n\n"
             f"{stacks}\n\n"
-            "## Notes\n\n"
+            f"## {notes_label}\n\n"
             f"{sanitized_resume_excerpt}\n"
         )
 
@@ -1305,6 +1745,7 @@ class OhMyCvDynamicResumeBuilder:
         posting: JobPosting,
         resume_snapshot: ResumeSourceSnapshot,
         adaptation_plan: ResumeAdaptationPlan | None = None,
+        render_language: SupportedLanguage = SupportedLanguage.ENGLISH,
     ) -> str:
         adaptation_plan = adaptation_plan or ResumeAdaptationPlan()
         location = _escape_yaml_scalar(resume_snapshot.city or settings.profile.city)
@@ -1366,7 +1807,10 @@ class OhMyCvDynamicResumeBuilder:
             linkedin_label = _escape_yaml_scalar(_display_label_for_url(linkedin_url))
             header_items.append(
                 (
-                    f'  - text: "LinkedIn: {linkedin_label}"',
+                    (
+                        f'  - text: "{localized_field_label("linkedin", render_language)}: '
+                        f'{linkedin_label}"'
+                    ),
                     f"    link: {linkedin_url}",
                     "    newLine: true",
                 ),
@@ -1376,7 +1820,10 @@ class OhMyCvDynamicResumeBuilder:
             github_label = _escape_yaml_scalar(_display_label_for_url(github_url))
             header_items.append(
                 (
-                    f'  - text: "GitHub: {github_label}"',
+                    (
+                        f'  - text: "{localized_field_label("github", render_language)}: '
+                        f'{github_label}"'
+                    ),
                     f"    link: {github_url}",
                     None,
                 ),
@@ -1410,11 +1857,11 @@ class OhMyCvDynamicResumeBuilder:
             [
                 "---",
                 "",
-                "## Summary",
+                f"## {localized_section_label('summary', render_language)}",
                 "",
                 summary_text,
                 "",
-                "## Experience",
+                f"## {localized_section_label('experience', render_language)}",
                 "",
             ],
         )
@@ -1431,7 +1878,9 @@ class OhMyCvDynamicResumeBuilder:
             markdown_lines.append("")
 
         if resume_snapshot.certifications:
-            markdown_lines.extend(["## Certifications", ""])
+            markdown_lines.extend(
+                [f"## {localized_section_label('certifications', render_language)}", ""]
+            )
             for certification in resume_snapshot.certifications:
                 markdown_lines.append(f"**{_normalize_resume_copy(certification.name)}**")
                 if certification.issuer:
@@ -1439,7 +1888,9 @@ class OhMyCvDynamicResumeBuilder:
                 markdown_lines.append("")
 
         if resume_snapshot.education_entries:
-            markdown_lines.extend(["## Education", ""])
+            markdown_lines.extend(
+                [f"## {localized_section_label('education', render_language)}", ""]
+            )
             for education in resume_snapshot.education_entries:
                 markdown_lines.append(f"**{_normalize_resume_copy(education.institution)}**")
                 if education.location:
@@ -1452,7 +1903,7 @@ class OhMyCvDynamicResumeBuilder:
                 markdown_lines.append("")
 
         if prioritized_skill_lines:
-            markdown_lines.extend(["## Skills", ""])
+            markdown_lines.extend([f"## {localized_section_label('skills', render_language)}", ""])
             markdown_lines.extend(_normalize_resume_copy(line) for line in prioritized_skill_lines)
             markdown_lines.append("")
 
@@ -1561,14 +2012,16 @@ class OhMyCvDynamicResumeBuilder:
         markdown: str,
         fallback_markdown: str,
         resume_snapshot: ResumeSourceSnapshot,
+        render_language: SupportedLanguage,
     ) -> bool:
+        del render_language
         if not _snapshot_has_structured_content(resume_snapshot):
             return True
 
         normalized_output = _normalize_comparison_text(markdown)
         _metadata, body_markdown = _parse_front_matter(markdown)
         generated_sections = {
-            heading.lower(): lines
+            (canonical_resume_section_title(heading) or _normalize_comparison_text(heading)): lines
             for heading, lines in _split_markdown_body_sections(body_markdown)
         }
         required_headings = ["summary", "experience"]
@@ -1579,8 +2032,6 @@ class OhMyCvDynamicResumeBuilder:
         if resume_snapshot.skill_lines:
             required_headings.append("skills")
         for heading in required_headings:
-            if heading not in normalized_output:
-                return False
             if heading not in generated_sections:
                 return False
 
@@ -1643,6 +2094,56 @@ class OhMyCvDynamicResumeBuilder:
         model: str,
         prompt_payload: dict[str, object],
     ) -> dict[str, object]:
+        return self._create_structured_response(
+            api_key=api_key,
+            model=model,
+            developer_text=(
+                "You produce a structured adaptation plan for a dynamic resume. "
+                "The system will render the final Oh-My-CV markdown itself. "
+                "Preserve the candidate's factual history exactly: same employers, "
+                "same education, same certifications, same projects, and no "
+                "invented claims. Optimize only by adjusting the headline, "
+                "rewriting the professional summary, and highlighting truthful "
+                "target-relevant keywords, skills, and experience emphasis. "
+                "Write the headline and summary in the target_resume_language "
+                "provided in language_context, even when the source resume uses "
+                "a different language. "
+                "Do not replace the candidate's base professional identity with "
+                "a different role family unless the source resume itself already "
+                "uses that identity. Treat role family and stack emphasis as "
+                "separate decisions. "
+                "Keep the headline concise: preserve the base role identity and "
+                "append at most two concrete stack specializations when they are "
+                "truthfully supported. Keep the summary to two or three concise "
+                "sentences. "
+                "Prefer minimal edits to the summary when the source version is "
+                "already strong. Avoid recruiter cliches, keyword stuffing, and "
+                "phrases like 'Targeted for' or 'Selected fit areas'. "
+                "Never introduce frameworks, stacks, seniority claims, or tools "
+                "outside the allowed_focus_keywords, "
+                "allowed_skill_focus_keywords, and "
+                "resume_evidence_keywords provided in the payload. "
+                "Use allowed_focus_keywords only for the headline and summary. "
+                "Use allowed_skill_focus_keywords only to prioritize skills and "
+                "experience emphasis. "
+                "Focus on improving match for the target job without changing the "
+                "candidate's story. Return only valid JSON matching the schema."
+            ),
+            prompt_payload=prompt_payload,
+            schema_name="dynamic_resume_plan",
+            schema=_RESUME_ADAPTATION_SCHEMA,
+        )
+
+    def _create_structured_response(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        developer_text: str,
+        prompt_payload: dict[str, object],
+        schema_name: str,
+        schema: dict[str, object],
+    ) -> dict[str, object]:
         body = {
             "model": model,
             "input": [
@@ -1651,37 +2152,7 @@ class OhMyCvDynamicResumeBuilder:
                     "content": [
                         {
                             "type": "input_text",
-                            "text": (
-                                "You produce a structured adaptation plan for a dynamic resume. "
-                                "The system will render the final Oh-My-CV markdown itself. "
-                                "Preserve the candidate's factual history exactly: same employers, "
-                                "same education, same certifications, same projects, and no "
-                                "invented claims. Optimize only by adjusting the headline, "
-                                "rewriting the professional summary, and highlighting truthful "
-                                "target-relevant keywords, skills, and experience emphasis. "
-                                "Do not replace the candidate's base professional identity with "
-                                "a different role family unless the source resume itself already "
-                                "uses that identity. Treat role family and stack emphasis as "
-                                "separate decisions. "
-                                "Keep the headline concise: preserve the base role identity and "
-                                "append at most two concrete stack specializations when they are "
-                                "truthfully supported. Keep the summary to two or three concise "
-                                "sentences."
-                                " "
-                                "Prefer minimal edits to the summary when the source version is "
-                                "already strong. Avoid recruiter cliches, keyword stuffing, and "
-                                "phrases like 'Targeted for' or 'Selected fit areas'. "
-                                "Never introduce frameworks, stacks, seniority claims, or tools "
-                                "outside the allowed_focus_keywords, "
-                                "allowed_skill_focus_keywords, and "
-                                "resume_evidence_keywords provided in the payload. "
-                                "Use allowed_focus_keywords only for the headline and summary. "
-                                "Use allowed_skill_focus_keywords only to prioritize skills and "
-                                "experience emphasis. "
-                                "Focus on improving match for the target job without changing the "
-                                "candidate's story. Return "
-                                "only valid JSON matching the schema."
-                            ),
+                            "text": developer_text,
                         },
                     ],
                 },
@@ -1698,8 +2169,8 @@ class OhMyCvDynamicResumeBuilder:
             "text": {
                 "format": {
                     "type": "json_schema",
-                    "name": "dynamic_resume_plan",
-                    "schema": _RESUME_ADAPTATION_SCHEMA,
+                    "name": schema_name,
+                    "schema": schema,
                     "strict": True,
                 },
             },
@@ -2432,7 +2903,6 @@ def _normalize_extracted_resume_text(text: str) -> str:
 
 
 def _split_resume_sections(text: str) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]]]:
-    section_titles = {"Summary", "Experience", "Certifications", "Education", "Skills"}
     header_lines: list[str] = []
     sections: dict[str, list[str]] = {}
     current_section: str | None = None
@@ -2440,8 +2910,9 @@ def _split_resume_sections(text: str) -> tuple[tuple[str, ...], dict[str, tuple[
         line = raw_line.strip()
         if not line:
             continue
-        if line in section_titles:
-            current_section = line
+        canonical_title = canonical_resume_section_title(line)
+        if canonical_title is not None:
+            current_section = localized_section_label(canonical_title, SupportedLanguage.ENGLISH)
             sections.setdefault(current_section, [])
             continue
         if current_section is None:
@@ -2686,15 +3157,16 @@ def _required_resume_identity_tokens(snapshot: ResumeSourceSnapshot) -> tuple[st
             token = _normalize_comparison_text(entry.company_name)
             if token:
                 tokens.append(token)
-        token = _normalize_comparison_text(entry.title)
-        if token:
-            tokens.append(token)
+        if entry.date_range:
+            token = _normalize_comparison_text(entry.date_range)
+            if token:
+                tokens.append(token)
     for certification in snapshot.certifications:
         token = _normalize_comparison_text(certification.name)
         if token:
             tokens.append(token)
     for education in snapshot.education_entries:
-        for part in (education.institution, education.degree):
+        for part in (education.institution, education.date_range):
             if part:
                 token = _normalize_comparison_text(part)
                 if token:

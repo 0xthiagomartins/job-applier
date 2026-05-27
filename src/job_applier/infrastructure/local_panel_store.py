@@ -24,7 +24,7 @@ from job_applier.application.panel import (
     StoredScheduleSection,
     ensure_runtime_dir,
 )
-from job_applier.domain.enums import ResumeMode
+from job_applier.domain.enums import ResumeMode, SupportedLanguage
 from job_applier.resume_theme import DEFAULT_OH_MY_CV_RESUME_CSS
 from job_applier.settings import RuntimeSettings
 
@@ -184,6 +184,7 @@ class LocalPanelSettingsStore:
                 resume_mode=(
                     ResumeMode.DYNAMIC if settings.resume_dynamic_enabled else ResumeMode.STATIC
                 ),
+                preferred_language=SupportedLanguage.ENGLISH,
                 resume_css=DEFAULT_OH_MY_CV_RESUME_CSS,
             ),
             preferences=StoredPreferencesSection(
@@ -251,6 +252,7 @@ class LocalPanelSettingsStore:
                             document.profile.cv_filename or bootstrap_document.profile.cv_filename
                         ),
                         "resume_mode": document.profile.resume_mode,
+                        "preferred_language": document.profile.preferred_language,
                         "resume_css": document.profile.resume_css
                         or bootstrap_document.profile.resume_css,
                     },

@@ -19,10 +19,17 @@ from pydantic import (
     field_validator,
 )
 
-from job_applier.domain.enums import ResumeMode, ScheduleFrequency, SeniorityLevel, WorkplaceType
+from job_applier.domain.enums import (
+    ResumeMode,
+    ScheduleFrequency,
+    SeniorityLevel,
+    SupportedLanguage,
+    WorkplaceType,
+)
 
 MODEL_OPTIONS = ("o3-mini", "gpt-4.1-mini", "gpt-4o-mini")
 SCHEDULE_FREQUENCY_OPTIONS = (ScheduleFrequency.DAILY,)
+SUPPORTED_LANGUAGE_OPTIONS = (SupportedLanguage.ENGLISH, SupportedLanguage.PORTUGUESE)
 TIMEZONE_OPTIONS = (
     "UTC",
     "America/Sao_Paulo",
@@ -153,6 +160,7 @@ class StoredProfileSection(PanelModel):
     cv_path: str | None = None
     cv_filename: str | None = None
     resume_mode: ResumeMode = ResumeMode.STATIC
+    preferred_language: SupportedLanguage = SupportedLanguage.ENGLISH
     resume_css: str | None = None
 
 
@@ -174,6 +182,7 @@ class ProfileFormInput(BaseModel):
     availability: str = Field(min_length=1)
     default_responses: dict[str, str] = Field(default_factory=dict)
     resume_mode: ResumeMode = ResumeMode.STATIC
+    preferred_language: SupportedLanguage = SupportedLanguage.ENGLISH
     resume_css: str | None = None
 
 

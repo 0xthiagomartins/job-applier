@@ -17,6 +17,10 @@ import {
   ApplicationHistoryPage,
 } from "@/lib/types";
 
+function languageLabel(value: "en" | "pt"): string {
+  return value === "pt" ? "Portuguese" : "English";
+}
+
 const PAGE_SIZE = 10;
 
 type HistoryFilters = {
@@ -263,6 +267,7 @@ export function ApplicationHistory(): React.JSX.Element {
                     <div className="mt-3 flex flex-wrap gap-2 text-xs text-muted-foreground">
                       {item.location ? <span>{item.location}</span> : null}
                       <span>Mode: {item.resume_mode}</span>
+                      <span>Language: {languageLabel(item.target_language)}</span>
                       {item.matched_role_target ? <span>Target: {item.matched_role_target}</span> : null}
                       {item.cv_version ? <span>CV: {item.cv_version}</span> : null}
                       {item.external_job_id ? <span>ID: {item.external_job_id}</span> : null}
@@ -333,6 +338,7 @@ export function ApplicationHistory(): React.JSX.Element {
                 </div>
                 <div className="grid gap-3 text-sm text-muted-foreground md:grid-cols-2">
                   <div>Resume mode: {selectedApplication.submission.resume_mode}</div>
+                  <div>Target language: {languageLabel(selectedApplication.submission.target_language)}</div>
                   <div>
                     Matched target: {selectedApplication.submission.matched_role_target || "Not informed"}
                   </div>

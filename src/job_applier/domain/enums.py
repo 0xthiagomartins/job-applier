@@ -41,6 +41,11 @@ class ResumeMode(StrEnum):
     DYNAMIC = "dynamic"
 
 
+class SupportedLanguage(StrEnum):
+    ENGLISH = "en"
+    PORTUGUESE = "pt"
+
+
 class QuestionType(StrEnum):
     FIRST_NAME = "first_name"
     LAST_NAME = "last_name"

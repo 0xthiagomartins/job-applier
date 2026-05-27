@@ -19,6 +19,11 @@ from job_applier.infrastructure.candidate_capabilities import (
     capability_profile_to_payload,
     find_capability_range_for_text,
 )
+from job_applier.infrastructure.language_support import (
+    combine_language_signals,
+    detect_job_posting_language,
+    detect_text_language,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -741,6 +746,7 @@ def _build_candidate_profile_payload(settings: UserAgentSettings) -> dict[str, o
         "salary_expectation": settings.profile.salary_expectation,
         "availability": settings.profile.availability,
         "default_responses": settings.profile.default_responses,
+        "preferred_language": settings.profile.preferred_language.value,
         "capability_profile": capability_profile_to_payload(capability_profile),
     }
 
@@ -1004,11 +1010,35 @@ class OpenAISemanticStepPlanner:
                     ),
                 }
             )
+        job_language = detect_job_posting_language(
+            posting,
+            default_language=settings.profile.preferred_language,
+        )
+        surface_language = combine_language_signals(
+            (
+                (
+                    detect_text_language(
+                        surface_text,
+                        default_language=job_language.language,
+                        source="easy_apply_surface",
+                    ),
+                    1.0,
+                ),
+                (job_language, 0.8),
+            ),
+            default_language=settings.profile.preferred_language,
+            source="easy_apply_step",
+        )
         return {
             "step_index": step_index + 1,
             "total_steps": total_steps,
             "surface_text": _truncate_prompt_text(surface_text, limit=1600),
             "fields": serialized_fields,
+            "language_context": {
+                "candidate_default_language": settings.profile.preferred_language.value,
+                "job_language": job_language.language.value,
+                "surface_language": surface_language.language.value,
+            },
             "candidate_profile": _build_candidate_profile_payload(settings),
             "job": {
                 "title": posting.title,
@@ -1302,6 +1332,26 @@ class OpenAIResponsesAnswerGenerator:
                 "company_name": posting.company_name,
                 "location": posting.location,
                 "description_raw": _truncate_prompt_text(posting.description_raw, limit=2400),
+            },
+            "language_context": {
+                "candidate_default_language": settings.profile.preferred_language.value,
+                "job_language": detect_job_posting_language(
+                    posting,
+                    default_language=settings.profile.preferred_language,
+                ).language.value,
+                "field_language": detect_text_language(
+                    " ".join(
+                        part
+                        for part in (
+                            field.question_raw,
+                            field.field_context,
+                            field.helper_text or "",
+                        )
+                        if part
+                    ),
+                    default_language=settings.profile.preferred_language,
+                    source="field_context",
+                ).language.value,
             },
             "candidate_profile": _build_candidate_profile_payload(settings),
         }

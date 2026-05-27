@@ -4,6 +4,7 @@ Job Applier is an internal-beta LinkedIn `Easy Apply` automation system with:
 
 - multi-target job search
 - explicit `static` and `dynamic` resume modes
+- English-first defaults with job-language-aware resume targeting for supported languages
 - competitive-but-plausible screening answers grounded in a real base CV
 - strong artifact capture for debugging, auditing, and resume review
 
@@ -29,6 +30,7 @@ The current product flow is:
 - direct `Easy Apply` execution with staged debugging modes
 - reviewed capability inference from the base CV
 - dynamic resume generation with CSS-backed PDF rendering
+- supported language-aware resume localization metadata in submission history
 - local artifact auditing for dynamic resumes
 - local runtime with FastAPI backend, Next.js panel, and SQLite persistence
 
@@ -49,6 +51,7 @@ The current repository already includes:
 - support for boards outside LinkedIn
 - fully visual resume theme editing in the panel
 - high-confidence stack tailoring when the target stack is not grounded in the base CV
+- arbitrary resume translation without an available AI localization path
 
 ## Core concepts
 
@@ -85,6 +88,13 @@ Each capability can include:
 - inference source
 
 This profile is used for screening questions such as years of experience. The user can review, tighten, disable, or override individual ranges without rewriting the CV itself.
+
+### Language targeting
+
+- the product default language is `English`
+- the `Profile` page lets the user choose a default content language
+- for supported multilingual flows, the dynamic resume builder attempts to target the vacancy language even when the base CV is in a different language
+- if that language alignment cannot be completed safely, the system falls back to the uploaded base CV instead of producing a mixed-language resume
 
 ## Getting started
 
@@ -162,6 +172,7 @@ Dynamic resume generation is still behind a feature flag.
 - if generation or rendering fails, the flow falls back to the original uploaded CV (safe default);
 - the profile API accepts optional `resume_css`, so users can persist custom stylesheet rules from the panel/UI for PDF rendering;
 - the generated resume should preserve the base CV identity and only emphasize stack cues that are grounded in the uploaded CV or reviewed capability profile.
+- the profile also accepts a default content language; this is used as a fallback signal when the vacancy language is weak or ambiguous.
 
 The panel exposes:
 

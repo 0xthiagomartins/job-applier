@@ -9,7 +9,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import AnyUrl, BaseModel, ConfigDict, EmailStr, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from job_applier.domain.enums import ResumeMode, ScheduleFrequency, SeniorityLevel, WorkplaceType
+from job_applier.domain.enums import (
+    ResumeMode,
+    ScheduleFrequency,
+    SeniorityLevel,
+    SupportedLanguage,
+    WorkplaceType,
+)
 from job_applier.domain.versioning import Ruleset
 
 
@@ -48,6 +54,7 @@ class UserProfileConfig(FrozenModel):
     cv_path: str | None = None
     cv_filename: str | None = None
     resume_mode: ResumeMode = ResumeMode.STATIC
+    preferred_language: SupportedLanguage = SupportedLanguage.ENGLISH
     resume_css: str | None = None
     positive_filters: tuple[str, ...] = ()
     blacklist: tuple[str, ...] = ()

@@ -21,6 +21,7 @@ from job_applier.domain.enums import (
     ResumeMode,
     SeniorityLevel,
     SubmissionStatus,
+    SupportedLanguage,
     WorkplaceType,
 )
 
@@ -103,6 +104,7 @@ class ApplicationSubmission:
     started_at: datetime = field(default_factory=utc_now)
     submitted_at: datetime | None = None
     resume_mode: ResumeMode = ResumeMode.STATIC
+    target_language: SupportedLanguage = SupportedLanguage.ENGLISH
     matched_role_target: str | None = None
     matched_specializations: tuple[str, ...] = ()
     cv_version: str | None = None

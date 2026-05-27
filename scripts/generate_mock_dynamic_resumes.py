@@ -75,6 +75,18 @@ def _mock_scenarios() -> tuple[MockJobScenario, ...]:
                 "automation. The role values ownership, observability, and reliable delivery."
             ),
         ),
+        MockJobScenario(
+            slug="backend-python-portuguese",
+            title="Desenvolvedor(a) Backend Python",
+            company_name="Atmo Sistemas",
+            location="Remoto - Brasil",
+            description_raw=(
+                "Estamos contratando uma pessoa desenvolvedora backend com foco em Python, APIs, "
+                "integrações entre sistemas, observabilidade e suporte a ambientes em produção. "
+                "Valorizamos experiência com automação, serviços distribuídos, documentação clara "
+                "e colaboração com times de produto."
+            ),
+        ),
     )
 
 
@@ -193,6 +205,8 @@ def main() -> int:
                 "location": scenario.location,
                 "used_dynamic_variant": prepared.used_dynamic_variant,
                 "notes": prepared.notes,
+                "target_language": prepared.target_language.value,
+                "source_resume_language": prepared.source_resume_language.value,
                 "source_cv_path": str(prepared.source_cv_path),
                 "submission_cv_path": str(prepared.submission_cv_path),
                 "markdown_path": str(prepared.markdown_path) if prepared.markdown_path else None,

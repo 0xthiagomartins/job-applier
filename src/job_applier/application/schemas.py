@@ -24,6 +24,7 @@ from job_applier.domain.enums import (
     ScheduleFrequency,
     SeniorityLevel,
     SubmissionStatus,
+    SupportedLanguage,
     WorkplaceType,
 )
 
@@ -71,6 +72,7 @@ class ApplicationSubmissionCreate(BaseModel):
     started_at: datetime | None = None
     submitted_at: datetime | None = None
     resume_mode: ResumeMode = ResumeMode.STATIC
+    target_language: SupportedLanguage = SupportedLanguage.ENGLISH
     matched_role_target: str | None = None
     matched_specializations: tuple[str, ...] = ()
     cv_version: str | None = None
@@ -89,6 +91,7 @@ class ApplicationSubmissionRead(ReadSchema):
     started_at: datetime
     submitted_at: datetime | None
     resume_mode: ResumeMode
+    target_language: SupportedLanguage
     matched_role_target: str | None
     matched_specializations: tuple[str, ...]
     cv_version: str | None
@@ -230,6 +233,7 @@ class ApplicationHistoryListItemRead(BaseModel):
     location: str | None = None
     external_job_id: str | None = None
     resume_mode: ResumeMode = ResumeMode.STATIC
+    target_language: SupportedLanguage = SupportedLanguage.ENGLISH
     matched_role_target: str | None = None
     cv_version: str | None = None
     execution_origin: ExecutionOrigin
@@ -248,6 +252,7 @@ class ApplicationHistoryListItemRead(BaseModel):
             location=entry.job_posting.location,
             external_job_id=entry.job_posting.external_job_id,
             resume_mode=entry.submission.resume_mode,
+            target_language=entry.submission.target_language,
             matched_role_target=entry.submission.matched_role_target,
             cv_version=entry.submission.cv_version,
             execution_origin=entry.submission.execution_origin,

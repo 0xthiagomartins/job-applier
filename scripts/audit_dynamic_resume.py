@@ -17,6 +17,7 @@ from job_applier.infrastructure.candidate_capabilities import (
     build_candidate_capability_profile,
     extract_capabilities_from_text,
 )
+from job_applier.infrastructure.language_support import canonical_resume_section_title
 from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
 from job_applier.infrastructure.resume_dynamic import (
     _parse_front_matter,
@@ -150,7 +151,10 @@ def _read_markdown(markdown_path: Path) -> tuple[str, str]:
             headline = first.removeprefix("# ").strip()
             continue
         if first.startswith("## "):
-            current_heading = first.removeprefix("## ").strip().lower()
+            current_heading = (
+                canonical_resume_section_title(first.removeprefix("## ").strip())
+                or first.removeprefix("## ").strip().lower()
+            )
             continue
         if current_heading == "summary":
             collected_summary.append(" ".join(line.strip() for line in block if line.strip()))

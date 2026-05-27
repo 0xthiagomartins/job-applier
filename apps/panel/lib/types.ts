@@ -35,6 +35,7 @@ export type ProfileSection = {
   cv_path: string | null;
   cv_filename: string | null;
   resume_mode: "static" | "dynamic";
+  preferred_language: "en" | "pt";
   resume_css: string | null;
 };
 
@@ -94,6 +95,7 @@ export type ApplicationHistoryListItem = {
   location: string | null;
   external_job_id: string | null;
   resume_mode: "static" | "dynamic";
+  target_language: "en" | "pt";
   matched_role_target: string | null;
   cv_version: string | null;
   execution_origin: string;
@@ -158,6 +160,7 @@ export type ApplicationHistoryDetail = {
     started_at: string;
     submitted_at: string | null;
     resume_mode: "static" | "dynamic";
+    target_language: "en" | "pt";
     matched_role_target: string | null;
     matched_specializations: string[];
     cv_version: string | null;
@@ -208,5 +211,6 @@ export type PanelState = {
     timezones: string[];
     workplace_types: string[];
     seniority_levels: string[];
+    supported_languages: string[];
   };
 };

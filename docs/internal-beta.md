@@ -14,6 +14,7 @@ This guide describes the current internal-beta contract for `job-applier`.
 - Two resume modes:
   - `static`: upload one base CV and use it as-is
   - `dynamic`: generate one tailored CV per matched job while preserving the base CV identity
+- English-first product defaults with job-language-aware resume generation for supported languages
 - Competitive-but-plausible screening answers derived from the base CV
 - Artifact capture for scoring, dynamic resume generation, and Easy Apply troubleshooting
 
@@ -31,7 +32,10 @@ This guide describes the current internal-beta contract for `job-applier`.
 2. Choose `Resume mode`:
    - `static` if you want strict reuse of the uploaded CV
    - `dynamic` if you want per-job tailoring
-3. Keep `Keywords / role targets` broad in the `Preferences` page.
+3. Choose `Default content language`:
+   - keep `English` as the default unless your base profile is primarily maintained in Portuguese
+   - the dynamic resume builder will still target the vacancy language when it has a strong signal
+4. Keep `Keywords / role targets` broad in the `Preferences` page.
 
 Recommended target families:
 
@@ -79,6 +83,8 @@ In `dynamic` mode the system should:
   - supported by the base CV or reviewed capability profile
 
 If dynamic generation fails, the flow falls back to the uploaded base CV.
+
+If the vacancy language differs from the base CV language and the system cannot complete a safe localization pass, the flow also falls back to the uploaded base CV instead of generating a mixed-language document.
 
 ## Artifact review workflow
 

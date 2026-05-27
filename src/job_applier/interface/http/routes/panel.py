@@ -14,6 +14,7 @@ from job_applier.application.agent_execution import (
 )
 from job_applier.application.panel import (
     SCHEDULE_FREQUENCY_OPTIONS,
+    SUPPORTED_LANGUAGE_OPTIONS,
     TIMEZONE_OPTIONS,
     AIFormInput,
     PreferencesFormInput,
@@ -25,7 +26,13 @@ from job_applier.application.panel import (
     parse_int_mapping_lines,
     parse_text_mapping_lines,
 )
-from job_applier.domain.enums import ResumeMode, ScheduleFrequency, SeniorityLevel, WorkplaceType
+from job_applier.domain.enums import (
+    ResumeMode,
+    ScheduleFrequency,
+    SeniorityLevel,
+    SupportedLanguage,
+    WorkplaceType,
+)
 from job_applier.infrastructure.candidate_capabilities import (
     build_candidate_capability_profile,
     capability_profile_to_payload,
@@ -86,6 +93,7 @@ async def get_panel_state(
                 "timezones": list(TIMEZONE_OPTIONS),
                 "workplace_types": [option.value for option in WorkplaceType],
                 "seniority_levels": [option.value for option in SeniorityLevel],
+                "supported_languages": [option.value for option in SUPPORTED_LANGUAGE_OPTIONS],
             },
         },
     )
@@ -109,6 +117,7 @@ async def save_profile(
     default_responses: Annotated[str, Form()] = "",
     capability_overrides: Annotated[str, Form()] = "",
     resume_mode: Annotated[ResumeMode, Form()] = ResumeMode.STATIC,
+    preferred_language: Annotated[SupportedLanguage, Form()] = SupportedLanguage.ENGLISH,
     resume_css: Annotated[str, Form()] = "",
     cv_file: Annotated[UploadFile | None, File()] = None,
 ) -> JSONResponse:
@@ -131,6 +140,7 @@ async def save_profile(
             default_responses=parse_text_mapping_lines(default_responses),
             capability_overrides=parse_capability_override_json(capability_overrides),
             resume_mode=resume_mode,
+            preferred_language=preferred_language,
             resume_css=resume_css.strip() or None,
         )
     except ValueError as exc:

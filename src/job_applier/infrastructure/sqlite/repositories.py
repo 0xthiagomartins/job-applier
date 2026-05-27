@@ -48,6 +48,7 @@ from job_applier.domain.enums import (
     ResumeMode,
     SeniorityLevel,
     SubmissionStatus,
+    SupportedLanguage,
     WorkplaceType,
 )
 from job_applier.infrastructure.sqlite.database import SessionProvider
@@ -129,6 +130,7 @@ def _submission_to_model(entity: ApplicationSubmission) -> ApplicationSubmission
         started_at=entity.started_at,
         submitted_at=entity.submitted_at,
         resume_mode=entity.resume_mode.value,
+        target_language=entity.target_language.value,
         matched_role_target=entity.matched_role_target,
         matched_specializations=list(entity.matched_specializations),
         cv_version=entity.cv_version,
@@ -149,6 +151,7 @@ def _submission_from_model(model: ApplicationSubmissionModel) -> ApplicationSubm
         started_at=_db_to_utc(model.started_at),
         submitted_at=_db_to_utc(model.submitted_at) if model.submitted_at else None,
         resume_mode=ResumeMode(model.resume_mode),
+        target_language=SupportedLanguage(model.target_language),
         matched_role_target=model.matched_role_target,
         matched_specializations=tuple(model.matched_specializations),
         cv_version=model.cv_version,
