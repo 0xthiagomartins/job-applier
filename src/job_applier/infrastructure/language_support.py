@@ -253,10 +253,18 @@ def detect_job_posting_language(
         default_language=default_language,
         source="job_title",
     )
+    title_weight = 1.25
+    description_weight = 1.0
+    if posting.detail_description_score < 0.45:
+        title_weight = 1.75
+        description_weight = 0.2
+    elif posting.detail_description_score < 0.7:
+        title_weight = 1.5
+        description_weight = 0.6
     return combine_language_signals(
         (
-            (title_signal, 1.25),
-            (description_signal, 1.0),
+            (title_signal, title_weight),
+            (description_signal, description_weight),
         ),
         default_language=default_language,
         source="job_posting",

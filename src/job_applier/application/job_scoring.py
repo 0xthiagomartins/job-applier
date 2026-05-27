@@ -58,6 +58,19 @@ _ROLE_TARGET_SPECIALIZATION_HINTS: dict[str, tuple[str, ...]] = {
     "full stack developer": ("javascript", "typescript", "react", "react native"),
 }
 
+_ROLE_TARGET_CANONICAL_ALIASES: dict[str, str] = {
+    "automation engineer": "automation engineer",
+    "automation developer": "automation developer",
+    "rpa developer": "rpa developer",
+    "backend developer": "backend developer",
+    "full stack developer": "full stack developer",
+    "engenheiro de automacao": "automation engineer",
+    "desenvolvedor de automacao": "automation developer",
+    "desenvolvedor rpa": "rpa developer",
+    "desenvolvedor backend": "backend developer",
+    "desenvolvedor full stack": "full stack developer",
+}
+
 _GENERIC_ENGINEERING_ROLE_PATTERNS: tuple[str, ...] = (
     r"\bengineer\b",
     r"\bdeveloper\b",
@@ -411,10 +424,21 @@ def match_role_targets(
 ) -> RoleTargetMatchResult:
     """Return matching role targets plus the strongest match score."""
 
+    canonical_role_targets: list[str] = []
+    seen_targets: set[str] = set()
+    for target in role_targets:
+        canonical_target = canonicalize_role_target_label(target)
+        if not canonical_target or canonical_target in seen_targets:
+            continue
+        seen_targets.add(canonical_target)
+        canonical_role_targets.append(canonical_target)
+
     scored_matches = [
-        (target, compute_role_target_match_score(target, normalized_title, searchable_text))
-        for target in role_targets
-        if target.strip()
+        (
+            target,
+            compute_role_target_match_score(target, normalized_title, searchable_text),
+        )
+        for target in canonical_role_targets
     ]
     title_matches = tuple(target for target, score in scored_matches if score >= 0.55)
     best_target = None
@@ -492,7 +516,7 @@ def compute_role_target_match_score(
     """Compute how strongly a vacancy maps to one configured role family."""
 
     del searchable_text
-    canonical_target = normalize_text(role_target)
+    canonical_target = canonicalize_role_target_label(role_target)
     if not canonical_target:
         return 0.0
 
@@ -525,6 +549,15 @@ def compute_role_target_match_score(
     if title_overlap >= 0.5:
         return round(max(title_overlap, inferred_score), 4)
     return round(inferred_score, 4)
+
+
+def canonicalize_role_target_label(role_target: str) -> str:
+    """Map localized target labels into one canonical internal role family."""
+
+    normalized_target = normalize_text(role_target)
+    if not normalized_target:
+        return ""
+    return _ROLE_TARGET_CANONICAL_ALIASES.get(normalized_target, normalized_target)
 
 
 def _infer_role_target_score_from_title(

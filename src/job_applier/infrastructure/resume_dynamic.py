@@ -841,7 +841,23 @@ class OhMyCvDynamicResumeBuilder:
             source_language=source_language,
             target_language=target_language,
         )
+        if translated_texts and not self._translated_resume_items_align(
+            translated_texts=translated_texts,
+            target_language=target_language,
+        ):
+            translated_texts = self._translate_resume_items(
+                settings=settings,
+                translation_items=translation_items,
+                source_language=source_language,
+                target_language=target_language,
+                strict_target_language=True,
+            )
         if not translated_texts:
+            return resume_snapshot, adaptation_plan, False
+        if not self._translated_resume_items_align(
+            translated_texts=translated_texts,
+            target_language=target_language,
+        ):
             return resume_snapshot, adaptation_plan, False
         localized_snapshot, localized_plan = self._apply_translated_resume_items(
             resume_snapshot=resume_snapshot,
@@ -901,6 +917,7 @@ class OhMyCvDynamicResumeBuilder:
         translation_items: tuple[tuple[str, str], ...],
         source_language: SupportedLanguage,
         target_language: SupportedLanguage,
+        strict_target_language: bool = False,
     ) -> dict[str, str] | None:
         if settings.ai.api_key is None:
             return None
@@ -909,21 +926,31 @@ class OhMyCvDynamicResumeBuilder:
             "source_language_name": display_name_for_language(source_language),
             "target_language": target_language.value,
             "target_language_name": display_name_for_language(target_language),
+            "translation_mode": "strict_target_language" if strict_target_language else "standard",
             "items": [{"ref": ref, "text": text} for ref, text in translation_items],
         }
+        developer_text = (
+            "You translate structured resume text from one language to another while "
+            "preserving facts exactly. Keep employers, institutions, URLs, technology names, "
+            "acronyms, dates, and certifications faithful to the source. Translate natural "
+            "language into the target_language_name only. Translate mixed label/value lines "
+            "too, such as skill category labels before a colon, while preserving the actual "
+            "technology tokens after the colon. Translate degree names when they are natural "
+            "language phrases, but do not invent equivalencies or new credentials. Do not add "
+            "or remove items. Return only valid JSON matching the schema."
+        )
+        if strict_target_language:
+            developer_text += (
+                " Every returned text must read naturally in the target_language_name, even "
+                "when the source already looks acceptable in another language. Do not leave "
+                "English prose unchanged when target_language_name is Portuguese. Proper names "
+                "and technology tokens may stay as-is, but the surrounding narrative must be "
+                "fully localized."
+            )
         response_payload = self._create_structured_response(
             api_key=settings.ai.api_key.get_secret_value(),
             model=settings.ai.model,
-            developer_text=(
-                "You translate structured resume text from one language to another while "
-                "preserving facts exactly. Keep employers, institutions, URLs, technology names, "
-                "acronyms, dates, and certifications faithful to the source. Translate natural "
-                "language into the target_language_name only. Translate mixed label/value lines "
-                "too, such as skill category labels before a colon, while preserving the actual "
-                "technology tokens after the colon. Translate degree names when they are natural "
-                "language phrases, but do not invent equivalencies or new credentials. Do not add "
-                "or remove items. Return only valid JSON matching the schema."
-            ),
+            developer_text=developer_text,
             prompt_payload=payload,
             schema_name="resume_translation",
             schema=_RESUME_TRANSLATION_SCHEMA,
@@ -965,6 +992,31 @@ class OhMyCvDynamicResumeBuilder:
         if expected_ref_set - set(translated):
             return None
         return translated
+
+    def _translated_resume_items_align(
+        self,
+        *,
+        translated_texts: dict[str, str],
+        target_language: SupportedLanguage,
+    ) -> bool:
+        if target_language is SupportedLanguage.ENGLISH:
+            return True
+        sampled_segments = [
+            translated_texts.get("headline", ""),
+            translated_texts.get("summary", ""),
+        ]
+        sampled_segments.extend(
+            text for ref, text in translated_texts.items() if ref.startswith("experience_bullet_")
+        )
+        sample_text = "\n".join(segment for segment in sampled_segments if segment.strip())
+        if not sample_text:
+            return False
+        detection = detect_text_language(
+            sample_text,
+            default_language=target_language,
+            source="translated_resume_items",
+        )
+        return detection.language is target_language and detection.confidence >= 0.35
 
     def _apply_translated_resume_items(
         self,
