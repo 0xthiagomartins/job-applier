@@ -1,42 +1,90 @@
 # Job Applier
 
-[![CI](https://github.com/0xthiagomartins/job-applier/actions/workflows/ci.yml/badge.svg)](https://github.com/0xthiagomartins/job-applier/actions/workflows/ci.yml)
+Job Applier is an internal-beta LinkedIn `Easy Apply` automation system with:
 
-Job Applier is an open source system for assisted job application automation with strong submission auditability.
+- multi-target job search
+- explicit `static` and `dynamic` resume modes
+- competitive-but-plausible screening answers grounded in a real base CV
+- strong artifact capture for debugging, auditing, and resume review
 
 For the current internal-beta operating contract, see [docs/internal-beta.md](docs/internal-beta.md).
 
-## What the agent does
+## What the product is today
 
-```mermaid
-flowchart TD
-    A[Open LinkedIn] --> B[Log in]
-    B --> C[Search jobs]
-    C --> D[Filter by last 24 hours]
-    D --> E[Filter by Easy Apply]
-    E --> F{For each job}
-    F --> G[Analyze job fit]
-    G --> H[Apply with Easy Apply]
-    H --> I[Persist successful application]
-    I --> F
-    F --> J[Close LinkedIn]
-    J --> K[Finish MCP connection]
-```
+The current product flow is:
 
-At a high level, the agent logs into LinkedIn, searches recent Easy Apply jobs, evaluates each opportunity, applies when the job passes the fit rules, saves the successful application, and then closes the browser flow cleanly.
+1. upload one truthful base CV
+2. configure broad role targets such as `Automation Engineer`, `RPA Developer`, `Backend Developer`, or `Full Stack Developer`
+3. let the system search LinkedIn `Easy Apply` jobs across those target families
+4. score each job against the configured targets
+5. either:
+   - apply with the base CV unchanged in `static` mode
+   - generate a job-specific CV variant in `dynamic` mode without changing the base identity or inventing experience
+6. answer screening questions with exact profile facts when available, or with plausible competitive ranges inferred from the base CV
+7. persist logs, timelines, screenshots, HTML dumps, and generated resume artifacts for auditability
 
-The current repository bootstrap already includes:
+## What the MVP supports
+
+- LinkedIn job search with broad multi-target role families
+- direct `Easy Apply` execution with staged debugging modes
+- reviewed capability inference from the base CV
+- dynamic resume generation with CSS-backed PDF rendering
+- local artifact auditing for dynamic resumes
+- local runtime with FastAPI backend, Next.js panel, and SQLite persistence
+
+The current repository already includes:
 
 - Python 3.14 project management with `uv`
 - FastAPI backend API with panel configuration endpoints
-- Next.js + TypeScript panel in `apps/panel` with shadcn-style components
+- Next.js + TypeScript panel in `apps/panel`
 - Ruff, mypy and pre-commit configuration
-- lint, type-check and panel build commands
 - single-container on-premise runtime path with local SQLite fallback
-- automatic Alembic upgrade to the latest schema on startup
-- explicit `static` and `dynamic` resume modes
-- inferred candidate capability ranges that can be reviewed in the panel
-- local audit tooling for dynamic resume artifacts
+- automatic Alembic upgrade on startup
+- resume capability inference and review UI
+- dynamic resume audit tooling
+
+## What the MVP does not promise yet
+
+- perfect success on every LinkedIn `Easy Apply` variation
+- support for boards outside LinkedIn
+- fully visual resume theme editing in the panel
+- high-confidence stack tailoring when the target stack is not grounded in the base CV
+
+## Core concepts
+
+### Resume modes
+
+- `static`: always apply with the uploaded base CV
+- `dynamic`: generate a per-job resume variant while preserving the base CV identity
+
+### Role targets
+
+Targets should be broad role families, not narrow stack-specific job titles.
+
+Recommended targets:
+
+- `Automation Engineer`
+- `Automation Developer`
+- `RPA Developer`
+- `Backend Developer`
+- `Full Stack Developer`
+
+Use stack cues such as `Python`, `AWS`, `TypeScript`, `JavaScript`, `UiPath`, or `LangChain` as scoring/tailoring signals, not as the primary job family.
+
+### Capability profile
+
+The `Profile` page exposes an inferred capability profile derived from the base CV.
+
+Each capability can include:
+
+- capability name
+- min years
+- max years
+- recommended years
+- confidence
+- inference source
+
+This profile is used for screening questions such as years of experience. The user can review, tighten, disable, or override individual ranges without rewriting the CV itself.
 
 ## Getting started
 
@@ -80,7 +128,7 @@ The current repository bootstrap already includes:
 
 8. Open the panel at `http://127.0.0.1:3000`.
 
-## LinkedIn search setup
+## LinkedIn runtime setup
 
 The LinkedIn Jobs search automation reads credentials from local runtime config, never from versioned code.
 
@@ -101,28 +149,26 @@ Runtime behavior:
 - if LinkedIn expires the session, the app clears the saved state and logs in again;
 - when `JOB_APPLIER_PLAYWRIGHT_MCP_URL` is configured, the login bootstrap runs through Playwright MCP and exports the storage state back to the Python app;
 - when `JOB_APPLIER_STAGEHAND_ENABLED=true`, the search flow can use Stagehand to semantically repair noisy LinkedIn job-detail extraction, especially in direct-target debugging and suspicious detail pages;
-- in headful mode, the browser stays visible so the user can solve captcha or checkpoint screens.
+- in headful mode, the browser stays visible so the user can solve captcha or checkpoint screens;
 - when the panel state is still empty, the app bootstraps a local profile automatically from `.env` and tries to import a CV from `~/Documents`.
 
-## Dynamic Resume (Feature Flag)
+## Resume and search configuration
 
-The dynamic Oh-My-CV flow is guarded by a feature flag and is disabled by default.
+Dynamic resume generation is still behind a feature flag.
 
 - enable with `JOB_APPLIER_RESUME_DYNAMIC_ENABLED=true`;
 - when enabled, each target job can receive a tailored resume variant generated as Oh-My-CV markdown;
 - the renderer then attempts to export that markdown to PDF and uses the resulting file in Easy Apply;
 - if generation or rendering fails, the flow falls back to the original uploaded CV (safe default);
-- the profile API now accepts optional `resume_css`, so users can persist custom stylesheet rules from the panel/UI for PDF rendering.
+- the profile API accepts optional `resume_css`, so users can persist custom stylesheet rules from the panel/UI for PDF rendering;
 - the generated resume should preserve the base CV identity and only emphasize stack cues that are grounded in the uploaded CV or reviewed capability profile.
 
-The panel now exposes two explicit resume modes:
+The panel exposes:
 
 - `static`: always apply with the uploaded base CV
 - `dynamic`: generate a per-job CV variant before application
-
-The `Profile` page also exposes an inferred `Capability profile` used for screening questions such as years of experience. Users can review, tighten, or disable individual capability ranges without changing the source CV.
-
-## Role target setup
+- `capability profile`: reviewed capability ranges used in screening answers
+- `keywords / role targets`: broad job families for search and scoring
 
 The search pipeline works best when `Preferences > Keywords` are broad role families rather than narrow stack-specific titles.
 
@@ -164,6 +210,8 @@ For low-cost manual debugging, you can enable `JOB_APPLIER_AGENT_TEST_MODE=true`
 
 For immediate iteration on a single problematic job, set `JOB_APPLIER_LINKEDIN_DEBUG_TARGET_JOB_URL=https://www.linkedin.com/jobs/view/...`. In that mode the agent bypasses the search pages and opens the target job directly, which is much faster when we are polishing the Easy Apply agent. When `JOB_APPLIER_AGENT_TEST_MODE=true`, this direct-target mode also relaxes the score threshold to `0.0` automatically so the debug run reaches `Easy Apply` instead of being blocked by ranking.
 
+Keep in mind that direct target URLs can go stale quickly on LinkedIn. A URL that was `Easy Apply` a few minutes ago may later turn into an external apply or closed listing, and the current pipeline is designed to skip those cases cleanly instead of forcing a broken submission.
+
 If you also enable `JOB_APPLIER_STAGEHAND_ENABLED=true`, the debug-target path will use Stagehand observe/extract to get a cleaner semantic view of the LinkedIn job page before the parser merges the detail payload.
 
 For stage-by-stage debugging, set `JOB_APPLIER_AGENT_DEBUG_STAGE` to one of:
@@ -191,6 +239,8 @@ uv run python scripts/audit_dynamic_resume.py \
 ```
 
 ## Quality commands
+
+This repository is currently validated through lint, type-check, panel build, scripts, artifacts, and real/staged runs rather than a maintained unit-test suite.
 
 Run lint:
 
