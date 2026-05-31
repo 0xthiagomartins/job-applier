@@ -2317,7 +2317,7 @@ class OhMyCvDynamicResumeBuilder:
         if prioritized_skill_lines:
             markdown_lines.extend([f"## {localized_section_label('skills', render_language)}", ""])
             markdown_lines.extend(
-                _localize_resume_phrase_overrides(line, render_language)
+                _render_localized_skill_line(line, render_language)
                 for line in prioritized_skill_lines
             )
             markdown_lines.append("")
@@ -3684,6 +3684,23 @@ def _localize_resume_phrase_overrides(
     for pattern, replacement in replacements:
         localized = re.sub(pattern, replacement, localized, flags=re.IGNORECASE)
     return _normalize_resume_copy(localized)
+
+
+def _render_localized_skill_line(
+    skill_line: str,
+    target_language: SupportedLanguage,
+) -> str:
+    normalized_line = _normalize_resume_copy(skill_line)
+    if not normalized_line:
+        return ""
+    prefix, separator, suffix = normalized_line.partition(":")
+    if not separator:
+        return _localize_resume_phrase_overrides(normalized_line, target_language)
+    localized_prefix = localized_skill_category_label(prefix, target_language)
+    localized_suffix = _localize_resume_phrase_overrides(suffix.strip(), target_language)
+    if not localized_suffix:
+        return localized_prefix
+    return f"{localized_prefix}: {localized_suffix}"
 
 
 def _is_resume_bullet(value: str) -> bool:
