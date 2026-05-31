@@ -276,6 +276,15 @@ _ROLE_TARGET_SUMMARY_SCOPES: dict[str, str] = {
     "software engineer": "software delivery, application services, and operational support",
 }
 
+_ROLE_TARGET_HEADLINE_SCOPE_LABELS: dict[str, str] = {
+    "automation engineer": "Automation Systems",
+    "automation developer": "Automation Systems",
+    "rpa developer": "Workflow Automation",
+    "backend developer": "Backend Systems",
+}
+
+_GENERIC_EDITORIAL_ROLE_TARGETS = frozenset({"software engineer", "software developer"})
+
 _EDITORIAL_BANNED_PHRASES: tuple[str, ...] = (
     "targeted for",
     "selected fit areas",
@@ -1289,16 +1298,21 @@ class OhMyCvDynamicResumeBuilder:
             role_target=role_target,
             focus_keywords=broad_focus_keywords,
         )
+        role_resolution_keywords = focus_keywords or primary_focus_keywords or broad_focus_keywords
+        summary_focus_keywords = focus_keywords or role_resolution_keywords[:3]
         headline = self._build_targeted_headline(
+            posting=posting,
             resume_snapshot=resume_snapshot,
             role_target=role_target,
             focus_keywords=focus_keywords,
+            role_resolution_keywords=role_resolution_keywords,
         )
         summary = self._build_targeted_summary(
             resume_snapshot=resume_snapshot,
             posting=posting,
             role_target=role_target,
-            focus_keywords=focus_keywords,
+            focus_keywords=summary_focus_keywords,
+            role_resolution_keywords=role_resolution_keywords,
         )
         experience_focus = tuple(
             ExperienceFocusPlan(
@@ -1318,7 +1332,7 @@ class OhMyCvDynamicResumeBuilder:
         return ResumeAdaptationPlan(
             headline=headline,
             summary=summary,
-            focus_keywords=focus_keywords,
+            focus_keywords=summary_focus_keywords,
             skill_focus=primary_focus_keywords or broad_focus_keywords or focus_keywords,
             experience_focus=experience_focus,
             adaptation_summary=(
@@ -1334,6 +1348,7 @@ class OhMyCvDynamicResumeBuilder:
         posting: JobPosting,
         role_target: str | None,
         focus_keywords: tuple[str, ...],
+        role_resolution_keywords: tuple[str, ...],
     ) -> str:
         base_summary = _normalize_resume_copy(
             resume_snapshot.summary
@@ -1346,8 +1361,13 @@ class OhMyCvDynamicResumeBuilder:
         if not base_sentences:
             return _trim_summary_text(base_summary)
         lead_sentence = base_sentences[0]
-        focus_sentence = _build_summary_focus_sentence(
+        editorial_role_target = _resolve_editorial_role_target(
             role_target=role_target,
+            posting_title=posting.title,
+            focus_keywords=role_resolution_keywords,
+        )
+        focus_sentence = _build_summary_focus_sentence(
+            role_target=editorial_role_target,
             focus_keywords=focus_keywords,
             posting_keywords=_extract_posting_keywords(posting),
             lead_sentence=lead_sentence,
@@ -1369,19 +1389,32 @@ class OhMyCvDynamicResumeBuilder:
     def _build_targeted_headline(
         self,
         *,
+        posting: JobPosting,
         resume_snapshot: ResumeSourceSnapshot,
         role_target: str | None,
         focus_keywords: tuple[str, ...],
+        role_resolution_keywords: tuple[str, ...],
     ) -> str:
-        del role_target
         headline_role = _extract_base_role_identity(
             resume_snapshot.header_role or "Full Stack Software Engineer",
+        )
+        editorial_role_target = _resolve_editorial_role_target(
+            role_target=role_target,
+            posting_title=posting.title,
+            focus_keywords=role_resolution_keywords,
         )
         headline_keywords = _select_headline_specializations(
             headline_role=headline_role,
             focus_keywords=focus_keywords,
         )
         if not headline_keywords:
+            role_scope_label = _resolve_headline_role_scope_label(
+                headline_role=headline_role,
+                editorial_role_target=editorial_role_target,
+                focus_keywords=role_resolution_keywords,
+            )
+            if role_scope_label:
+                return f"{headline_role} | {role_scope_label}"
             return headline_role
         suffix = _format_keyword_phrase(headline_keywords[:2])
         return f"{headline_role} | {suffix}"
@@ -2615,6 +2648,75 @@ def _select_headline_specializations(
         seen.add(normalized_keyword)
         selected.append(keyword)
     return tuple(selected[:2])
+
+
+def _resolve_editorial_role_target(
+    *,
+    role_target: str | None,
+    posting_title: str,
+    focus_keywords: tuple[str, ...],
+) -> str | None:
+    normalized_role_target = _normalize_keyword(role_target or "")
+    if normalized_role_target and normalized_role_target not in _GENERIC_EDITORIAL_ROLE_TARGETS:
+        return normalized_role_target
+
+    normalized_title = _normalize_comparison_text(posting_title)
+    focus_tokens = {
+        _normalize_keyword(keyword) for keyword in focus_keywords if _normalize_keyword(keyword)
+    }
+    candidate_roles = (
+        "backend developer",
+        "full stack developer",
+        "automation engineer",
+        "automation developer",
+        "rpa developer",
+    )
+    for candidate_role in candidate_roles:
+        alias_patterns = _ROLE_TARGET_ALIAS_PATTERNS.get(candidate_role, ())
+        if not alias_patterns or not any(
+            re.search(pattern, normalized_title) for pattern in alias_patterns
+        ):
+            continue
+        profile_tokens = {
+            _normalize_keyword(keyword)
+            for keyword in _ROLE_TARGET_PROFILE_KEYWORDS.get(candidate_role, ())
+            if _normalize_keyword(keyword)
+        }
+        if focus_tokens & profile_tokens:
+            return candidate_role
+
+    return normalized_role_target or None
+
+
+def _resolve_headline_role_scope_label(
+    *,
+    headline_role: str,
+    editorial_role_target: str | None,
+    focus_keywords: tuple[str, ...],
+) -> str | None:
+    normalized_role_target = _normalize_keyword(editorial_role_target or "")
+    if not normalized_role_target:
+        return None
+    role_scope_label = _ROLE_TARGET_HEADLINE_SCOPE_LABELS.get(normalized_role_target)
+    if role_scope_label is None:
+        return None
+    normalized_headline = _normalize_comparison_text(headline_role)
+    alias_patterns = _ROLE_TARGET_ALIAS_PATTERNS.get(normalized_role_target, ())
+    if normalized_role_target in normalized_headline or any(
+        re.search(pattern, normalized_headline) for pattern in alias_patterns
+    ):
+        return None
+    profile_tokens = {
+        _normalize_keyword(keyword)
+        for keyword in _ROLE_TARGET_PROFILE_KEYWORDS.get(normalized_role_target, ())
+        if _normalize_keyword(keyword)
+    }
+    focus_tokens = {
+        _normalize_keyword(keyword) for keyword in focus_keywords if _normalize_keyword(keyword)
+    }
+    if not focus_tokens & profile_tokens:
+        return None
+    return role_scope_label
 
 
 def _split_summary_sentences(summary: str) -> tuple[str, ...]:
