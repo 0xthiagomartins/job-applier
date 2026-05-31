@@ -52,10 +52,6 @@ _ROLE_TARGET_ALIAS_PATTERNS: dict[str, tuple[str, ...]] = {
     "software engineer": (
         r"\bsoftware (engineer|developer)\b",
         r"\bapplication(s)? (engineer|developer)\b",
-        r"\bbackend (engineer|developer)\b",
-        r"\bback[\s\-]?end (engineer|developer)\b",
-        r"\bfull[\s\-]?stack\b",
-        r"\bfullstack\b",
         r"\bengenheir(?:o|a)(?:\s+a)?\s+de\s+software\b",
         r"\bdesenvolvedor(?:a)?(?:\s+a)?\s+de\s+software\b",
         r"\bingenier(?:o|a)\s+de\s+software\b",
@@ -86,6 +82,13 @@ _ROLE_TARGET_CROSS_FAMILY_FALLBACKS: dict[str, tuple[tuple[str, float], ...]] = 
     "rpa developer": (
         (r"\bautomation (engineer|developer|specialist)\b", 1.0),
         (r"\bintelligent automation\b", 1.0),
+    ),
+    "software engineer": (
+        (r"\bbackend (engineer|developer)\b", 0.84),
+        (r"\bback[\s\-]?end (engineer|developer)\b", 0.84),
+        (r"\bserver[\s\-]?side\b", 0.8),
+        (r"\bfull[\s\-]?stack\b", 0.84),
+        (r"\bfullstack\b", 0.84),
     ),
 }
 
@@ -176,10 +179,52 @@ _TITLE_SPECIALIZATION_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("rag", (r"\brag\b", r"\bretrieval[\s\-]augmented generation\b")),
 )
 
+_TITLE_ROLE_CONTEXT_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "backend",
+        (
+            r"\bbackend\b",
+            r"\bback[\s\-]?end\b",
+            r"\bserver[\s\-]?side\b",
+        ),
+    ),
+    (
+        "full stack",
+        (
+            r"\bfull[\s\-]?stack\b",
+            r"\bfullstack\b",
+        ),
+    ),
+    (
+        "automation",
+        (
+            r"\bautomation\b",
+            r"\bintelligent automation\b",
+        ),
+    ),
+    (
+        "rpa",
+        (
+            r"\brpa\b",
+            r"\brobotic process automation\b",
+            r"\buipath\b",
+        ),
+    ),
+)
+
 _GENERIC_SOFTWARE_ROLE_TARGET_SCORES: dict[str, float] = {
     "backend developer": 0.56,
     "full stack developer": 0.6,
     "software engineer": 0.72,
+}
+
+_ROLE_TARGET_SPECIFICITY_RANKS: dict[str, int] = {
+    "rpa developer": 5,
+    "automation engineer": 4,
+    "automation developer": 4,
+    "backend developer": 4,
+    "full stack developer": 4,
+    "software engineer": 1,
 }
 
 
@@ -474,20 +519,29 @@ def match_role_targets(
         seen_targets.add(canonical_target)
         canonical_role_targets.append(canonical_target)
 
-    scored_matches = [
+    scored_matches = tuple(
         (
             target,
             compute_role_target_match_score(target, normalized_title, searchable_text),
         )
         for target in canonical_role_targets
-    ]
-    title_matches = tuple(target for target, score in scored_matches if score >= 0.55)
+    )
+    ranked_matches = tuple(
+        sorted(
+            scored_matches,
+            key=lambda item: _role_target_sort_key(
+                canonical_target=item[0],
+                score=item[1],
+                normalized_title=normalized_title,
+            ),
+            reverse=True,
+        )
+    )
+    title_matches = tuple(target for target, score in ranked_matches if score >= 0.55)
     best_target = None
     best_score = 0.0
-    for target, score in scored_matches:
-        if score > best_score:
-            best_target = target
-            best_score = score
+    if ranked_matches:
+        best_target, best_score = ranked_matches[0]
     if best_target is not None and best_score < 0.55:
         best_target = None
     return RoleTargetMatchResult(
@@ -516,11 +570,17 @@ def match_specializations(
     """Return target stack cues enriched by profile-aligned filters when available."""
 
     title_specializations = extract_title_specializations(normalized_title)
+    title_role_context = extract_title_role_context_keywords(normalized_title)
     matched_from_stack = match_terms(stack_terms, searchable_text)
     matched_from_positive = match_terms(positive_terms, searchable_text)
     merged_matches: list[str] = []
     seen: set[str] = set()
-    for term in (*title_specializations, *matched_from_stack, *matched_from_positive):
+    for term in (
+        *title_specializations,
+        *title_role_context,
+        *matched_from_stack,
+        *matched_from_positive,
+    ):
         normalized_term = normalize_text(term)
         if not normalized_term or normalized_term in seen:
             continue
@@ -534,6 +594,26 @@ def extract_title_specializations(normalized_title: str) -> tuple[str, ...]:
 
     positioned_matches: list[tuple[int, int, str]] = []
     for pattern_index, (label, patterns) in enumerate(_TITLE_SPECIALIZATION_PATTERNS):
+        earliest_position: int | None = None
+        for pattern in patterns:
+            match = re.search(pattern, normalized_title)
+            if match is None:
+                continue
+            position = match.start()
+            if earliest_position is None or position < earliest_position:
+                earliest_position = position
+        if earliest_position is None:
+            continue
+        positioned_matches.append((earliest_position, pattern_index, label))
+    positioned_matches.sort()
+    return tuple(label for _, _, label in positioned_matches)
+
+
+def extract_title_role_context_keywords(normalized_title: str) -> tuple[str, ...]:
+    """Return safe role-context cues found directly in the vacancy title."""
+
+    positioned_matches: list[tuple[int, int, str]] = []
+    for pattern_index, (label, patterns) in enumerate(_TITLE_ROLE_CONTEXT_PATTERNS):
         earliest_position: int | None = None
         for pattern in patterns:
             match = re.search(pattern, normalized_title)
@@ -646,6 +726,58 @@ def _title_has_hard_exclusion(normalized_title: str) -> bool:
     ) or any(
         re.search(pattern, normalized_title) for pattern in _TITLE_NON_SOFTWARE_DISCIPLINE_PATTERNS
     )
+
+
+def _role_target_sort_key(
+    *,
+    canonical_target: str,
+    score: float,
+    normalized_title: str,
+) -> tuple[float, int, int, int, int]:
+    """Rank role-target matches by confidence and family specificity."""
+
+    return (
+        score,
+        _role_target_specificity_rank(canonical_target),
+        _role_target_family_alignment_score(canonical_target, normalized_title),
+        int(canonical_target in normalized_title),
+        _role_target_token_overlap_score(canonical_target, normalized_title),
+    )
+
+
+def _role_target_specificity_rank(canonical_target: str) -> int:
+    """Return how specific a role family is relative to generic software roles."""
+
+    return _ROLE_TARGET_SPECIFICITY_RANKS.get(canonical_target, 0)
+
+
+def _role_target_family_alignment_score(canonical_target: str, normalized_title: str) -> int:
+    """Return whether the title carries the family cue for the canonical role target."""
+
+    role_context_keywords = set(extract_title_role_context_keywords(normalized_title))
+    target_aliases = {
+        "automation engineer": {"automation"},
+        "automation developer": {"automation"},
+        "rpa developer": {"rpa"},
+        "backend developer": {"backend"},
+        "full stack developer": {"full stack"},
+    }
+    matching_aliases = role_context_keywords.intersection(
+        target_aliases.get(canonical_target, set())
+    )
+    return int(bool(matching_aliases))
+
+
+def _role_target_token_overlap_score(canonical_target: str, normalized_title: str) -> int:
+    """Return title-token overlap excluding generic role words."""
+
+    title_tokens = set(normalized_title.split())
+    target_tokens = [
+        token
+        for token in canonical_target.split()
+        if token and token not in _GENERIC_ROLE_TARGET_TOKENS
+    ]
+    return sum(token in title_tokens for token in target_tokens)
 
 
 def fraction(matches: int, total: int) -> float:
