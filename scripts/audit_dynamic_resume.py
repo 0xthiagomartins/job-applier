@@ -13,15 +13,20 @@ from pathlib import Path
 from typing import Literal
 
 from job_applier.application.agent_execution import build_user_agent_settings
+from job_applier.domain.enums import SupportedLanguage
 from job_applier.infrastructure.candidate_capabilities import (
     build_candidate_capability_profile,
     extract_capabilities_from_text,
 )
-from job_applier.infrastructure.language_support import canonical_resume_section_title
+from job_applier.infrastructure.language_support import (
+    canonical_resume_section_title,
+    detect_text_language,
+)
 from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
 from job_applier.infrastructure.resume_dynamic import (
     _parse_front_matter,
     _split_markdown_blocks,
+    _split_markdown_body_sections,
 )
 
 Severity = Literal["info", "warning", "error"]
@@ -49,6 +54,19 @@ _UNANCHORED_ALLOWED_TOKENS = frozenset(
         "remote",
         "apis",
     }
+)
+_PORTUGUESE_SECTION_HEADINGS = frozenset(
+    {"resumo", "experiência", "certificações", "educação", "competências"}
+)
+_ENGLISH_SECTION_HEADINGS = frozenset(
+    {"summary", "experience", "certifications", "education", "skills"}
+)
+_PORTUGUESE_ENGLISH_LABEL_LEAKS = (
+    "core languages:",
+    "tools & platforms:",
+    "full stack & backend:",
+    "engineering practices:",
+    "applied ai & automation:",
 )
 
 
@@ -169,6 +187,29 @@ def _read_markdown(markdown_path: Path) -> tuple[str, str]:
     return headline, summary
 
 
+def _read_markdown_sections(markdown_path: Path) -> dict[str, tuple[str, ...]]:
+    raw_markdown = markdown_path.read_text(encoding="utf-8")
+    _metadata, body_markdown = _parse_front_matter(raw_markdown)
+    sections: dict[str, tuple[str, ...]] = {}
+    for heading, lines in _split_markdown_body_sections(body_markdown):
+        sections[heading.strip()] = tuple(line.strip() for line in lines if line.strip())
+    return sections
+
+
+def _infer_expected_resume_language(sections: dict[str, tuple[str, ...]]) -> SupportedLanguage:
+    portuguese_score = 0
+    english_score = 0
+    for heading in sections:
+        normalized = heading.strip().lower()
+        if normalized in _PORTUGUESE_SECTION_HEADINGS:
+            portuguese_score += 1
+        if normalized in _ENGLISH_SECTION_HEADINGS:
+            english_score += 1
+    if portuguese_score > english_score:
+        return SupportedLanguage.PORTUGUESE
+    return SupportedLanguage.ENGLISH
+
+
 def _extract_pdf_page_metrics(pdf_path: Path | None) -> tuple[int | None, tuple[int, ...]]:
     if pdf_path is None or not pdf_path.exists():
         return None, ()
@@ -249,6 +290,8 @@ def _audit_resume(
     capability_profile = build_candidate_capability_profile(settings)
     anchored_capabilities = set(capability_profile.capabilities)
     headline, summary = _read_markdown(markdown_path)
+    sections = _read_markdown_sections(markdown_path)
+    expected_language = _infer_expected_resume_language(sections)
     page_count, page_char_counts = _extract_pdf_page_metrics(pdf_path)
     if page_count is None:
         page_count, page_char_counts = _extract_pdf_page_metrics_via_cli(pdf_path)
@@ -323,6 +366,43 @@ def _audit_resume(
                 f"Summary repeats focus terms too aggressively: {repeated_phrase}.",
             )
         )
+
+    sampled_language_lines: list[str] = []
+    for heading, lines in sections.items():
+        normalized_heading = canonical_resume_section_title(heading) or heading.strip().lower()
+        if normalized_heading not in {"summary", "experience", "skills"}:
+            continue
+        sampled_language_lines.extend(lines[:6])
+    sampled_language_text = "\n".join(line for line in sampled_language_lines if line.strip())
+    if sampled_language_text:
+        detection = detect_text_language(
+            sampled_language_text,
+            default_language=expected_language,
+            source=str(markdown_path),
+        )
+        if detection.language is not expected_language and detection.confidence >= 0.4:
+            findings.append(
+                AuditFinding(
+                    "error",
+                    "mixed_language_content",
+                    "Resume body language does not match the localized section headings.",
+                )
+            )
+
+    if expected_language is SupportedLanguage.PORTUGUESE:
+        lower_markdown = markdown_path.read_text(encoding="utf-8").lower()
+        leaked_labels = [
+            label for label in _PORTUGUESE_ENGLISH_LABEL_LEAKS if label in lower_markdown
+        ]
+        if leaked_labels:
+            findings.append(
+                AuditFinding(
+                    "error",
+                    "english_labels_in_portuguese_resume",
+                    "Portuguese resume still contains English section/category labels: "
+                    + ", ".join(leaked_labels),
+                )
+            )
 
     if job_title:
         title_capabilities = set(extract_capabilities_from_text(job_title))
