@@ -959,6 +959,7 @@ class OhMyCvDynamicResumeBuilder:
 
         add_item("headline", adaptation_plan.headline or resume_snapshot.header_role)
         add_item("summary", adaptation_plan.summary or resume_snapshot.summary)
+        add_item("city", resume_snapshot.city)
 
         for index, entry in enumerate(resume_snapshot.experience_entries):
             add_item(f"experience_title_{index}", entry.title)
@@ -1231,6 +1232,7 @@ class OhMyCvDynamicResumeBuilder:
             resume_snapshot,
             header_role=translated_texts.get("headline", resume_snapshot.header_role),
             summary=translated_texts.get("summary", resume_snapshot.summary),
+            city=translated_texts.get("city", resume_snapshot.city),
             experience_entries=localized_experience_entries,
             certifications=localized_certifications,
             education_entries=localized_education_entries,
@@ -1274,6 +1276,21 @@ class OhMyCvDynamicResumeBuilder:
             if detection.language is target_language:
                 continue
             grouped_items.setdefault(detection.language, []).append((ref, text))
+        for index, skill_line in enumerate(resume_snapshot.skill_lines):
+            prefix, separator, suffix = skill_line.partition(":")
+            normalized_suffix = _normalize_resume_copy(suffix)
+            if not separator or not normalized_suffix:
+                continue
+            if len(re.findall(r"[A-Za-zÀ-ÿ]{3,}", normalized_suffix)) < 2:
+                continue
+            suffix_detection = detect_text_language(
+                normalized_suffix,
+                default_language=target_language,
+                source="resume_skill_suffix_localization_check",
+            )
+            grouped_items.setdefault(suffix_detection.language, []).append(
+                (f"skill_suffix_{index}", normalized_suffix)
+            )
         for source_language, items in grouped_items.items():
             batch_result = self._translate_resume_items(
                 settings=settings,
@@ -1286,12 +1303,30 @@ class OhMyCvDynamicResumeBuilder:
                 translated_residuals.update(batch_result)
         if not translated_residuals:
             return resume_snapshot, adaptation_plan
-        return self._apply_translated_resume_items(
+        localized_snapshot, localized_plan = self._apply_translated_resume_items(
             resume_snapshot=resume_snapshot,
             adaptation_plan=adaptation_plan,
             translated_texts=translated_residuals,
             target_language=target_language,
         )
+        if any(ref.startswith("skill_suffix_") for ref in translated_residuals):
+            localized_skill_lines = list(localized_snapshot.skill_lines)
+            for index, skill_line in enumerate(localized_skill_lines):
+                translated_suffix = translated_residuals.get(f"skill_suffix_{index}")
+                if translated_suffix is None:
+                    continue
+                prefix, separator, _suffix = skill_line.partition(":")
+                if not separator:
+                    continue
+                localized_skill_lines[index] = (
+                    f"{localized_skill_category_label(prefix, target_language)}: "
+                    f"{_normalize_resume_copy(translated_suffix)}"
+                )
+            localized_snapshot = replace(
+                localized_snapshot,
+                skill_lines=tuple(localized_skill_lines),
+            )
+        return localized_snapshot, localized_plan
 
     def _resume_item_needs_localization(
         self,
@@ -2084,7 +2119,12 @@ class OhMyCvDynamicResumeBuilder:
         render_language: SupportedLanguage = SupportedLanguage.ENGLISH,
     ) -> str:
         adaptation_plan = adaptation_plan or ResumeAdaptationPlan()
-        location = _escape_yaml_scalar(resume_snapshot.city or settings.profile.city)
+        location = _escape_yaml_scalar(
+            _localize_resume_meta_text(
+                resume_snapshot.city or settings.profile.city,
+                render_language,
+            ),
+        )
         phone = _escape_yaml_scalar(resume_snapshot.phone or settings.profile.phone)
         email = _escape_yaml_scalar(resume_snapshot.email or settings.profile.email)
         header_role = _escape_yaml_scalar(
@@ -2110,6 +2150,7 @@ class OhMyCvDynamicResumeBuilder:
                 "delivery, automation, and applied AI."
             ),
         )
+        summary_text = _localize_resume_phrase_overrides(summary_text, render_language)
         header_items: list[tuple[str, str | None, str | None]] = [
             (
                 "  - text: |",
@@ -2203,14 +2244,25 @@ class OhMyCvDynamicResumeBuilder:
         )
 
         for entry in prioritized_experience_entries:
-            markdown_lines.append(f"**{_normalize_resume_copy(entry.title)}**")
+            markdown_lines.append(
+                f"**{_localize_resume_phrase_overrides(entry.title, render_language)}**"
+            )
             if entry.company_name:
-                markdown_lines.append(f"  ~ {_normalize_resume_copy(entry.company_name)}")
+                markdown_lines.append(
+                    "  ~ "
+                    + _normalize_resume_copy(
+                        _localize_resume_meta_text(entry.company_name, render_language),
+                    )
+                )
             if entry.date_range:
-                markdown_lines.append(f"  ~ {entry.date_range}")
+                markdown_lines.append(
+                    "  ~ " + _localize_resume_meta_text(entry.date_range, render_language)
+                )
             markdown_lines.append("")
             for bullet in entry.bullets:
-                markdown_lines.append(f"- {_normalize_resume_copy(bullet)}")
+                markdown_lines.append(
+                    f"- {_localize_resume_phrase_overrides(bullet, render_language)}"
+                )
             markdown_lines.append("")
 
         if resume_snapshot.certifications:
@@ -2218,9 +2270,17 @@ class OhMyCvDynamicResumeBuilder:
                 [f"## {localized_section_label('certifications', render_language)}", ""]
             )
             for certification in resume_snapshot.certifications:
-                markdown_lines.append(f"**{_normalize_resume_copy(certification.name)}**")
+                markdown_lines.append(
+                    f"**{_localize_resume_phrase_overrides(certification.name, render_language)}**"
+                )
                 if certification.issuer:
-                    markdown_lines.append(f"  ~ {_normalize_resume_copy(certification.issuer)}")
+                    markdown_lines.append(
+                        "  ~ "
+                        + _localize_resume_phrase_overrides(
+                            certification.issuer,
+                            render_language,
+                        )
+                    )
                 markdown_lines.append("")
 
         if resume_snapshot.education_entries:
@@ -2228,26 +2288,49 @@ class OhMyCvDynamicResumeBuilder:
                 [f"## {localized_section_label('education', render_language)}", ""]
             )
             for education in resume_snapshot.education_entries:
-                markdown_lines.append(f"**{_normalize_resume_copy(education.institution)}**")
+                markdown_lines.append(
+                    "**"
+                    + _localize_resume_phrase_overrides(
+                        education.institution,
+                        render_language,
+                    )
+                    + "**"
+                )
                 if education.location:
-                    markdown_lines.append(f"  ~ {_normalize_resume_copy(education.location)}")
+                    markdown_lines.append(
+                        "  ~ "
+                        + _normalize_resume_copy(
+                            _localize_resume_meta_text(education.location, render_language),
+                        )
+                    )
                 markdown_lines.append("")
                 if education.degree:
-                    markdown_lines.append(_normalize_resume_copy(education.degree))
+                    markdown_lines.append(
+                        _localize_resume_phrase_overrides(education.degree, render_language)
+                    )
                 if education.date_range:
-                    markdown_lines.append(f"  ~ {education.date_range}")
+                    markdown_lines.append(
+                        "  ~ " + _localize_resume_meta_text(education.date_range, render_language)
+                    )
                 markdown_lines.append("")
 
         if prioritized_skill_lines:
             markdown_lines.extend([f"## {localized_section_label('skills', render_language)}", ""])
-            markdown_lines.extend(_normalize_resume_copy(line) for line in prioritized_skill_lines)
+            markdown_lines.extend(
+                _localize_resume_phrase_overrides(line, render_language)
+                for line in prioritized_skill_lines
+            )
             markdown_lines.append("")
 
         for title, lines in resume_snapshot.additional_sections:
             if not lines:
                 continue
-            markdown_lines.extend([f"## {title}", ""])
-            markdown_lines.extend(_normalize_resume_copy(line) for line in lines)
+            markdown_lines.extend(
+                [_localize_resume_phrase_overrides(f"## {title}", render_language), ""]
+            )
+            markdown_lines.extend(
+                _localize_resume_phrase_overrides(line, render_language) for line in lines
+            )
             markdown_lines.append("")
 
         return (
@@ -3547,6 +3630,62 @@ def _looks_like_date_range(value: str) -> bool:
     return bool(re.fullmatch(r"\d{2}/\d{4}\s*-\s*(?:Present|\d{2}/\d{4})", value.strip()))
 
 
+def _localize_resume_meta_text(
+    text: str | None,
+    target_language: SupportedLanguage,
+) -> str:
+    normalized = _normalize_resume_copy(text or "")
+    if not normalized:
+        return ""
+    localized = normalized
+    if target_language is SupportedLanguage.PORTUGUESE:
+        localized = re.sub(r"\bSelf[\s\-]?Employed\b", "Autônomo", localized, flags=re.IGNORECASE)
+        localized = re.sub(r"\bPresent\b", "Presente", localized, flags=re.IGNORECASE)
+        localized = re.sub(r"\bCurrent\b", "Atual", localized, flags=re.IGNORECASE)
+        localized = re.sub(r"\bBrazil\b", "Brasil", localized, flags=re.IGNORECASE)
+    elif target_language is SupportedLanguage.ENGLISH:
+        localized = re.sub(r"\bAutônomo\b", "Self-Employed", localized, flags=re.IGNORECASE)
+        localized = re.sub(r"\bPresente\b", "Present", localized, flags=re.IGNORECASE)
+        localized = re.sub(r"\bAtual\b", "Current", localized, flags=re.IGNORECASE)
+        localized = re.sub(r"\bBrasil\b", "Brazil", localized, flags=re.IGNORECASE)
+    return _normalize_resume_copy(localized)
+
+
+def _localize_resume_phrase_overrides(
+    text: str | None,
+    target_language: SupportedLanguage,
+) -> str:
+    normalized = _normalize_resume_copy(text or "")
+    if not normalized:
+        return ""
+    localized = normalized
+    if target_language is SupportedLanguage.PORTUGUESE:
+        replacements = (
+            (r"\bMicroservices\b", "Microserviços"),
+            (r"\bSystem Integrations\b", "Integrações de Sistemas"),
+            (r"\bBackend Architecture\b", "Arquitetura de Backend"),
+            (r"\bDatabase Modeling\b", "Modelagem de Banco de Dados"),
+            (r"\bInternal Tools\b", "Ferramentas Internas"),
+            (r"\bMachine Learning\b", "Aprendizado de Máquina"),
+            (r"\bCryptography\b", "Criptografia"),
+            (r"\bScalable Systems\b", "Sistemas Escaláveis"),
+        )
+    else:
+        replacements = (
+            (r"\bMicroserviços\b", "Microservices"),
+            (r"\bIntegrações de Sistemas\b", "System Integrations"),
+            (r"\bArquitetura de Backend\b", "Backend Architecture"),
+            (r"\bModelagem de Banco de Dados\b", "Database Modeling"),
+            (r"\bFerramentas Internas\b", "Internal Tools"),
+            (r"\bAprendizado de Máquina\b", "Machine Learning"),
+            (r"\bCriptografia\b", "Cryptography"),
+            (r"\bSistemas Escaláveis\b", "Scalable Systems"),
+        )
+    for pattern, replacement in replacements:
+        localized = re.sub(pattern, replacement, localized, flags=re.IGNORECASE)
+    return _normalize_resume_copy(localized)
+
+
 def _is_resume_bullet(value: str) -> bool:
     stripped = value.strip()
     return stripped.startswith(("◦", "-", "*"))
@@ -3601,20 +3740,42 @@ def _required_resume_identity_tokens(snapshot: ResumeSourceSnapshot) -> tuple[st
     tokens: list[str] = []
     for entry in snapshot.experience_entries:
         if entry.company_name:
-            token = _normalize_comparison_text(entry.company_name)
+            token = _resume_identity_company_token(entry.company_name)
             if token:
                 tokens.append(token)
         if entry.date_range:
-            token = _normalize_comparison_text(entry.date_range)
+            token = _resume_identity_date_token(entry.date_range)
             if token:
                 tokens.append(token)
     for education in snapshot.education_entries:
-        for part in (education.institution, education.date_range):
-            if part:
-                token = _normalize_comparison_text(part)
-                if token:
-                    tokens.append(token)
+        if education.institution:
+            token = _normalize_comparison_text(education.institution)
+            if token:
+                tokens.append(token)
+        if education.date_range:
+            token = _resume_identity_date_token(education.date_range)
+            if token:
+                tokens.append(token)
     return tuple(dict.fromkeys(tokens))
+
+
+def _resume_identity_company_token(raw_value: str) -> str:
+    token = _normalize_comparison_text(raw_value)
+    if token in {"self employed", "autonomo"}:
+        return ""
+    return token
+
+
+def _resume_identity_date_token(raw_value: str) -> str:
+    matches = re.findall(r"\d{2}/\d{4}", raw_value)
+    if matches:
+        token = _normalize_comparison_text(" ".join(matches))
+        if token:
+            return token
+    token = _normalize_comparison_text(raw_value)
+    if token:
+        return token
+    return ""
 
 
 def _format_target_keyword_sentence(posting: JobPosting) -> str:

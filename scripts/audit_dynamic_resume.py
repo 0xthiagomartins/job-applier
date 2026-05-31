@@ -68,6 +68,39 @@ _PORTUGUESE_ENGLISH_LABEL_LEAKS = (
     "engineering practices:",
     "applied ai & automation:",
 )
+_PORTUGUESE_ENGLISH_META_LEAK_PATTERNS = (
+    r"\bpresent\b",
+    r"\bself-employed\b",
+    r"\bbrazil\b",
+)
+_TECHNICAL_LANGUAGE_ALLOWLIST = frozenset(
+    {
+        "python",
+        "javascript",
+        "typescript",
+        "java",
+        "aws",
+        "gcp",
+        "azure",
+        "rest apis",
+        "api",
+        "apis",
+        "devops",
+        "rag",
+        "rabbitmq",
+        "saas",
+        "legal-tech",
+        "legaltech",
+        "microservices",
+        "backend",
+        "full stack",
+        "full-stack",
+        "mobile",
+        "chatbot",
+        "chatbots",
+        "rust",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,6 +434,55 @@ def _audit_resume(
                     "english_labels_in_portuguese_resume",
                     "Portuguese resume still contains English section/category labels: "
                     + ", ".join(leaked_labels),
+                )
+            )
+        leaked_meta = [
+            pattern.strip("\\b")
+            for pattern in _PORTUGUESE_ENGLISH_META_LEAK_PATTERNS
+            if re.search(pattern, lower_markdown)
+        ]
+        if leaked_meta:
+            findings.append(
+                AuditFinding(
+                    "error",
+                    "english_meta_leaks_in_portuguese_resume",
+                    "Portuguese resume still contains untranslated English meta markers: "
+                    + ", ".join(leaked_meta),
+                )
+            )
+        mixed_skill_suffixes: list[str] = []
+        for heading, lines in sections.items():
+            normalized_heading = canonical_resume_section_title(heading) or heading.strip().lower()
+            if normalized_heading != "skills":
+                continue
+            for line in lines:
+                prefix, separator, suffix = line.partition(":")
+                normalized_suffix = suffix.strip()
+                if not separator or len(normalized_suffix.split()) < 2:
+                    continue
+                suffix_detection = detect_text_language(
+                    normalized_suffix,
+                    default_language=expected_language,
+                    source=str(markdown_path),
+                )
+                lower_suffix = normalized_suffix.lower()
+                non_technical_alpha = re.findall(r"[a-z]{4,}", lower_suffix)
+                if (
+                    suffix_detection.language is SupportedLanguage.ENGLISH
+                    and suffix_detection.confidence >= 0.45
+                    and len(non_technical_alpha) >= 2
+                    and not all(
+                        token in _TECHNICAL_LANGUAGE_ALLOWLIST for token in non_technical_alpha
+                    )
+                ):
+                    mixed_skill_suffixes.append(prefix.strip())
+        if mixed_skill_suffixes:
+            findings.append(
+                AuditFinding(
+                    "error",
+                    "english_skill_suffixes_in_portuguese_resume",
+                    "Portuguese resume still contains English-heavy skill/interests suffixes in: "
+                    + ", ".join(sorted(dict.fromkeys(mixed_skill_suffixes))),
                 )
             )
 

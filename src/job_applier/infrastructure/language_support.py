@@ -49,20 +49,20 @@ _FIELD_LABELS: dict[SupportedLanguage, dict[str, str]] = {
 _SKILL_CATEGORY_LABELS: dict[SupportedLanguage, dict[str, str]] = {
     SupportedLanguage.ENGLISH: {
         "core languages": "Core Languages",
-        "full stack & backend": "Full Stack & Backend",
+        "full stack backend": "Full Stack & Backend",
         "engineering practices": "Engineering Practices",
-        "applied ai & automation": "Applied AI & Automation",
-        "tools & platforms": "Tools & Platforms",
-        "cloud & platforms": "Cloud & Platforms",
+        "applied ai automation": "Applied AI & Automation",
+        "tools platforms": "Tools & Platforms",
+        "cloud platforms": "Cloud & Platforms",
         "interests": "Interests",
     },
     SupportedLanguage.PORTUGUESE: {
         "core languages": "Linguagens Principais",
-        "full stack & backend": "Full Stack e Backend",
+        "full stack backend": "Full Stack e Backend",
         "engineering practices": "Práticas de Engenharia",
-        "applied ai & automation": "IA Aplicada e Automação",
-        "tools & platforms": "Ferramentas e Plataformas",
-        "cloud & platforms": "Nuvem e Plataformas",
+        "applied ai automation": "IA Aplicada e Automação",
+        "tools platforms": "Ferramentas e Plataformas",
+        "cloud platforms": "Nuvem e Plataformas",
         "interests": "Interesses",
     },
 }
