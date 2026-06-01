@@ -47,6 +47,12 @@ class LocalPanelSettingsStore:
     def load(self) -> PanelSettingsDocument:
         """Load the persisted panel document or return defaults."""
 
+        document = self._load_persisted_document()
+        return self._apply_runtime_overrides(document)
+
+    def _load_persisted_document(self) -> PanelSettingsDocument:
+        """Load the persisted panel document without runtime-only overrides."""
+
         if not self._state_path.exists():
             bootstrap_document = self._build_bootstrap_document()
             if bootstrap_document is not None:
@@ -69,7 +75,7 @@ class LocalPanelSettingsStore:
     ) -> PanelSettingsDocument:
         """Persist the profile section and optional CV upload."""
 
-        document = self.load()
+        document = self._load_persisted_document()
         current_profile = document.profile
         cv_path = current_profile.cv_path
         cv_filename = current_profile.cv_filename
@@ -93,24 +99,24 @@ class LocalPanelSettingsStore:
             },
         )
         self._write(updated_document)
-        return updated_document
+        return self._apply_runtime_overrides(updated_document)
 
     def save_preferences(self, preferences_input: PreferencesFormInput) -> PanelSettingsDocument:
         """Persist search filters and user preferences."""
 
-        document = self.load()
+        document = self._load_persisted_document()
         updated_document = document.model_copy(
             update={
                 "preferences": StoredPreferencesSection(**preferences_input.model_dump()),
             },
         )
         self._write(updated_document)
-        return updated_document
+        return self._apply_runtime_overrides(updated_document)
 
     def save_ai(self, ai_input: AIFormInput) -> PanelSettingsDocument:
         """Persist AI settings while keeping an existing key when omitted."""
 
-        document = self.load()
+        document = self._load_persisted_document()
         existing_key = document.ai.api_key
         api_key = ai_input.api_key or existing_key
         updated_document = document.model_copy(
@@ -119,19 +125,19 @@ class LocalPanelSettingsStore:
             },
         )
         self._write(updated_document)
-        return updated_document
+        return self._apply_runtime_overrides(updated_document)
 
     def save_schedule(self, schedule_input: ScheduleFormInput) -> PanelSettingsDocument:
         """Persist the execution schedule used by the agent."""
 
-        document = self.load()
+        document = self._load_persisted_document()
         updated_document = document.model_copy(
             update={
                 "schedule": StoredScheduleSection(**schedule_input.model_dump()),
             },
         )
         self._write(updated_document)
-        return updated_document
+        return self._apply_runtime_overrides(updated_document)
 
     def _write(self, document: PanelSettingsDocument) -> None:
         """Write the full panel document atomically."""
@@ -142,6 +148,26 @@ class LocalPanelSettingsStore:
         temp_path = self._state_path.with_suffix(".tmp")
         temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         temp_path.replace(self._state_path)
+
+    def _apply_runtime_overrides(
+        self,
+        document: PanelSettingsDocument,
+    ) -> PanelSettingsDocument:
+        """Apply runtime-only values that should override persisted panel state."""
+
+        runtime_ai_key = self._resolve_runtime_ai_key()
+        if runtime_ai_key is None:
+            return document
+        if (
+            document.ai.api_key is not None
+            and document.ai.api_key.get_secret_value() == runtime_ai_key.get_secret_value()
+        ):
+            return document
+        return document.model_copy(
+            update={
+                "ai": document.ai.model_copy(update={"api_key": runtime_ai_key}),
+            },
+        )
 
     def _build_bootstrap_document(self) -> PanelSettingsDocument | None:
         """Build a local bootstrap document when the panel state is still empty."""
@@ -312,6 +338,17 @@ class LocalPanelSettingsStore:
         """Return the AI key used for local bootstrap, checking common env names."""
 
         if settings.openai_api_key is not None:
+            return settings.openai_api_key
+        raw_value = os.getenv("OPENAI_API_KEY") or os.getenv("JOB_APPLIER_OPENAI_API_KEY")
+        if raw_value:
+            return SecretStr(raw_value)
+        return None
+
+    def _resolve_runtime_ai_key(self) -> SecretStr | None:
+        """Return the effective AI key for runtime behavior, preferring env settings."""
+
+        settings = self._runtime_settings
+        if settings is not None and settings.openai_api_key is not None:
             return settings.openai_api_key
         raw_value = os.getenv("OPENAI_API_KEY") or os.getenv("JOB_APPLIER_OPENAI_API_KEY")
         if raw_value:
