@@ -277,7 +277,7 @@ def _extract_pdf_page_metrics_via_cli(pdf_path: Path | None) -> tuple[int | None
             text=True,
             timeout=10,
         ).stdout
-    except (OSError, subprocess.SubprocessError):
+    except OSError, subprocess.SubprocessError:
         return None, ()
     page_count: int | None = None
     for line in pdfinfo_output.splitlines():
@@ -299,7 +299,7 @@ def _extract_pdf_page_metrics_via_cli(pdf_path: Path | None) -> tuple[int | None
                 text=True,
                 timeout=10,
             ).stdout
-        except (OSError, subprocess.SubprocessError):
+        except OSError, subprocess.SubprocessError:
             return page_count, tuple(counts)
         counts.append(len(page_text.strip()))
     return page_count, tuple(counts)

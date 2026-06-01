@@ -3661,6 +3661,7 @@ def _localize_resume_phrase_overrides(
     localized = normalized
     if target_language is SupportedLanguage.PORTUGUESE:
         replacements = (
+            (r"\bApplied AI\b", "IA Aplicada"),
             (r"\bMicroservices\b", "Microserviços"),
             (r"\bSystem Integrations\b", "Integrações de Sistemas"),
             (r"\bBackend Architecture\b", "Arquitetura de Backend"),
@@ -3672,6 +3673,7 @@ def _localize_resume_phrase_overrides(
         )
     else:
         replacements = (
+            (r"\bIA Aplicada\b", "Applied AI"),
             (r"\bMicroserviços\b", "Microservices"),
             (r"\bIntegrações de Sistemas\b", "System Integrations"),
             (r"\bArquitetura de Backend\b", "Backend Architecture"),
