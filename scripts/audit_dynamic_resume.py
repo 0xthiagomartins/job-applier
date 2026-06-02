@@ -488,7 +488,14 @@ def _audit_resume(
 
     if job_title:
         title_capabilities = set(extract_capabilities_from_text(job_title))
-        if title_capabilities and not (generated_capabilities & title_capabilities):
+        supported_title_capabilities = {
+            capability
+            for capability in title_capabilities
+            if capability in anchored_capabilities or capability in _UNANCHORED_ALLOWED_TOKENS
+        }
+        if supported_title_capabilities and not (
+            generated_capabilities & supported_title_capabilities
+        ):
             findings.append(
                 AuditFinding(
                     "warning",
