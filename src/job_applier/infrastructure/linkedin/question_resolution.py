@@ -1531,6 +1531,17 @@ class LinkedInAnswerResolver:
     ) -> ResolvedFieldValue | None:
         normalized_validation = normalize_text(validation_message or "")
         adapted_field = self._adapt_field_for_validation_feedback(field, normalized_validation)
+        normalized_question = normalize_text(f"{field.question_raw} {field.normalized_key}")
+        prefer_numeric_coercion = (
+            adapted_field.question_type is QuestionType.YEARS_EXPERIENCE
+            or self._looks_like_experience_duration_question(normalized_question)
+            or (
+                _looks_like_generic_invalid_feedback(normalized_validation)
+                and "experience" in normalized_question
+                and not field.options
+                and field.control_kind in {"text", "textarea"}
+            )
+        )
         validation_context = ValidationFeedbackContext(
             validation_message=validation_message,
             current_value=current_value,
@@ -1581,6 +1592,7 @@ class LinkedInAnswerResolver:
             coerced_value = _coerce_value_for_validation_feedback(
                 raw_value,
                 validation_message=normalized_validation,
+                prefer_numeric=prefer_numeric_coercion,
             )
             if coerced_value is None:
                 continue
@@ -1599,6 +1611,7 @@ class LinkedInAnswerResolver:
             coerced_candidate = _coerce_value_for_validation_feedback(
                 candidate.value,
                 validation_message=normalized_validation,
+                prefer_numeric=prefer_numeric_coercion,
             )
             if coerced_candidate is None:
                 continue
@@ -2626,11 +2639,12 @@ def _coerce_value_for_validation_feedback(
     value: str,
     *,
     validation_message: str,
+    prefer_numeric: bool = False,
 ) -> str | None:
     stripped_value = value.strip()
     if not stripped_value:
         return None
-    if not _validation_requires_numeric(validation_message):
+    if not _validation_requires_numeric(validation_message) and not prefer_numeric:
         return stripped_value
 
     numeric_match = re.search(r"-?\d+(?:[.,]\d+)?", stripped_value)
@@ -2650,6 +2664,21 @@ def _coerce_value_for_validation_feedback(
     if numeric_value.is_integer():
         return str(int(numeric_value))
     return f"{numeric_value:.1f}".rstrip("0").rstrip(".")
+
+
+def _looks_like_generic_invalid_feedback(validation_message: str) -> bool:
+    if not validation_message:
+        return False
+    return any(
+        token in validation_message
+        for token in (
+            "invalid input",
+            "invalid value",
+            "input invalido",
+            "entrada invalida",
+            "valor invalido",
+        )
+    )
 
 
 def _looks_like_current_employer_question(field: EasyApplyField) -> bool:

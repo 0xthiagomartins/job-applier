@@ -113,6 +113,42 @@ class LinkedInEasyApplyError(RuntimeError):
     """Raised when the Easy Apply execution cannot continue."""
 
 
+def _field_has_explicit_invalid_feedback(field: EasyApplyField) -> bool:
+    feedback = normalize_text(f"{field.helper_text or ''} {field.field_context}")
+    if not feedback:
+        return False
+    return any(
+        token in feedback
+        for token in (
+            "invalid input",
+            "invalid value",
+            "error",
+            "required",
+            "obrigatorio",
+            "obrigatória",
+            "obrigatorio",
+            "invalido",
+            "inválido",
+        )
+    )
+
+
+def _resume_field_matches_requested_cv(
+    field: EasyApplyField,
+    *,
+    submission_cv_path: Path | None,
+    fallback_filename: str | None = None,
+) -> bool:
+    target_filename = (
+        submission_cv_path.name
+        if submission_cv_path is not None
+        else (fallback_filename.strip() if fallback_filename else None)
+    )
+    if target_filename is None:
+        return False
+    return _resume_option_match_score(field.current_value, target_filename) > 0
+
+
 @dataclass(frozen=True, slots=True)
 class EasyApplyStep:
     """Current Easy Apply step metadata and discovered controls."""
@@ -1371,12 +1407,45 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "classification_confidence": field.classification_confidence,
                     },
                 )
-            resolution = await self._answer_resolver.resolve(
-                field,
-                settings,
-                posting=posting,
-                semantic_plan=semantic_plan_by_ref.get(field_reference(field)),
+            force_resume_refresh = (
+                field.question_type is QuestionType.RESUME_UPLOAD
+                and submission_cv_path is not None
+                and not _resume_field_matches_requested_cv(
+                    field,
+                    submission_cv_path=submission_cv_path,
+                    fallback_filename=settings.profile.cv_filename,
+                )
             )
+            resolution: ResolvedFieldValue | None
+            if force_resume_refresh:
+                assert submission_cv_path is not None
+                resolution = ResolvedFieldValue(
+                    value=submission_cv_path.name,
+                    answer_source=AnswerSource.PROFILE_SNAPSHOT,
+                    fill_strategy=FillStrategy.DETERMINISTIC,
+                    confidence=1.0,
+                )
+            else:
+                resolution = await self._answer_resolver.resolve(
+                    field,
+                    settings,
+                    posting=posting,
+                    semantic_plan=semantic_plan_by_ref.get(field_reference(field)),
+                )
+            if (
+                resolution is None
+                and field.prefilled
+                and field_has_meaningful_current_value(field)
+                and _field_has_explicit_invalid_feedback(field)
+            ):
+                resolution = await self._answer_resolver.resolve_with_validation_feedback(
+                    field,
+                    settings,
+                    posting=posting,
+                    validation_message=field.helper_text or field.field_context,
+                    current_value=field.current_value,
+                    previous_answer=field.current_value,
+                )
             if resolution is None:
                 stage = (
                     "easy_apply_field_preserved"
@@ -2226,14 +2295,28 @@ class PlaywrightLinkedInEasyApplyExecutor:
         settings: UserAgentSettings,
         submission_cv_path: Path | None,
     ) -> str | None:
-        target_cv_name = settings.profile.cv_filename or (
-            submission_cv_path.name if submission_cv_path is not None else None
+        target_cv_name = (
+            submission_cv_path.name
+            if submission_cv_path is not None
+            else settings.profile.cv_filename
         )
         if target_cv_name is None:
             return None
         option_index = _pick_resume_option_index(field.options, target_cv_name)
         if option_index is None:
-            return target_cv_name
+            if submission_cv_path is not None and await self._upload_resume_from_choice_step(
+                page=page,
+                root=root,
+                submission_cv_path=submission_cv_path,
+            ):
+                return target_cv_name
+            if submission_cv_path is not None:
+                msg = (
+                    "LinkedIn Easy Apply did not expose the requested dynamic resume in the "
+                    "resume picker and the upload path could not be completed."
+                )
+                raise LinkedInEasyApplyError(msg)
+            return None
 
         match field.control_kind:
             case "radio":
@@ -2267,6 +2350,75 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 if locator is not None:
                     await self._select_field_option(locator, field, option_index=option_index)
                     return target_cv_name
+        return None
+
+    async def _upload_resume_from_choice_step(
+        self,
+        *,
+        page: Page,
+        root: Locator,
+        submission_cv_path: Path,
+    ) -> bool:
+        if not submission_cv_path.exists():
+            return False
+
+        direct_file_input = await self._locate_resume_file_input(root, page)
+        if direct_file_input is not None:
+            await direct_file_input.set_input_files(submission_cv_path)
+            await page.wait_for_timeout(750)
+            return True
+
+        upload_trigger = await self._locate_resume_upload_trigger(root)
+        if upload_trigger is None:
+            return False
+
+        try:
+            async with page.expect_file_chooser(timeout=2_500) as chooser_info:
+                await upload_trigger.click()
+            chooser = await chooser_info.value
+            await chooser.set_files(submission_cv_path)
+            await page.wait_for_timeout(900)
+            return True
+        except PlaywrightTimeoutError:
+            await upload_trigger.click()
+            await page.wait_for_timeout(250)
+
+        revealed_file_input = await self._locate_resume_file_input(root, page)
+        if revealed_file_input is None:
+            return False
+        await revealed_file_input.set_input_files(submission_cv_path)
+        await page.wait_for_timeout(900)
+        return True
+
+    async def _locate_resume_upload_trigger(self, root: Locator) -> Locator | None:
+        candidates = (
+            root.get_by_role("button", name=re.compile(r"upload\s+resume", re.I)),
+            root.get_by_role("link", name=re.compile(r"upload\s+resume", re.I)),
+            root.get_by_text(re.compile(r"upload\s+resume", re.I)),
+        )
+        for candidate in candidates:
+            try:
+                if await candidate.count() > 0:
+                    return candidate.first
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    async def _locate_resume_file_input(
+        self,
+        root: Locator,
+        page: Page,
+    ) -> Locator | None:
+        candidates = (
+            root.locator('input[type="file"]'),
+            page.locator('input[type="file"]'),
+        )
+        for candidate in candidates:
+            try:
+                if await candidate.count() > 0:
+                    return candidate.first
+            except Exception:  # noqa: BLE001
+                continue
         return None
 
     async def _check_radio_option(
@@ -3959,6 +4111,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
             extra_rules=(
                 "Use blocked when the screen shows a visible validation or completeness issue.",
                 (
+                    "Do not treat standalone helper counters like '1/20' or "
+                    "'1 of 20 characters' as validation errors unless the same field also "
+                    "shows explicit invalid/error wording or invalid styling."
+                ),
+                (
                     "Use complete only when the current step is clearly ready for the next "
                     "stage or has already advanced."
                 ),
@@ -4053,6 +4210,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     (
                         "Use blocked when a visible validation issue, chooser problem, or "
                         "blocking surface still prevents progress."
+                    ),
+                    (
+                        "Standalone helper counters like '1/20' or '1 of 20 characters' are "
+                        "not blocking errors by themselves. Treat them as helper text unless "
+                        "the same field also shows explicit invalid/error wording or invalid "
+                        "styling."
                     ),
                     (
                         "Use complete only when the current step is visibly ready for the "
@@ -4158,6 +4321,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
             ),
             extra_rules=(
                 "Use blocked when the visible issue is still preventing the step from continuing.",
+                (
+                    "Standalone helper counters like '1/20' or '1 of 20 characters' are not "
+                    "blocking errors by themselves. Treat them as helper text unless the same "
+                    "field also shows explicit invalid/error wording or invalid styling."
+                ),
                 (
                     "Use complete only when the current step is ready for the main "
                     "primary action or already advanced."
