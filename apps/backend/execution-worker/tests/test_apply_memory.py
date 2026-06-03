@@ -1,0 +1,329 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest.mock import patch
+from uuid import uuid4
+
+from job_applier.domain.entities import ApplyActionMemory
+from job_applier.domain.enums import QuestionType
+from job_applier.infrastructure.cache import DiskCacheApplyActionMemoryRepository
+from job_applier.infrastructure.linkedin.apply_memory import (
+    TASK_PRIMARY_ACTION,
+    AdaptiveApplyMemory,
+    build_step_task_signature,
+)
+from job_applier.infrastructure.linkedin.browser_agent import (
+    BrowserAgentAction,
+    BrowserAgentElement,
+    BrowserAgentSnapshot,
+)
+from job_applier.infrastructure.linkedin.easy_apply import PlaywrightLinkedInEasyApplyExecutor
+from job_applier.infrastructure.linkedin.question_resolution import EasyApplyField
+
+
+def _make_step_field(
+    *,
+    normalized_key: str,
+    question_type: QuestionType,
+    control_kind: str,
+) -> EasyApplyField:
+    return EasyApplyField(
+        question_raw=normalized_key,
+        normalized_key=normalized_key,
+        question_type=question_type,
+        control_kind=control_kind,  # type: ignore[arg-type]
+        input_type=control_kind,
+        required=True,
+    )
+
+
+def _make_snapshot(
+    *,
+    element_id: str,
+    step_index: int = 0,
+    total_steps: int = 4,
+    priority: bool = True,
+    label: str = "Next",
+    candidate_label: str | None = None,
+) -> BrowserAgentSnapshot:
+    return BrowserAgentSnapshot(
+        url="https://www.linkedin.com/jobs/view/123/",
+        title="Apply to ACME",
+        visible_text=f"Apply to ACME {step_index + 1}/{total_steps} pages contact info Next",
+        elements=(
+            BrowserAgentElement(
+                element_id="noise-1",
+                tag="button",
+                label="Back",
+                text="Back",
+                role="button",
+            ),
+            BrowserAgentElement(
+                element_id=element_id,
+                tag="button",
+                label=label,
+                text=label,
+                role="button",
+                is_priority_target=priority,
+                candidate_label=candidate_label,
+            ),
+            BrowserAgentElement(
+                element_id="noise-2",
+                tag="button",
+                label="Save",
+                text="Save",
+                role="button",
+                disabled=True,
+            ),
+        ),
+        active_surface="easy apply modal",
+    )
+
+
+class AdaptiveApplyMemoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp_dir.cleanup)
+        self.repository = DiskCacheApplyActionMemoryRepository(Path(self._temp_dir.name))
+        self.memory = AdaptiveApplyMemory(self.repository)
+        self.step_fields = (
+            _make_step_field(
+                normalized_key="first_name",
+                question_type=QuestionType.FIRST_NAME,
+                control_kind="text",
+            ),
+            _make_step_field(
+                normalized_key="email",
+                question_type=QuestionType.EMAIL,
+                control_kind="select",
+            ),
+        )
+        self.signature = build_step_task_signature(
+            task_type=TASK_PRIMARY_ACTION,
+            step_index=0,
+            total_steps=4,
+            surface_text="Apply to ACME 1/4 pages Contact info Next",
+            fields=self.step_fields,
+        )
+
+    def test_priority_target_memory_replays_across_snapshot_variants(self) -> None:
+        initial_snapshot = _make_snapshot(element_id="button-1")
+        action = BrowserAgentAction(
+            action_type="click",
+            element_id="button-1",
+            value_source=None,
+            value=None,
+            action_intent="advance_step",
+            key_name=None,
+            scroll_target=None,
+            scroll_direction=None,
+            scroll_amount=0,
+            wait_seconds=0,
+            reasoning="advance",
+        )
+
+        promoted = self.memory.promote_successful_action(
+            task_type=TASK_PRIMARY_ACTION,
+            signature_payload=self.signature,
+            action=action,
+            snapshot=initial_snapshot,
+        )
+        if promoted is None:
+            self.fail("expected memory promotion to succeed")
+        active_memory = self.memory.find_active_memory(
+            task_type=TASK_PRIMARY_ACTION,
+            signature_payload=self.signature,
+        )
+        if active_memory is None:
+            self.fail("expected active memory to be available")
+
+        for index in range(10):
+            with self.subTest(index=index):
+                variant_snapshot = BrowserAgentSnapshot(
+                    url=initial_snapshot.url,
+                    title=initial_snapshot.title,
+                    visible_text=initial_snapshot.visible_text,
+                    elements=(
+                        BrowserAgentElement(
+                            element_id=f"other-{index}",
+                            tag="button",
+                            label="Back",
+                            text="Back",
+                            role="button",
+                        ),
+                        BrowserAgentElement(
+                            element_id=f"replayed-{index}",
+                            tag="button",
+                            label="Continue",
+                            text="Continue",
+                            role="button",
+                            is_priority_target=True,
+                        ),
+                    ),
+                    active_surface=initial_snapshot.active_surface,
+                )
+                replayed = self.memory.replay_action(
+                    memory=active_memory,
+                    snapshot=variant_snapshot,
+                )
+                if replayed is None:
+                    self.fail("expected replayed action for priority target memory")
+                self.assertEqual(replayed.element_id, f"replayed-{index}")
+                self.assertEqual(replayed.action_type, "click")
+                self.assertEqual(replayed.action_intent, "advance_step")
+
+    def test_memory_refresh_and_replace_behaviour(self) -> None:
+        initial_snapshot = _make_snapshot(
+            element_id="button-1",
+            priority=False,
+            label="Especialista",
+        )
+        action = BrowserAgentAction(
+            action_type="click",
+            element_id="button-1",
+            value_source=None,
+            value=None,
+            action_intent="select_option",
+            key_name=None,
+            scroll_target=None,
+            scroll_direction=None,
+            scroll_amount=0,
+            wait_seconds=0,
+            reasoning="pick radio",
+        )
+
+        promoted = self.memory.promote_successful_action(
+            task_type=TASK_PRIMARY_ACTION,
+            signature_payload=self.signature,
+            action=action,
+            snapshot=initial_snapshot,
+        )
+        if promoted is None:
+            self.fail("expected initial promotion to succeed")
+        refreshed = self.memory.record_memory_hit_success(promoted)
+        self.assertEqual(refreshed.success_count, 2)
+        self.assertEqual(refreshed.failure_count, 0)
+        self.assertIsNotNone(refreshed.last_succeeded_at)
+        self.assertGreater(refreshed.expires_at, promoted.expires_at)
+
+        degraded = self.memory.record_memory_hit_failure(refreshed)
+        self.assertEqual(degraded.success_count, 2)
+        self.assertEqual(degraded.failure_count, 1)
+
+        replacement_snapshot = _make_snapshot(
+            element_id="button-99",
+            priority=False,
+            label="Avançado",
+            candidate_label="avançado",
+        )
+        replacement_action = BrowserAgentAction(
+            action_type="click",
+            element_id="button-99",
+            value_source=None,
+            value=None,
+            action_intent="select_option",
+            key_name=None,
+            scroll_target=None,
+            scroll_direction=None,
+            scroll_amount=0,
+            wait_seconds=0,
+            reasoning="pick better radio",
+        )
+        replaced = self.memory.promote_successful_action(
+            task_type=TASK_PRIMARY_ACTION,
+            signature_payload=self.signature,
+            action=replacement_action,
+            snapshot=replacement_snapshot,
+            existing_memory=degraded,
+            replace_existing=True,
+        )
+        if replaced is None:
+            self.fail("expected replacement promotion to succeed")
+        self.assertEqual(replaced.id, degraded.id)
+        self.assertEqual(replaced.failure_count, 0)
+        self.assertEqual(replaced.success_count, degraded.success_count + 1)
+        replayed = self.memory.replay_action(
+            memory=replaced,
+            snapshot=BrowserAgentSnapshot(
+                url=replacement_snapshot.url,
+                title=replacement_snapshot.title,
+                visible_text=replacement_snapshot.visible_text,
+                elements=(
+                    BrowserAgentElement(
+                        element_id="first-match",
+                        tag="button",
+                        label="Avançado",
+                        text="Avançado",
+                        role="button",
+                    ),
+                    BrowserAgentElement(
+                        element_id="priority-match",
+                        tag="button",
+                        label="Ignored label",
+                        text="Ignored label",
+                        role="button",
+                        candidate_label="avançado",
+                        is_priority_target=True,
+                    ),
+                ),
+                active_surface=replacement_snapshot.active_surface,
+            ),
+        )
+        if replayed is None:
+            self.fail("expected replayed action for label/candidate-label memory")
+        self.assertEqual(replayed.element_id, "priority-match")
+
+    def test_executor_emits_explicit_memory_timeline_events(self) -> None:
+        now = datetime.now(tz=UTC)
+        stored = self.repository.save(
+            ApplyActionMemory(
+                id=uuid4(),
+                task_type=TASK_PRIMARY_ACTION,
+                signature_hash="abc123",
+                signature_json=json.dumps({"signature": "v1"}),
+                strategy_payload_json=json.dumps(
+                    {
+                        "action_type": "click",
+                        "action_intent": "advance_step",
+                        "anchor": {"kind": "priority_target"},
+                        "scroll_amount": 0,
+                        "scroll_direction": None,
+                        "scroll_target": None,
+                        "wait_seconds": 0,
+                        "key_name": None,
+                    }
+                ),
+                success_count=1,
+                failure_count=0,
+                created_at=now,
+                last_used_at=now,
+                last_succeeded_at=now,
+                expires_at=now + timedelta(days=30),
+            )
+        )
+
+        executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
+        executor._apply_memory = self.memory
+
+        with patch(
+            "job_applier.infrastructure.linkedin.easy_apply.append_timeline_event"
+        ) as timeline:
+            executor._record_apply_memory_success(stored, task_type=TASK_PRIMARY_ACTION)
+            executor._record_apply_memory_failure(stored, task_type=TASK_PRIMARY_ACTION)
+
+        event_types = [call.args[0] for call in timeline.call_args_list]
+        self.assertEqual(event_types, ["apply_memory_refreshed", "apply_memory_degraded"])
+        refresh_payload = timeline.call_args_list[0].args[1]
+        degrade_payload = timeline.call_args_list[1].args[1]
+        self.assertEqual(refresh_payload["task_type"], TASK_PRIMARY_ACTION)
+        self.assertEqual(degrade_payload["task_type"], TASK_PRIMARY_ACTION)
+        self.assertIn("success_count", refresh_payload)
+        self.assertIn("failure_count", degrade_payload)
+
+
+if __name__ == "__main__":
+    unittest.main()

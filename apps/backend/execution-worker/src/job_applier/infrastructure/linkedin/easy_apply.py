@@ -4569,14 +4569,18 @@ class PlaywrightLinkedInEasyApplyExecutor:
         )
         stale_memory: ApplyActionMemory | None = None
         try:
+            replay_root = await self._easy_apply_root(page)
+            replay_footer_primary = await self._locate_easy_apply_footer_primary_button(replay_root)
             memory_entry, memory_action, _ = await self._attempt_replay_apply_memory(
                 browser_agent=browser_agent,
                 page=page,
                 task_type=TASK_PRIMARY_ACTION,
                 signature_payload=signature_payload,
                 available_values={},
-                focus_locator=await self._easy_apply_root(page),
-                priority_locator=None,
+                focus_locator=replay_root,
+                priority_locator=(
+                    replay_footer_primary[0] if replay_footer_primary is not None else None
+                ),
             )
             if memory_entry is not None and memory_action is not None:
                 memory_succeeded = False
@@ -6247,7 +6251,44 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 "action_intent": action.action_intent,
             },
         )
+        self._append_apply_memory_timeline(
+            "apply_memory_replayed",
+            task_type=task_type,
+            signature_hash=memory.signature_hash,
+            action_type=action.action_type,
+            action_intent=action.action_intent,
+            success_count=memory.success_count,
+            failure_count=memory.failure_count,
+        )
         return memory, action, snapshot
+
+    def _append_apply_memory_timeline(
+        self,
+        event_type: str,
+        *,
+        task_type: str,
+        signature_hash: str,
+        success_count: int | None = None,
+        failure_count: int | None = None,
+        action_type: str | None = None,
+        action_intent: str | None = None,
+        replace_existing: bool | None = None,
+    ) -> None:
+        payload: dict[str, object] = {
+            "task_type": task_type,
+            "signature_hash": signature_hash,
+        }
+        if success_count is not None:
+            payload["success_count"] = success_count
+        if failure_count is not None:
+            payload["failure_count"] = failure_count
+        if action_type is not None:
+            payload["action_type"] = action_type
+        if action_intent is not None:
+            payload["action_intent"] = action_intent
+        if replace_existing is not None:
+            payload["replace_existing"] = replace_existing
+        append_timeline_event(event_type, payload)
 
     def _record_apply_memory_success(
         self,
@@ -6266,6 +6307,13 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 "success_count": refreshed.success_count,
             },
         )
+        self._append_apply_memory_timeline(
+            "apply_memory_refreshed",
+            task_type=task_type,
+            signature_hash=refreshed.signature_hash,
+            success_count=refreshed.success_count,
+            failure_count=refreshed.failure_count,
+        )
 
     def _record_apply_memory_failure(
         self,
@@ -6283,6 +6331,13 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 "signature_hash": updated.signature_hash,
                 "failure_count": updated.failure_count,
             },
+        )
+        self._append_apply_memory_timeline(
+            "apply_memory_degraded",
+            task_type=task_type,
+            signature_hash=updated.signature_hash,
+            success_count=updated.success_count,
+            failure_count=updated.failure_count,
         )
 
     def _promote_apply_memory(
@@ -6315,6 +6370,16 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 "replace_existing": replace_existing,
                 "success_count": promoted.success_count,
             },
+        )
+        self._append_apply_memory_timeline(
+            "apply_memory_promoted",
+            task_type=task_type,
+            signature_hash=promoted.signature_hash,
+            success_count=promoted.success_count,
+            failure_count=promoted.failure_count,
+            action_type=action.action_type,
+            action_intent=action.action_intent,
+            replace_existing=replace_existing,
         )
 
     async def _pause_before_navigation(self, page: Page, *, reason: str) -> None:
