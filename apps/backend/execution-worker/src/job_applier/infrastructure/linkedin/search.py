@@ -1127,15 +1127,18 @@ class PlaywrightLinkedInJobsClient:
             primary_error: Exception | None = None
             try:
                 for attempt in range(2):
+                    attempt_error: Exception | None = None
                     context = await session_manager.create_authenticated_context(browser)
                     try:
                         jobs = await self._fetch_jobs_once(context, criteria)
                         return jobs
-                    except LinkedInAuthError:
+                    except LinkedInAuthError as exc:
+                        attempt_error = exc
                         session_manager.clear_saved_state()
                         if attempt == 1:
                             raise
                     except Exception as exc:  # noqa: BLE001
+                        attempt_error = exc
                         primary_error = exc
                         raise
                     finally:
@@ -1149,7 +1152,7 @@ class PlaywrightLinkedInJobsClient:
                                     "criteria": criteria.to_log_payload(),
                                 },
                             )
-                            if primary_error is None and jobs is None:
+                            if primary_error is None and attempt_error is None and jobs is None:
                                 raise
             finally:
                 try:
@@ -1187,16 +1190,19 @@ class PlaywrightLinkedInJobsClient:
             primary_error: Exception | None = None
             try:
                 for attempt in range(2):
+                    attempt_error: Exception | None = None
                     context = await session_manager.create_authenticated_context(browser)
                     try:
                         await self._fetch_jobs_once(context, criteria, on_job=on_job)
                         stream_completed = True
                         return
-                    except LinkedInAuthError:
+                    except LinkedInAuthError as exc:
+                        attempt_error = exc
                         session_manager.clear_saved_state()
                         if attempt == 1:
                             raise
                     except Exception as exc:  # noqa: BLE001
+                        attempt_error = exc
                         primary_error = exc
                         raise
                     finally:
@@ -1210,7 +1216,11 @@ class PlaywrightLinkedInJobsClient:
                                     "criteria": criteria.to_log_payload(),
                                 },
                             )
-                            if primary_error is None and not stream_completed:
+                            if (
+                                primary_error is None
+                                and attempt_error is None
+                                and not stream_completed
+                            ):
                                 raise
             finally:
                 try:

@@ -1696,6 +1696,21 @@ class LinkedInAnswerResolver:
         if field.prefilled and field_has_meaningful_current_value(field):
             return None
 
+        sensitive_guardrail = _resolve_sensitive_demographic_guardrail(field)
+        if sensitive_guardrail is not None:
+            return ResolvedFieldValue(
+                value=sensitive_guardrail.value,
+                answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
+                fill_strategy=FillStrategy.BEST_EFFORT,
+                ambiguity_flag=True,
+                confidence=sensitive_guardrail.confidence,
+                reasoning=sensitive_guardrail.reasoning,
+            )
+        if _looks_like_sensitive_demographic_question(field):
+            return None
+        if _looks_like_sensitive_demographic_gate_question(field):
+            return None
+
         semantic_plan_value = self._resolve_semantic_plan_value(
             field,
             settings,
@@ -1742,19 +1757,6 @@ class LinkedInAnswerResolver:
 
         if not settings.ruleset.allow_best_effort_autofill:
             return None
-
-        if _looks_like_sensitive_demographic_question(field):
-            sensitive_opt_out = _resolve_sensitive_opt_out_answer(field)
-            if sensitive_opt_out is None:
-                return None
-            return ResolvedFieldValue(
-                value=sensitive_opt_out.value,
-                answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
-                fill_strategy=FillStrategy.BEST_EFFORT,
-                ambiguity_flag=True,
-                confidence=sensitive_opt_out.confidence,
-                reasoning=sensitive_opt_out.reasoning,
-            )
 
         ai_answer = await self._generate_ai_answer(field=field, settings=settings, posting=posting)
         if ai_answer is not None:
@@ -2792,6 +2794,10 @@ def field_needs_semantic_step_planning(field: EasyApplyField) -> bool:
 
     if field.prefilled and field_has_meaningful_current_value(field):
         return False
+    if _looks_like_sensitive_demographic_question(field):
+        return False
+    if _looks_like_sensitive_demographic_gate_question(field):
+        return False
     if field.question_type is QuestionType.UNKNOWN:
         return True
     if field.classification_confidence < 0.75:
@@ -3188,6 +3194,38 @@ def _looks_like_sensitive_demographic_question(field: EasyApplyField) -> bool:
     )
 
 
+def _looks_like_sensitive_demographic_gate_question(field: EasyApplyField) -> bool:
+    normalized = normalize_text(f"{field.question_raw} {field.normalized_key}")
+    if not any(
+        token in normalized
+        for token in (
+            "opcional",
+            "optional",
+            "afirmativ",
+            "affirmative action",
+            "demographic",
+            "demograf",
+            "self identify",
+            "autoident",
+        )
+    ):
+        return False
+    return any(
+        token in normalized
+        for token in (
+            "comfortable",
+            "comfortavel",
+            "confortavel",
+            "feel comfortable",
+            "se sente confort",
+            "responder as questoes abaixo",
+            "answer the questions below",
+            "answer the questions that follow",
+            "responder as perguntas abaixo",
+        )
+    )
+
+
 def _pick_sensitive_opt_out_option(options: tuple[str, ...]) -> str | None:
     for option in options:
         normalized_option = normalize_text(option)
@@ -3211,6 +3249,49 @@ def _resolve_sensitive_opt_out_answer(field: EasyApplyField) -> GuardrailAnswer 
         confidence=0.92,
         reasoning="sensitive_question_opt_out",
     )
+
+
+def _pick_sensitive_gate_decline_option(options: tuple[str, ...]) -> str | None:
+    decline_tokens = (
+        "no",
+        "nao",
+        "não",
+        "not comfortable",
+        "uncomfortable",
+        "prefer not",
+        "decline",
+        "prefiro nao",
+        "nao me sinto confortavel",
+        "não me sinto confortável",
+    )
+    for option in options:
+        normalized_option = normalize_text(option)
+        if normalized_option in _PLACEHOLDER_OPTION_TOKENS:
+            continue
+        if any(token in normalized_option for token in decline_tokens):
+            return option
+    return _pick_sensitive_opt_out_option(options)
+
+
+def _resolve_sensitive_demographic_gate_answer(field: EasyApplyField) -> GuardrailAnswer | None:
+    if not field.options:
+        return None
+    decline_option = _pick_sensitive_gate_decline_option(field.options)
+    if decline_option is None:
+        return None
+    return GuardrailAnswer(
+        value=decline_option,
+        confidence=0.96,
+        reasoning="sensitive_demographic_gate_decline",
+    )
+
+
+def _resolve_sensitive_demographic_guardrail(field: EasyApplyField) -> GuardrailAnswer | None:
+    if _looks_like_sensitive_demographic_gate_question(field):
+        return _resolve_sensitive_demographic_gate_answer(field)
+    if _looks_like_sensitive_demographic_question(field):
+        return _resolve_sensitive_opt_out_answer(field)
+    return None
 
 
 def _profile_first_name(full_name: str) -> str:

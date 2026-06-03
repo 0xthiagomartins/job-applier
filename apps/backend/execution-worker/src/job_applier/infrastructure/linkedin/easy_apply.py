@@ -99,6 +99,8 @@ from job_applier.infrastructure.linkedin.question_resolution import (
     LinkedInAnswerResolver,
     LinkedInQuestionExtractor,
     ResolvedFieldValue,
+    _looks_like_sensitive_demographic_gate_question,
+    _looks_like_sensitive_demographic_question,
     _profile_first_name,
     _profile_last_name,
     field_has_meaningful_current_value,
@@ -125,6 +127,12 @@ from job_applier.settings import RuntimeSettings
 logger = logging.getLogger(__name__)
 
 _FIELD_STATE_INSPECTION_TIMEOUT_MS = 5_000
+
+
+def _field_disallows_adaptive_resolution_memory(field: EasyApplyField) -> bool:
+    return _looks_like_sensitive_demographic_question(
+        field
+    ) or _looks_like_sensitive_demographic_gate_question(field)
 
 
 class LinkedInEasyApplyError(RuntimeError):
@@ -505,8 +513,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
 
         try:
             with bind_submission_context(submission_id):
-                await self._pause_before_navigation(page, reason="job_detail_open")
-                await page.goto(posting.url, wait_until="domcontentloaded")
+                await self._open_job_detail_page(page, posting=posting)
                 await self._ensure_authenticated_page(page)
                 update_progress_snapshot(
                     {
@@ -1093,7 +1100,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             notes=notes,
                         )
 
-                    if action.action_intent == "submit_application":
+                    if self._action_indicates_submission(action):
                         update_progress_snapshot(
                             {
                                 "current_stage": "easy_apply_submit_triggered",
@@ -1110,6 +1117,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                 "job_posting_id": str(posting.id),
                                 "step_index": step.step_index,
                                 "reasoning": action.reasoning,
+                                "action_type": action.action_type,
+                                "action_intent": action.action_intent,
                             },
                         )
                         success, outcome_notes = await self._await_submission_outcome(
@@ -4709,8 +4718,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         current_step.step_index != step.step_index
                         or _step_surface_changed(step, current_step)
                     )
-                elif memory_action.action_intent == "submit_application":
-                    memory_succeeded = not await self._easy_apply_modal_visible(page)
+                elif self._action_indicates_submission(memory_action):
+                    memory_succeeded = await self._submission_confirmation_visible(page)
+                    if not memory_succeeded:
+                        memory_succeeded = not await self._easy_apply_modal_visible(page)
 
                 if memory_succeeded:
                     self._record_apply_memory_success(memory_entry, task_type=TASK_PRIMARY_ACTION)
@@ -4787,8 +4798,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             current_step.step_index != step.step_index
                             or _step_surface_changed(step, current_step)
                         )
-                    elif footer_action.action_intent == "submit_application":
-                        action_succeeded = not await self._easy_apply_modal_visible(page)
+                    elif self._action_indicates_submission(footer_action):
+                        action_succeeded = await self._submission_confirmation_visible(page)
+                        if not action_succeeded:
+                            action_succeeded = not await self._easy_apply_modal_visible(page)
 
                     if action_succeeded:
                         if footer_snapshot is not None:
@@ -4892,10 +4905,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "reasoning": action.reasoning,
                     },
                 )
-                if action.action_type == "click" and action.action_intent in {
-                    "advance_step",
-                    "submit_application",
-                }:
+                if action.action_type == "click" and (
+                    action.action_intent == "advance_step"
+                    or self._action_indicates_submission(action)
+                ):
                     if action.action_intent == "advance_step":
                         await self._wait_for_easy_apply_surface(page)
                     self._promote_apply_memory(
@@ -4906,6 +4919,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         existing_memory=stale_memory,
                         replace_existing=stale_memory is not None,
                     )
+                    return action
+                if action.action_type == "done" and self._action_indicates_submission(action):
                     return action
                 if action.action_type in {"done", "fail"}:
                     return action
@@ -5037,6 +5052,19 @@ class PlaywrightLinkedInEasyApplyExecutor:
 
         return "advance_step"
 
+    def _action_indicates_submission(self, action: BrowserAgentAction) -> bool:
+        normalized_intent = normalize_text(action.action_intent or "")
+        if normalized_intent in {
+            "submit_application",
+            "application_submitted",
+            "submitted",
+            "submission_complete",
+        }:
+            return True
+        return action.action_type == "done" and any(
+            token in normalized_intent for token in ("submit", "submitted", "complete", "completed")
+        )
+
     async def _read_locator_text(self, locator: Locator) -> str:
         try:
             label = await locator.inner_text(timeout=500)
@@ -5052,11 +5080,15 @@ class PlaywrightLinkedInEasyApplyExecutor:
     async def _wait_for_easy_apply_surface(self, page: Page, *, timeout_ms: int = 10_000) -> None:
         deadline = asyncio.get_running_loop().time() + max(1, timeout_ms) / 1_000
         while True:
+            if await self._submission_confirmation_visible(page):
+                return
             if await self._easy_apply_surface_ready(page):
                 return
             if asyncio.get_running_loop().time() >= deadline:
                 break
             await page.wait_for_timeout(350)
+        if await self._submission_confirmation_visible(page):
+            return
         if await self._easy_apply_modal_visible(page):
             msg = "LinkedIn Easy Apply dialog did not finish loading after the last step action."
         else:
@@ -5174,6 +5206,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
         execution_events: list[ExecutionEvent],
         recent_actions: tuple[dict[str, object], ...] = (),
     ) -> tuple[bool, str | None]:
+        if await self._submission_confirmation_visible(page):
+            return True, "LinkedIn Easy Apply submitted successfully."
         for attempt_index in range(self._agentic_retry_budget(default=20, production_cap=6)):
             assessment = await self._assess_browser_state_with_agent(
                 page,
@@ -5217,6 +5251,79 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 return False, assessment.summary or "LinkedIn blocked the application flow."
             await page.wait_for_timeout(750)
         return False, "LinkedIn did not confirm the application result in time."
+
+    async def _submission_confirmation_visible(self, page: Page) -> bool:
+        try:
+            return bool(
+                await page.evaluate(
+                    """
+                    () => {
+                      const collapse = (value) =>
+                        (value || "").replace(/\\s+/g, " ").trim().toLowerCase();
+                      const isVisible = (element) => {
+                        if (!element) {
+                          return false;
+                        }
+                        const style = window.getComputedStyle(element);
+                        if (
+                          style.display === "none" ||
+                          style.visibility === "hidden" ||
+                          style.opacity === "0"
+                        ) {
+                          return false;
+                        }
+                        const rect = element.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0;
+                      };
+                      const visibleTexts = Array.from(
+                        document.querySelectorAll("h1, h2, h3, p, span, div, button")
+                      )
+                        .filter(isVisible)
+                        .map((element) => collapse(
+                          element.innerText
+                          || element.textContent
+                          || element.getAttribute("aria-label")
+                          || ""
+                        ))
+                        .filter(Boolean);
+                      const pageText = visibleTexts.join(" ");
+                      const hasSubmittedText =
+                        pageText.includes("application submitted")
+                        || pageText.includes("application sent")
+                        || pageText.includes("your application was sent")
+                        || pageText.includes("candidatura enviada")
+                        || pageText.includes("candidatura enviada agora")
+                        || pageText.includes("inscrição enviada")
+                        || pageText.includes("aplicação enviada");
+                      if (!hasSubmittedText) {
+                        return false;
+                      }
+                      const dismissLikeButtons = visibleTexts.filter(
+                        (text) =>
+                          text.includes("done")
+                          || text.includes("close")
+                          || text.includes("dismiss")
+                          || text.includes("fechar")
+                          || text.includes("concluído")
+                          || text.includes("concluido")
+                          || text.includes("descartar")
+                      );
+                      const profileButtons = visibleTexts.filter(
+                        (text) =>
+                          text.includes("update profile")
+                          || text.includes("atualizar perfil")
+                      );
+                      return (
+                        dismissLikeButtons.length > 0
+                        || profileButtons.length > 0
+                        || hasSubmittedText
+                      );
+                    }
+                    """,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return False
 
     async def _assess_easy_apply_step_state(
         self,
@@ -6330,6 +6437,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
         task_type = resolution_task_type_for_field(field)
         if task_type is None:
             return None, None, None, None
+        if _field_disallows_adaptive_resolution_memory(field):
+            return None, None, None, None
         signature_payload = build_field_resolution_task_signature(
             task_type=task_type,
             field=field,
@@ -6365,6 +6474,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
         field: EasyApplyField,
         resolution: ResolvedFieldValue,
     ) -> bool:
+        if _field_disallows_adaptive_resolution_memory(field):
+            return False
         task_type = resolution_task_type_for_field(field)
         if task_type not in {TASK_RESOLVE_CHECKBOX, TASK_RESOLVE_RADIO, TASK_RESOLVE_SELECT}:
             return False
@@ -6637,6 +6748,44 @@ class PlaywrightLinkedInEasyApplyExecutor:
         )
         logger.info("linkedin_navigation_delay", extra={"reason": reason, "delay_ms": delay_ms})
         await page.wait_for_timeout(delay_ms)
+
+    async def _open_job_detail_page(self, page: Page, *, posting: JobPosting) -> None:
+        default_timeout_ms = self._runtime_settings.linkedin_default_timeout_ms
+        timeout_attempts = (
+            default_timeout_ms,
+            max(default_timeout_ms * 2, 30_000),
+        )
+        last_error: Exception | None = None
+        for attempt_index, timeout_ms in enumerate(timeout_attempts):
+            await self._pause_before_navigation(page, reason="job_detail_open")
+            try:
+                await page.goto(
+                    posting.url,
+                    wait_until="domcontentloaded",
+                    timeout=timeout_ms,
+                )
+                return
+            except PlaywrightTimeoutError as exc:
+                last_error = exc
+                append_timeline_event(
+                    "easy_apply_job_page_retry",
+                    {
+                        "job_posting_id": str(posting.id),
+                        "external_job_id": posting.external_job_id,
+                        "attempt_index": attempt_index,
+                        "timeout_ms": timeout_ms,
+                        "error": str(exc),
+                    },
+                )
+                if attempt_index >= len(timeout_attempts) - 1:
+                    break
+                try:
+                    await page.goto("about:blank", wait_until="domcontentloaded", timeout=5_000)
+                except Exception:  # noqa: BLE001
+                    pass
+                await page.wait_for_timeout(500)
+        msg = "LinkedIn job page did not finish loading in time for the current Easy Apply flow."
+        raise LinkedInEasyApplyError(msg) from last_error
 
     async def _start_trace(self, context: BrowserContext) -> bool:
         try:

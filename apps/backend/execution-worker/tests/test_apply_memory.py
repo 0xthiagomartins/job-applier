@@ -9,7 +9,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from job_applier.domain.entities import ApplyActionMemory
-from job_applier.domain.enums import QuestionType
+from job_applier.domain.enums import AnswerSource, FillStrategy, QuestionType
 from job_applier.infrastructure.cache import DiskCacheApplyActionMemoryRepository
 from job_applier.infrastructure.linkedin.apply_memory import (
     TASK_PRIMARY_ACTION,
@@ -24,7 +24,10 @@ from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserAgentSnapshot,
 )
 from job_applier.infrastructure.linkedin.easy_apply import PlaywrightLinkedInEasyApplyExecutor
-from job_applier.infrastructure.linkedin.question_resolution import EasyApplyField
+from job_applier.infrastructure.linkedin.question_resolution import (
+    EasyApplyField,
+    ResolvedFieldValue,
+)
 
 
 def _make_step_field(
@@ -381,6 +384,54 @@ class AdaptiveApplyMemoryTests(unittest.TestCase):
 
         replayed = self.memory.replay_resolution(memory=active_memory, field=replay_field)
         self.assertEqual(replayed, "Advanced")
+
+    def test_executor_skips_sensitive_resolution_memory_replay_and_promotion(self) -> None:
+        field = EasyApplyField(
+            question_raw="Gostaria de nos dizer sua identidade de gênero?",
+            normalized_key="gostaria_de_nos_dizer_sua_identidade_de_genero",
+            question_type=QuestionType.UNKNOWN,
+            control_kind="select",
+            input_type="select",
+            required=False,
+            options=("Homem Cisgênero", "Mulher Cisgênero", "Pessoa Não Binária"),
+        )
+        signature = build_field_resolution_task_signature(
+            task_type=TASK_RESOLVE_SELECT,
+            field=field,
+        )
+        promoted = self.memory.promote_successful_resolution(
+            task_type=TASK_RESOLVE_SELECT,
+            signature_payload=signature,
+            field=field,
+            resolved_value="Homem Cisgênero",
+        )
+        if promoted is None:
+            self.fail("expected stored memory entry for setup")
+
+        executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
+        executor._apply_memory = self.memory
+
+        (
+            memory_entry,
+            task_type,
+            signature_payload,
+            resolution,
+        ) = executor._replay_field_resolution_memory(field)
+        self.assertIsNone(memory_entry)
+        self.assertIsNone(task_type)
+        self.assertIsNone(signature_payload)
+        self.assertIsNone(resolution)
+
+        self.assertFalse(
+            executor._should_promote_field_resolution_memory(
+                field,
+                ResolvedFieldValue(
+                    value="Homem Cisgênero",
+                    answer_source=AnswerSource.AI,
+                    fill_strategy=FillStrategy.AUTOFILL_AI,
+                ),
+            )
+        )
 
     def test_executor_emits_explicit_memory_timeline_events(self) -> None:
         now = datetime.now(tz=UTC)
