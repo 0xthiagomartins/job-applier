@@ -4606,12 +4606,34 @@ class PlaywrightLinkedInEasyApplyExecutor:
 
             for action_round in range(self._agentic_retry_budget(default=4)):
                 root = await self._easy_apply_root(page)
-                footer_action = await self._click_easy_apply_footer_primary_button(
-                    page,
-                    root=root,
-                    step=step,
-                )
+                footer_primary = await self._locate_easy_apply_footer_primary_button(root)
+                footer_snapshot = None
+                footer_action = None
+                if footer_primary is not None:
+                    footer_button, footer_label = footer_primary
+                    footer_snapshot = await browser_agent.capture_task_snapshot(
+                        page=page,
+                        focus_locator=root,
+                        priority_locator=footer_button,
+                    )
+                    footer_action = await self._click_easy_apply_footer_primary_button(
+                        page,
+                        primary_button=footer_button,
+                        primary_label=footer_label,
+                        step=step,
+                    )
                 if footer_action is not None:
+                    if footer_snapshot is not None and footer_action.element_id is None:
+                        priority_element_id = next(
+                            (
+                                element.element_id
+                                for element in footer_snapshot.elements
+                                if element.is_priority_target
+                            ),
+                            None,
+                        )
+                        if priority_element_id is not None:
+                            footer_action = replace(footer_action, element_id=priority_element_id)
                     last_action = footer_action
                     recent_actions.append(
                         {
@@ -4635,7 +4657,32 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             "reasoning": footer_action.reasoning,
                         },
                     )
-                    return footer_action
+                    action_succeeded = False
+                    if footer_action.action_intent == "advance_step":
+                        await self._wait_for_easy_apply_surface(page)
+                        current_step = await self._extract_step(
+                            page,
+                            last_known_step_index=step.step_index,
+                            last_known_total_steps=step.total_steps,
+                        )
+                        action_succeeded = (
+                            current_step.step_index != step.step_index
+                            or _step_surface_changed(step, current_step)
+                        )
+                    elif footer_action.action_intent == "submit_application":
+                        action_succeeded = not await self._easy_apply_modal_visible(page)
+
+                    if action_succeeded:
+                        if footer_snapshot is not None:
+                            self._promote_apply_memory(
+                                task_type=TASK_PRIMARY_ACTION,
+                                signature_payload=signature_payload,
+                                action=footer_action,
+                                snapshot=footer_snapshot,
+                                existing_memory=stale_memory,
+                                replace_existing=stale_memory is not None,
+                            )
+                        return footer_action
                 snapshot = await browser_agent.capture_task_snapshot(
                     page=page,
                     focus_locator=root,
@@ -4751,13 +4798,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
         msg = "Browser agent could not determine how to advance the Easy Apply step."
         raise LinkedInEasyApplyError(msg)
 
-    async def _click_easy_apply_footer_primary_button(
+    async def _locate_easy_apply_footer_primary_button(
         self,
-        page: Page,
-        *,
         root: Locator,
-        step: EasyApplyStep,
-    ) -> BrowserAgentAction | None:
+    ) -> tuple[Locator, str] | None:
         footers = root.locator("footer")
         footer_count = await footers.count()
         if footer_count == 0:
@@ -4795,6 +4839,17 @@ class PlaywrightLinkedInEasyApplyExecutor:
 
         if primary_button is None or primary_label is None:
             return None
+
+        return primary_button, primary_label
+
+    async def _click_easy_apply_footer_primary_button(
+        self,
+        page: Page,
+        *,
+        primary_button: Locator,
+        primary_label: str,
+        step: EasyApplyStep,
+    ) -> BrowserAgentAction | None:
 
         try:
             await primary_button.scroll_into_view_if_needed(timeout=2_000)
