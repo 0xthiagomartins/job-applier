@@ -13,7 +13,9 @@ from job_applier.domain.enums import QuestionType
 from job_applier.infrastructure.cache import DiskCacheApplyActionMemoryRepository
 from job_applier.infrastructure.linkedin.apply_memory import (
     TASK_PRIMARY_ACTION,
+    TASK_RESOLVE_SELECT,
     AdaptiveApplyMemory,
+    build_field_resolution_task_signature,
     build_step_task_signature,
 )
 from job_applier.infrastructure.linkedin.browser_agent import (
@@ -276,6 +278,109 @@ class AdaptiveApplyMemoryTests(unittest.TestCase):
         if replayed is None:
             self.fail("expected replayed action for label/candidate-label memory")
         self.assertEqual(replayed.element_id, "priority-match")
+
+    def test_resolution_memory_replays_select_option(self) -> None:
+        field = EasyApplyField(
+            question_raw="Como ficou sabendo da nossa vaga?",
+            normalized_key="referral_source",
+            question_type=QuestionType.FREE_TEXT_GENERIC,
+            control_kind="select",
+            input_type="select",
+            required=True,
+            options=("Select an option", "LinkedIn", "Indicação"),
+        )
+        signature = build_field_resolution_task_signature(
+            task_type=TASK_RESOLVE_SELECT,
+            field=field,
+        )
+        promoted = self.memory.promote_successful_resolution(
+            task_type=TASK_RESOLVE_SELECT,
+            signature_payload=signature,
+            field=field,
+            resolved_value="LinkedIn",
+        )
+        if promoted is None:
+            self.fail("expected select resolution memory promotion to succeed")
+
+        active_memory = self.memory.find_active_memory(
+            task_type=TASK_RESOLVE_SELECT,
+            signature_payload=signature,
+        )
+        if active_memory is None:
+            self.fail("expected select resolution memory to be available")
+
+        replayed = self.memory.replay_resolution(memory=active_memory, field=field)
+        self.assertEqual(replayed, "LinkedIn")
+
+        refreshed = self.memory.record_memory_hit_success(active_memory)
+        self.assertEqual(refreshed.success_count, 2)
+        self.assertGreater(refreshed.expires_at, active_memory.expires_at)
+
+    def test_resolution_memory_replays_proficiency_select_across_languages(self) -> None:
+        warmup_field = EasyApplyField(
+            question_raw="[EN] Qual é o seu nível de confiança ao se comunicar em inglês?",
+            normalized_key="english_proficiency",
+            question_type=QuestionType.FREE_TEXT_GENERIC,
+            control_kind="select",
+            input_type="select",
+            required=True,
+            options=(
+                "Select an option",
+                "Básico",
+                "Intermediário I",
+                "Intermediário II",
+                "Avançado",
+                "Proficiente",
+            ),
+        )
+        replay_field = EasyApplyField(
+            question_raw=(
+                "[EN] What is your level of confidence when communicating in an "
+                "English-speaking work environment?"
+            ),
+            normalized_key="english_proficiency",
+            question_type=QuestionType.FREE_TEXT_GENERIC,
+            control_kind="select",
+            input_type="select",
+            required=True,
+            options=(
+                "Select an option",
+                "Basic",
+                "Intermediate I",
+                "Intermediate II",
+                "Advanced",
+                "Proficient",
+            ),
+        )
+        warmup_signature = build_field_resolution_task_signature(
+            task_type=TASK_RESOLVE_SELECT,
+            field=warmup_field,
+        )
+        replay_signature = build_field_resolution_task_signature(
+            task_type=TASK_RESOLVE_SELECT,
+            field=replay_field,
+        )
+
+        self.assertEqual(warmup_signature, replay_signature)
+
+        promoted = self.memory.promote_successful_resolution(
+            task_type=TASK_RESOLVE_SELECT,
+            signature_payload=warmup_signature,
+            field=warmup_field,
+            resolved_value="Avançado",
+        )
+        if promoted is None:
+            self.fail("expected proficiency select resolution memory promotion to succeed")
+
+        active_memory = self.memory.find_active_memory(
+            task_type=TASK_RESOLVE_SELECT,
+            signature_payload=replay_signature,
+        )
+        if active_memory is None:
+            self.fail("expected proficiency select resolution memory to be available")
+
+        replayed = self.memory.replay_resolution(memory=active_memory, field=replay_field)
+        self.assertEqual(replayed, "Advanced")
 
     def test_executor_emits_explicit_memory_timeline_events(self) -> None:
         now = datetime.now(tz=UTC)

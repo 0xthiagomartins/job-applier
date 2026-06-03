@@ -72,9 +72,14 @@ from job_applier.infrastructure.linkedin.apply_memory import (
     TASK_FINALIZE_FIELD,
     TASK_FINALIZE_RADIO,
     TASK_PRIMARY_ACTION,
+    TASK_RESOLVE_CHECKBOX,
+    TASK_RESOLVE_RADIO,
+    TASK_RESOLVE_SELECT,
     AdaptiveApplyMemory,
+    build_field_resolution_task_signature,
     build_field_task_signature,
     build_step_task_signature,
+    resolution_task_type_for_field,
 )
 from job_applier.infrastructure.linkedin.auth import (
     LinkedInAuthError,
@@ -1534,6 +1539,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 )
             )
             resolution: ResolvedFieldValue | None
+            resolution_memory_entry: ApplyActionMemory | None = None
+            resolution_memory_task_type: str | None = None
+            resolution_memory_signature: dict[str, object] | None = None
+            stale_resolution_memory: ApplyActionMemory | None = None
             if force_resume_refresh:
                 assert submission_cv_path is not None
                 resolution = ResolvedFieldValue(
@@ -1543,11 +1552,28 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     confidence=1.0,
                 )
             else:
-                resolution = await self._answer_resolver.resolve(
-                    field,
-                    settings,
-                    posting=posting,
-                    semantic_plan=semantic_plan_by_ref.get(field_reference(field)),
+                (
+                    resolution_memory_entry,
+                    resolution_memory_task_type,
+                    resolution_memory_signature,
+                    resolution,
+                ) = self._replay_field_resolution_memory(field)
+                if resolution is None:
+                    resolution = await self._answer_resolver.resolve(
+                        field,
+                        settings,
+                        posting=posting,
+                        semantic_plan=semantic_plan_by_ref.get(field_reference(field)),
+                    )
+            if resolution is not None and resolution.fill_strategy is FillStrategy.ADAPTIVE_MEMORY:
+                logger.info(
+                    "linkedin_field_resolution_memory_replayed",
+                    extra={
+                        "step_index": step.step_index,
+                        "normalized_key": field.normalized_key,
+                        "question_type": field.question_type.value,
+                        "control_kind": field.control_kind,
+                    },
                 )
             if (
                 resolution is None
@@ -1599,6 +1625,32 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 settings,
                 submission_cv_path=submission_cv_path,
             )
+            if (
+                applied_value is None
+                and resolution_memory_entry is not None
+                and resolution_memory_task_type is not None
+            ):
+                self._record_apply_memory_failure(
+                    resolution_memory_entry,
+                    task_type=resolution_memory_task_type,
+                )
+                stale_resolution_memory = resolution_memory_entry
+                resolution_memory_entry = None
+                resolution = await self._answer_resolver.resolve(
+                    field,
+                    settings,
+                    posting=posting,
+                    semantic_plan=semantic_plan_by_ref.get(field_reference(field)),
+                )
+                if resolution is not None:
+                    applied_value = await self._apply_field_value(
+                        page,
+                        root,
+                        field,
+                        resolution,
+                        settings,
+                        submission_cv_path=submission_cv_path,
+                    )
             if applied_value is None:
                 self._record_event(
                     execution_events,
@@ -1611,11 +1663,34 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "normalized_key": field.normalized_key,
                         "question_type": field.question_type.value,
                         "control_kind": field.control_kind,
-                        "answer_source": resolution.answer_source.value,
-                        "fill_strategy": resolution.fill_strategy.value,
+                        "answer_source": (
+                            resolution.answer_source.value if resolution is not None else None
+                        ),
+                        "fill_strategy": (
+                            resolution.fill_strategy.value if resolution is not None else None
+                        ),
                     },
                 )
                 continue
+            assert resolution is not None
+            if resolution_memory_entry is not None and resolution_memory_task_type is not None:
+                self._record_apply_memory_success(
+                    resolution_memory_entry,
+                    task_type=resolution_memory_task_type,
+                )
+            elif (
+                resolution_memory_signature is not None
+                and resolution_memory_task_type is not None
+                and self._should_promote_field_resolution_memory(field, resolution)
+            ):
+                self._promote_field_resolution_memory(
+                    task_type=resolution_memory_task_type,
+                    signature_payload=resolution_memory_signature,
+                    field=field,
+                    resolved_value=applied_value,
+                    existing_memory=stale_resolution_memory,
+                    replace_existing=stale_resolution_memory is not None,
+                )
 
             if resolution.ambiguity_flag:
                 self._record_event(
@@ -3526,10 +3601,49 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 return True
             if option_label and await self._click_radio_text_target(option_locator, option_label):
                 if await self._radio_option_is_selected(root, field, option_index=option_index):
+                    synthetic_action = self._build_priority_target_click_action(
+                        snapshot=snapshot,
+                        action_intent="select_option",
+                    )
+                    if synthetic_action is not None:
+                        self._promote_apply_memory(
+                            task_type=TASK_FINALIZE_RADIO,
+                            signature_payload=signature_payload,
+                            action=synthetic_action,
+                            snapshot=snapshot,
+                            existing_memory=stale_memory,
+                            replace_existing=stale_memory is not None,
+                        )
                     return True
             if await self._activate_radio_option(root, option_locator):
+                synthetic_action = self._build_priority_target_click_action(
+                    snapshot=snapshot,
+                    action_intent="select_option",
+                )
+                if synthetic_action is not None:
+                    self._promote_apply_memory(
+                        task_type=TASK_FINALIZE_RADIO,
+                        signature_payload=signature_payload,
+                        action=synthetic_action,
+                        snapshot=snapshot,
+                        existing_memory=stale_memory,
+                        replace_existing=stale_memory is not None,
+                    )
                 return True
             if await self._radio_option_is_selected(root, field, option_index=option_index):
+                synthetic_action = self._build_priority_target_click_action(
+                    snapshot=snapshot,
+                    action_intent="select_option",
+                )
+                if synthetic_action is not None:
+                    self._promote_apply_memory(
+                        task_type=TASK_FINALIZE_RADIO,
+                        signature_payload=signature_payload,
+                        action=synthetic_action,
+                        snapshot=snapshot,
+                        existing_memory=stale_memory,
+                        replace_existing=stale_memory is not None,
+                    )
                 return True
         root = await self._easy_apply_root(page)
         option_locator = await self._resolve_radio_option_locator(
@@ -6199,6 +6313,140 @@ class PlaywrightLinkedInEasyApplyExecutor:
             openai_max_retries=self._runtime_settings.resolved_openai_responses_max_retries,
             openai_retry_max_delay_seconds=(
                 self._runtime_settings.openai_responses_retry_max_delay_seconds
+            ),
+        )
+
+    def _replay_field_resolution_memory(
+        self,
+        field: EasyApplyField,
+    ) -> tuple[
+        ApplyActionMemory | None,
+        str | None,
+        dict[str, object] | None,
+        ResolvedFieldValue | None,
+    ]:
+        if self._apply_memory is None:
+            return None, None, None, None
+        task_type = resolution_task_type_for_field(field)
+        if task_type is None:
+            return None, None, None, None
+        signature_payload = build_field_resolution_task_signature(
+            task_type=task_type,
+            field=field,
+        )
+        memory = self._apply_memory.find_active_memory(
+            task_type=task_type,
+            signature_payload=signature_payload,
+        )
+        if memory is None:
+            return None, task_type, signature_payload, None
+        remembered_value = self._apply_memory.replay_resolution(memory=memory, field=field)
+        if remembered_value is None:
+            return memory, task_type, signature_payload, None
+        resolution = ResolvedFieldValue(
+            value=remembered_value,
+            answer_source=AnswerSource.ADAPTIVE_MEMORY,
+            fill_strategy=FillStrategy.ADAPTIVE_MEMORY,
+            ambiguity_flag=True,
+            confidence=min(0.98, 0.62 + (0.04 * max(memory.success_count, 0))),
+            reasoning="adaptive_field_resolution_memory",
+        )
+        self._append_apply_memory_timeline(
+            "apply_memory_replayed",
+            task_type=task_type,
+            signature_hash=memory.signature_hash,
+            success_count=memory.success_count,
+            failure_count=memory.failure_count,
+        )
+        return memory, task_type, signature_payload, resolution
+
+    def _should_promote_field_resolution_memory(
+        self,
+        field: EasyApplyField,
+        resolution: ResolvedFieldValue,
+    ) -> bool:
+        task_type = resolution_task_type_for_field(field)
+        if task_type not in {TASK_RESOLVE_CHECKBOX, TASK_RESOLVE_RADIO, TASK_RESOLVE_SELECT}:
+            return False
+        if field.question_type is QuestionType.RESUME_UPLOAD:
+            return False
+        if resolution.answer_source not in {
+            AnswerSource.AI,
+            AnswerSource.BEST_EFFORT_AUTOFILL,
+            AnswerSource.ADAPTIVE_MEMORY,
+        }:
+            return False
+        return True
+
+    def _promote_field_resolution_memory(
+        self,
+        *,
+        task_type: str,
+        signature_payload: dict[str, object],
+        field: EasyApplyField,
+        resolved_value: str,
+        existing_memory: ApplyActionMemory | None = None,
+        replace_existing: bool = False,
+    ) -> None:
+        if self._apply_memory is None:
+            return
+        promoted = self._apply_memory.promote_successful_resolution(
+            task_type=task_type,
+            signature_payload=signature_payload,
+            field=field,
+            resolved_value=resolved_value,
+            existing_memory=existing_memory,
+            replace_existing=replace_existing,
+        )
+        if promoted is None:
+            return
+        logger.info(
+            "linkedin_field_resolution_memory_promoted",
+            extra={
+                "task_type": task_type,
+                "signature_hash": promoted.signature_hash,
+                "replace_existing": replace_existing,
+                "success_count": promoted.success_count,
+            },
+        )
+        self._append_apply_memory_timeline(
+            "apply_memory_promoted",
+            task_type=task_type,
+            signature_hash=promoted.signature_hash,
+            success_count=promoted.success_count,
+            failure_count=promoted.failure_count,
+            replace_existing=replace_existing,
+        )
+
+    def _build_priority_target_click_action(
+        self,
+        *,
+        snapshot: BrowserAgentSnapshot,
+        action_intent: str,
+    ) -> BrowserAgentAction | None:
+        priority_element = next(
+            (
+                element
+                for element in snapshot.elements
+                if element.is_priority_target and not element.disabled
+            ),
+            None,
+        )
+        if priority_element is None:
+            return None
+        return BrowserAgentAction(
+            action_type="click",
+            element_id=priority_element.element_id,
+            value_source=None,
+            value=None,
+            action_intent=action_intent,
+            key_name=None,
+            scroll_target=None,
+            scroll_direction=None,
+            scroll_amount=0,
+            wait_seconds=0,
+            reasoning=(
+                "Promoted a deterministic priority-target click that completed the radio selection."
             ),
         )
 

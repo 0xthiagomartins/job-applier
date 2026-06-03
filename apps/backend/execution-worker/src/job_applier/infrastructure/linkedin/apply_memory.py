@@ -20,7 +20,11 @@ from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserScrollDirection,
     BrowserScrollTarget,
 )
-from job_applier.infrastructure.linkedin.question_resolution import EasyApplyField, normalize_text
+from job_applier.infrastructure.linkedin.question_resolution import (
+    _PLACEHOLDER_OPTION_TOKENS,
+    EasyApplyField,
+    normalize_text,
+)
 
 MEMORY_TTL = timedelta(days=30)
 
@@ -29,6 +33,9 @@ TASK_PRIMARY_ACTION = "linkedin_easy_apply_primary_action"
 TASK_FINALIZE_CHECKBOX = "linkedin_easy_apply_finalize_checkbox"
 TASK_FINALIZE_RADIO = "linkedin_easy_apply_finalize_radio"
 TASK_FINALIZE_FIELD = "linkedin_easy_apply_finalize_field_interaction"
+TASK_RESOLVE_CHECKBOX = "linkedin_easy_apply_resolve_checkbox"
+TASK_RESOLVE_RADIO = "linkedin_easy_apply_resolve_radio"
+TASK_RESOLVE_SELECT = "linkedin_easy_apply_resolve_select"
 
 PROMOTABLE_TASKS = frozenset(
     {
@@ -36,6 +43,14 @@ PROMOTABLE_TASKS = frozenset(
         TASK_FINALIZE_CHECKBOX,
         TASK_FINALIZE_RADIO,
         TASK_FINALIZE_FIELD,
+    }
+)
+
+PROMOTABLE_RESOLUTION_TASKS = frozenset(
+    {
+        TASK_RESOLVE_CHECKBOX,
+        TASK_RESOLVE_RADIO,
+        TASK_RESOLVE_SELECT,
     }
 )
 
@@ -78,6 +93,30 @@ def build_field_task_signature(
         ],
         "validation_kind": normalize_text(validation_message or "")[:120],
     }
+
+
+def build_field_resolution_task_signature(*, task_type: str, field: EasyApplyField) -> MappingLike:
+    return {
+        "task_type": task_type,
+        "question_type": field.question_type.value,
+        "normalized_key": _structural_resolution_key(field),
+        "control_kind": field.control_kind,
+        "input_type": normalize_text(field.input_type or ""),
+        "required": field.required,
+        "option_signature": _structural_option_signature(field),
+    }
+
+
+def resolution_task_type_for_field(field: EasyApplyField) -> str | None:
+    match field.control_kind:
+        case "checkbox":
+            return TASK_RESOLVE_CHECKBOX
+        case "radio":
+            return TASK_RESOLVE_RADIO
+        case "select":
+            return TASK_RESOLVE_SELECT
+        case _:
+            return None
 
 
 def build_step_task_signature(
@@ -178,6 +217,36 @@ class AdaptiveApplyMemory:
             ),
         )
 
+    def replay_resolution(
+        self,
+        *,
+        memory: ApplyActionMemory,
+        field: EasyApplyField,
+    ) -> str | None:
+        payload = json.loads(memory.strategy_payload_json)
+        strategy_kind = str(payload.get("strategy_kind") or "").strip()
+        if strategy_kind == "semantic_option":
+            semantic_token = _optional_string(payload.get("semantic_token"))
+            if semantic_token is None:
+                return None
+            for option in field.options:
+                if _semantic_option_token(field, option) == semantic_token:
+                    return option
+            return None
+        if strategy_kind == "single_non_placeholder_option":
+            return _first_meaningful_option(field.options)
+        if strategy_kind == "selected_option":
+            preferred_value = _optional_string(payload.get("preferred_value"))
+            if preferred_value is None:
+                return None
+            return _pick_matching_option(field.options, preferred=preferred_value)
+        if strategy_kind == "checkbox_state":
+            desired_checked = payload.get("desired_checked")
+            if not isinstance(desired_checked, bool):
+                return None
+            return "Yes" if desired_checked else "No"
+        return None
+
     def record_memory_hit_success(self, memory: ApplyActionMemory) -> ApplyActionMemory:
         now = utc_now()
         updated = replace(
@@ -212,6 +281,52 @@ class AdaptiveApplyMemory:
             return None
 
         strategy_payload = self._strategy_payload_from_action(action=action, snapshot=snapshot)
+        if strategy_payload is None:
+            return None
+
+        now = utc_now()
+        self._repository.delete_expired(now=now)
+        if (
+            existing_memory is not None
+            and not replace_existing
+            and existing_memory.expires_at > now
+        ):
+            return existing_memory
+
+        entity = ApplyActionMemory(
+            id=existing_memory.id if existing_memory is not None else uuid4(),
+            task_type=task_type,
+            signature_hash=_signature_hash(task_type, signature_payload),
+            signature_json=_canonical_json(signature_payload),
+            strategy_payload_json=_canonical_json(strategy_payload),
+            success_count=(existing_memory.success_count + 1) if existing_memory else 1,
+            failure_count=(
+                0 if replace_existing or existing_memory is None else existing_memory.failure_count
+            ),
+            created_at=existing_memory.created_at if existing_memory else now,
+            last_used_at=now,
+            last_succeeded_at=now,
+            expires_at=now + MEMORY_TTL,
+        )
+        return self._repository.save(entity)
+
+    def promote_successful_resolution(
+        self,
+        *,
+        task_type: str,
+        signature_payload: MappingLike,
+        field: EasyApplyField,
+        resolved_value: str,
+        existing_memory: ApplyActionMemory | None = None,
+        replace_existing: bool = False,
+    ) -> ApplyActionMemory | None:
+        if task_type not in PROMOTABLE_RESOLUTION_TASKS:
+            return None
+
+        strategy_payload = self._resolution_strategy_payload(
+            field=field,
+            resolved_value=resolved_value,
+        )
         if strategy_payload is None:
             return None
 
@@ -281,6 +396,39 @@ class AdaptiveApplyMemory:
                 return None
             payload["anchor"] = anchor
         return payload
+
+    def _resolution_strategy_payload(
+        self,
+        *,
+        field: EasyApplyField,
+        resolved_value: str,
+    ) -> MappingLike | None:
+        match field.control_kind:
+            case "checkbox":
+                normalized_value = normalize_text(resolved_value)
+                desired_checked = normalized_value in {"yes", "sim", "true", "1"}
+                return {
+                    "strategy_kind": "checkbox_state",
+                    "desired_checked": desired_checked,
+                }
+            case "radio" | "select":
+                if _has_single_meaningful_option(field.options):
+                    return {"strategy_kind": "single_non_placeholder_option"}
+                semantic_token = _semantic_option_token(field, resolved_value)
+                if semantic_token is not None and semantic_token != "placeholder":
+                    return {
+                        "strategy_kind": "semantic_option",
+                        "semantic_token": semantic_token,
+                    }
+                preferred_value = _pick_matching_option(field.options, preferred=resolved_value)
+                if preferred_value is None:
+                    return None
+                return {
+                    "strategy_kind": "selected_option",
+                    "preferred_value": preferred_value,
+                }
+            case _:
+                return None
 
     def _anchor_for_element(self, element: BrowserAgentElement) -> MappingLike | None:
         if element.is_priority_target:
@@ -357,3 +505,190 @@ def _optional_string(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _pick_matching_option(options: tuple[str, ...], *, preferred: str) -> str | None:
+    normalized_preferred = normalize_text(preferred)
+    if not normalized_preferred:
+        return None
+    canonical_preferred = _canonical_binary_token(normalized_preferred)
+    for option in options:
+        normalized_option = normalize_text(option)
+        if normalized_option == normalized_preferred:
+            return option
+        if (
+            canonical_preferred is not None
+            and _canonical_binary_token(normalized_option) == canonical_preferred
+        ):
+            return option
+    for option in options:
+        normalized_option = normalize_text(option)
+        if normalized_preferred in normalized_option or normalized_option in normalized_preferred:
+            return option
+    return None
+
+
+def _structural_resolution_key(field: EasyApplyField) -> str:
+    normalized_key = normalize_text(field.normalized_key)
+    subject = _semantic_subject_key(field)
+    if _looks_like_proficiency_ladder_field(field):
+        return f"proficiency_ladder:{subject}:{field.control_kind}"
+    if _is_binary_like_field(field):
+        return f"binary_choice:{subject}:{field.control_kind}"
+    if _has_single_meaningful_option(field.options):
+        return f"single_choice:{subject}:{field.control_kind}"
+    return normalized_key
+
+
+def _structural_option_signature(field: EasyApplyField) -> list[str]:
+    signature: list[str] = []
+    for option in field.options[:8]:
+        if not option.strip():
+            continue
+        semantic_token = _semantic_option_token(field, option)
+        signature.append(semantic_token or normalize_text(option)[:120])
+    return signature
+
+
+def _semantic_option_token(field: EasyApplyField, option: str) -> str | None:
+    normalized_option = normalize_text(option)
+    if not normalized_option:
+        return None
+    if normalized_option in _PLACEHOLDER_OPTION_TOKENS:
+        return "placeholder"
+    binary_token = _canonical_binary_token(normalized_option)
+    if binary_token is not None:
+        return f"binary:{binary_token}"
+    if _looks_like_proficiency_ladder_field(field):
+        proficiency_token = _canonical_proficiency_token(normalized_option)
+        if proficiency_token is not None:
+            return f"proficiency:{proficiency_token}"
+    if _has_single_meaningful_option(field.options):
+        return "single_choice"
+    return None
+
+
+def _looks_like_proficiency_ladder_field(field: EasyApplyField) -> bool:
+    combined = normalize_text(" ".join((field.question_raw, field.normalized_key, *field.options)))
+    if not combined:
+        return False
+    proficiency_markers = (
+        "level",
+        "nivel",
+        "proficiency",
+        "fluency",
+        "confidence",
+        "confianca",
+        "knowledge",
+        "conhecimento",
+    )
+    if any(token in combined for token in proficiency_markers):
+        return any(
+            token in combined
+            for token in (
+                "advanced",
+                "avancado",
+                "intermediate",
+                "intermediario",
+                "basic",
+                "basico",
+                "beginner",
+                "iniciante",
+                "proficient",
+                "proficiente",
+                "expert",
+                "especialista",
+                "fluent",
+                "fluente",
+            )
+        )
+    return False
+
+
+def _is_binary_like_field(field: EasyApplyField) -> bool:
+    if field.control_kind == "checkbox":
+        return True
+    meaningful_options = [
+        option
+        for option in field.options
+        if normalize_text(option) not in _PLACEHOLDER_OPTION_TOKENS
+    ]
+    if not meaningful_options:
+        return False
+    return all(_canonical_binary_token(option) is not None for option in meaningful_options[:3])
+
+
+def _has_single_meaningful_option(options: tuple[str, ...]) -> bool:
+    return (
+        sum(1 for option in options if normalize_text(option) not in _PLACEHOLDER_OPTION_TOKENS)
+        == 1
+    )
+
+
+def _first_meaningful_option(options: tuple[str, ...]) -> str | None:
+    for option in options:
+        if normalize_text(option) not in _PLACEHOLDER_OPTION_TOKENS:
+            return option
+    return None
+
+
+def _semantic_subject_key(field: EasyApplyField) -> str:
+    combined = normalize_text(" ".join((field.question_raw, field.normalized_key)))
+    if any(token in combined for token in ("english", "ingles")):
+        return "english"
+    if any(token in combined for token in ("spanish", "espanhol", "espanol")):
+        return "spanish"
+    if any(token in combined for token in ("portuguese", "portugues")):
+        return "portuguese"
+    if "java" in combined:
+        return "java"
+    if any(token in combined for token in ("disability", "deficiencia", "pcd")):
+        return "disability"
+    if any(token in combined for token in ("gender", "genero", "gênero")):
+        return "gender"
+    if any(token in combined for token in ("race", "raca", "cor/ra")):
+        return "race"
+    return normalize_text(field.normalized_key)
+
+
+def _canonical_proficiency_token(value: str) -> str | None:
+    normalized = normalize_text(value)
+    roman_numeral = None
+    if " ii" in f" {normalized} " or " 2" in f" {normalized} ":
+        roman_numeral = "2"
+    elif " i" in f" {normalized} " or " 1" in f" {normalized} ":
+        roman_numeral = "1"
+
+    if any(token in normalized for token in ("basic", "basico", "beginner", "iniciante")):
+        return "basic"
+    if "intermediate" in normalized or "intermediario" in normalized:
+        if roman_numeral == "1":
+            return "intermediate_1"
+        if roman_numeral == "2":
+            return "intermediate_2"
+        return "intermediate"
+    if any(token in normalized for token in ("advanced", "avancado")):
+        return "advanced"
+    if any(
+        token in normalized
+        for token in (
+            "proficient",
+            "proficiente",
+            "expert",
+            "especialista",
+            "fluent",
+            "fluente",
+            "native",
+        )
+    ):
+        return "proficient"
+    return None
+
+
+def _canonical_binary_token(value: str) -> str | None:
+    normalized = normalize_text(value)
+    if normalized in {"yes", "y", "true", "sim", "s"}:
+        return "yes"
+    if normalized in {"no", "n", "false", "nao"}:
+        return "no"
+    return None

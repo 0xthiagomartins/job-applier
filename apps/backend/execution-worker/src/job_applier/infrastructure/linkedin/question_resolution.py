@@ -539,17 +539,60 @@ class LinkedInQuestionClassifier:
                 confidence=0.95,
                 matched_rule="salary_expectation",
             )
-        if self._contains_any(
-            normalized,
-            "start date",
-            "availability",
-            "notice period",
-            "when can you start",
-            "data de inicio",
-            "disponibilidade",
-            "quando pode comecar",
-            "quando voce pode comecar",
+        if self._looks_like_referral_source_question(normalized):
+            return QuestionClassification(
+                question_type=QuestionType.FREE_TEXT_GENERIC,
+                normalized_key="referral_source",
+                confidence=0.88,
+                matched_rule="referral_source",
+            )
+        if self._looks_like_current_employer_question(normalized):
+            return QuestionClassification(
+                question_type=QuestionType.FREE_TEXT_GENERIC,
+                normalized_key="current_employer",
+                confidence=0.88,
+                matched_rule="current_employer",
+            )
+        if self._looks_like_workplace_availability_question(normalized):
+            return QuestionClassification(
+                question_type=QuestionType.FREE_TEXT_GENERIC,
+                normalized_key="workplace_availability",
+                confidence=0.84,
+                matched_rule="workplace_availability",
+            )
+        if self._looks_like_language_working_comfort_question(normalized):
+            return QuestionClassification(
+                question_type=QuestionType.FREE_TEXT_GENERIC,
+                normalized_key=self._language_working_comfort_normalized_key(normalized),
+                confidence=0.84,
+                matched_rule="language_working_comfort",
+            )
+        if self._looks_like_proficiency_ladder_question(
+            normalized_question=normalized,
+            options_text=options_text,
+            control_kind=control_kind,
         ):
+            return QuestionClassification(
+                question_type=QuestionType.FREE_TEXT_GENERIC,
+                normalized_key=self._proficiency_ladder_normalized_key(normalized),
+                confidence=0.82,
+                matched_rule="proficiency_ladder",
+            )
+        if self._looks_like_disability_status_question(normalized):
+            return QuestionClassification(
+                question_type=QuestionType.YES_NO_GENERIC,
+                normalized_key="disability_status",
+                confidence=0.9,
+                matched_rule="disability_status",
+            )
+        if self._looks_like_disability_type_question(normalized):
+            return QuestionClassification(
+                question_type=QuestionType.FREE_TEXT_GENERIC,
+                normalized_key="disability_type",
+                confidence=0.84,
+                matched_rule="disability_type",
+            )
+        if self._looks_like_start_date_question(normalized):
             return QuestionClassification(
                 question_type=QuestionType.START_DATE,
                 normalized_key="start_date",
@@ -706,6 +749,163 @@ class LinkedInQuestionClassifier:
             "confortavel trabalhando",
             "confortavel em um ambiente",
         )
+
+    def _looks_like_start_date_question(self, normalized_question: str) -> bool:
+        if self._contains_any(
+            normalized_question,
+            "start date",
+            "notice period",
+            "when can you start",
+            "data de inicio",
+            "quando pode comecar",
+            "quando voce pode comecar",
+        ):
+            return True
+        if "availability" in normalized_question or "disponibilidade" in normalized_question:
+            return not self._looks_like_workplace_availability_question(normalized_question)
+        return False
+
+    def _looks_like_referral_source_question(self, normalized_question: str) -> bool:
+        return self._contains_any(
+            normalized_question,
+            "how did you hear",
+            "how did you find",
+            "where did you find",
+            "como ficou sabendo",
+            "como soube",
+            "onde viu nossa vaga",
+            "onde viu a vaga",
+        )
+
+    def _looks_like_current_employer_question(self, normalized_question: str) -> bool:
+        return self._contains_any(
+            normalized_question,
+            "current company",
+            "current employer",
+            "company where you work",
+            "company you work for",
+            "empresa onde voce trabalha",
+            "empresa onde vc trabalha",
+            "empresa em que voce trabalha",
+            "empresa atual",
+            "empregador atual",
+        )
+
+    def _looks_like_workplace_availability_question(self, normalized_question: str) -> bool:
+        return self._contains_any(
+            normalized_question,
+            "trabalho presencial",
+            "work onsite",
+            "work on site",
+            "onsite",
+            "presencial",
+            "mudanca",
+            "mudar para",
+            "relocation",
+            "campinas",
+        )
+
+    def _looks_like_language_working_comfort_question(self, normalized_question: str) -> bool:
+        if not self._contains_any(
+            normalized_question,
+            "english-speaking environment",
+            "spanish-speaking environment",
+            "portuguese-speaking environment",
+            "ambiente onde se fala ingles",
+            "ambiente onde se fala espanhol",
+            "ambiente onde se fala portugues",
+            "english work environment",
+            "spanish work environment",
+            "portuguese work environment",
+        ):
+            return False
+        return self._contains_any(
+            normalized_question,
+            "comfortable",
+            "comfort",
+            "confortavel",
+            "confortável",
+            "confidence",
+            "confianca",
+            "confiança",
+        )
+
+    def _looks_like_proficiency_ladder_question(
+        self,
+        *,
+        normalized_question: str,
+        options_text: str,
+        control_kind: ControlKind,
+    ) -> bool:
+        if control_kind not in {"radio", "select"}:
+            return False
+        combined = f"{normalized_question} {options_text}"
+        if not self._contains_any(
+            combined,
+            "level",
+            "nivel",
+            "proficiency",
+            "fluency",
+            "fluencia",
+            "confidence",
+            "confianca",
+            "knowledge",
+            "conhecimento",
+        ):
+            return False
+        return self._contains_any(
+            combined,
+            "advanced",
+            "avancado",
+            "intermediate",
+            "intermediario",
+            "basic",
+            "basico",
+            "beginner",
+            "iniciante",
+            "fluent",
+            "fluente",
+        )
+
+    def _looks_like_disability_status_question(self, normalized_question: str) -> bool:
+        return self._contains_any(
+            normalized_question,
+            "person with disabilities",
+            "person with disability",
+            "people with disabilities",
+            "disabled person",
+            "pessoa com deficiencia",
+            "pessoa com deficiência",
+            "pcd",
+        )
+
+    def _looks_like_disability_type_question(self, normalized_question: str) -> bool:
+        return self._contains_any(
+            normalized_question,
+            "type of disability",
+            "what type of disability",
+            "qual o tipo de deficiencia",
+            "tipo de deficiência",
+        )
+
+    def _proficiency_ladder_normalized_key(self, normalized_question: str) -> str:
+        subject = self._proficiency_subject_key(normalized_question)
+        return f"{subject}_proficiency"
+
+    def _language_working_comfort_normalized_key(self, normalized_question: str) -> str:
+        subject = self._proficiency_subject_key(normalized_question)
+        return f"{subject}_work_environment_comfort"
+
+    def _proficiency_subject_key(self, normalized_question: str) -> str:
+        if self._contains_any(normalized_question, "english", "ingles"):
+            return "english"
+        if self._contains_any(normalized_question, "spanish", "espanhol", "espanol"):
+            return "spanish"
+        if self._contains_any(normalized_question, "portuguese", "portugues", "português"):
+            return "portuguese"
+        if self._contains_any(normalized_question, "java"):
+            return "java"
+        return "generic"
 
     def _looks_like_resume_control(
         self,

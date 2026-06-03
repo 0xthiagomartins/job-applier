@@ -199,7 +199,12 @@ class ApplicationAnswer:
         )
         object.__setattr__(self, "answer_raw", ensure_non_empty(self.answer_raw, "answer_raw"))
         if (
-            self.fill_strategy in {FillStrategy.BEST_EFFORT, FillStrategy.AUTOFILL_AI}
+            self.fill_strategy
+            in {
+                FillStrategy.ADAPTIVE_MEMORY,
+                FillStrategy.BEST_EFFORT,
+                FillStrategy.AUTOFILL_AI,
+            }
             and not self.ambiguity_flag
         ):
             msg = "non-deterministic answers must be marked as ambiguous"

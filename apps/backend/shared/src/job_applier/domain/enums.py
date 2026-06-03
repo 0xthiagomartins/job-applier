@@ -71,12 +71,14 @@ class AnswerSource(StrEnum):
     RULE = "rule"
     PROFILE_SNAPSHOT = "profile_snapshot"
     DEFAULT_RESPONSE = "default_response"
+    ADAPTIVE_MEMORY = "adaptive_memory"
     BEST_EFFORT_AUTOFILL = "best_effort_autofill"
     AI = "ai"
 
 
 class FillStrategy(StrEnum):
     DETERMINISTIC = "deterministic"
+    ADAPTIVE_MEMORY = "adaptive_memory"
     BEST_EFFORT = "best_effort"
     AUTOFILL_AI = "autofill_ai"
 
