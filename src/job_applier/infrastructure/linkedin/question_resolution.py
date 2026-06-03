@@ -197,6 +197,52 @@ def _canonical_binary_token(value: str) -> str | None:
     return None
 
 
+def _looks_like_salary_expectation_text(normalized: str) -> bool:
+    direct_terms = (
+        "salary",
+        "compensation",
+        "pay expectation",
+        "salary expectation",
+        "expected salary",
+        "expectativa salarial",
+        "pretensao salarial",
+        "faixa salarial",
+        "remuneracao",
+    )
+    if any(term in normalized for term in direct_terms):
+        return True
+    expectation_terms = (
+        "expectation",
+        "expected",
+        "expectativa",
+        "pretensao",
+        "pretensão",
+        "rate",
+        "valor",
+    )
+    compensation_context_terms = (
+        "currency",
+        "monthly",
+        "annual",
+        "yearly",
+        "hourly",
+        "daily",
+        "per month",
+        "per year",
+        "per hour",
+        "salario",
+        "salário",
+        "salarial",
+        "compensation",
+        "pay",
+        "remuneracao",
+        "remuneração",
+    )
+    return any(term in normalized for term in expectation_terms) and any(
+        term in normalized for term in compensation_context_terms
+    )
+
+
 def field_reference(field: EasyApplyField) -> str:
     """Return the most stable reference we have for one extracted field."""
 
@@ -429,21 +475,26 @@ class LinkedInQuestionClassifier:
                 confidence=0.99,
                 matched_rule="phone",
             )
-        if "linkedin" in normalized:
+        has_binary_options = self._is_binary_option_set(meaningful_options)
+
+        if "linkedin" in normalized and not has_binary_options:
             return QuestionClassification(
                 question_type=QuestionType.LINKEDIN_URL,
                 normalized_key="linkedin_url",
                 confidence=0.98,
                 matched_rule="linkedin_url",
             )
-        if "github" in normalized:
+        if "github" in normalized and not has_binary_options:
             return QuestionClassification(
                 question_type=QuestionType.GITHUB_URL,
                 normalized_key="github_url",
                 confidence=0.98,
                 matched_rule="github_url",
             )
-        if self._contains_any(normalized, "portfolio", "personal site", "website", "site"):
+        if (
+            self._contains_any(normalized, "portfolio", "personal site", "website", "site")
+            and not has_binary_options
+        ):
             return QuestionClassification(
                 question_type=QuestionType.PORTFOLIO_URL,
                 normalized_key="portfolio_url",
@@ -481,15 +532,7 @@ class LinkedInQuestionClassifier:
                 confidence=0.98,
                 matched_rule="visa_sponsorship",
             )
-        if self._contains_any(
-            normalized,
-            "salary",
-            "compensation",
-            "pay expectation",
-            "pretensao salarial",
-            "faixa salarial",
-            "remuneracao",
-        ):
+        if _looks_like_salary_expectation_text(normalized) and not has_binary_options:
             return QuestionClassification(
                 question_type=QuestionType.SALARY_EXPECTATION,
                 normalized_key="salary_expectation",
@@ -570,6 +613,15 @@ class LinkedInQuestionClassifier:
             "expérience",
             "erfahrung",
             "esperienza",
+            "using",
+            "used",
+            "usa",
+            "usar",
+            "utiliza",
+            "utilizou",
+            "trabalhou",
+            "working with",
+            "worked with",
         )
         duration_terms = (
             "year",
@@ -600,6 +652,16 @@ class LinkedInQuestionClassifier:
             "combien de temps",
             "seit wann",
         )
+        work_context_terms = (
+            "at work",
+            "on the job",
+            "professionally",
+            "in production",
+            "no trabalho",
+            "em producao",
+            "em produção",
+            "profissionalmente",
+        )
         role_terms = (
             "developer",
             "software",
@@ -619,7 +681,10 @@ class LinkedInQuestionClassifier:
         has_how_long_role_prompt = any(phrase in normalized for phrase in how_long_phrases) and any(
             term in normalized for term in role_terms
         )
-        return has_experience_and_duration or has_how_long_role_prompt
+        has_how_long_work_prompt = any(phrase in normalized for phrase in how_long_phrases) and any(
+            term in normalized for term in work_context_terms
+        )
+        return has_experience_and_duration or has_how_long_role_prompt or has_how_long_work_prompt
 
     def _is_binary_option_set(self, options: set[str]) -> bool:
         if not options:
@@ -923,7 +988,12 @@ class OpenAISemanticStepPlanner:
                                 "conservative plausible answer only for low-risk application "
                                 "questions, and leave answer null for legal, certification, visa, "
                                 "or compliance facts you cannot support. Never invent personal "
-                                "facts that contradict the visible candidate profile."
+                                "facts that contradict the visible candidate profile. When a "
+                                "required free-text field is just a conditional follow-up like "
+                                "'if yes, provide details' and the conservative gate answer is "
+                                "negative or not applicable, use a short neutral placeholder "
+                                "such as 'N/A' instead of inventing names, IDs, or company "
+                                "details."
                             ),
                         },
                     ],
@@ -1085,13 +1155,7 @@ class OpenAIResponsesAnswerGenerator:
 
         if settings.ai.api_key is None:
             return None
-        if field.question_type not in {
-            QuestionType.UNKNOWN,
-            QuestionType.YES_NO_GENERIC,
-            QuestionType.FREE_TEXT_GENERIC,
-            QuestionType.YEARS_EXPERIENCE,
-            QuestionType.SALARY_EXPECTATION,
-        }:
+        if not _field_allows_ambiguous_autofill(field):
             return None
 
         prompt_payload = self._build_prompt_payload(
@@ -1215,6 +1279,10 @@ class OpenAIResponsesAnswerGenerator:
                                 "options such as intermediate when exact data is missing. "
                                 "Do not invent legal, visa, or certification facts. "
                                 "Keep free-text answers concise, professional, and believable. "
+                                "When a required free-text field is only asking for details in "
+                                "the 'if yes' case and that condition does not apply, answer "
+                                "with a short neutral placeholder such as 'N/A' instead of "
+                                "inventing sensitive details. "
                                 "When validation feedback is provided, assume the previous "
                                 "attempt was rejected, use that feedback to repair the answer, "
                                 "and avoid repeating the same invalid value."
@@ -1446,6 +1514,10 @@ class LinkedInAnswerResolver:
                 confidence=1.0,
             )
 
+        binary_years_value = self._resolve_binary_years_experience_field_value(field, settings)
+        if binary_years_value is not None:
+            return binary_years_value
+
         profile_value = self._resolve_profile_value(field, settings)
         if profile_value is not None:
             return ResolvedFieldValue(
@@ -1534,7 +1606,9 @@ class LinkedInAnswerResolver:
         normalized_question = normalize_text(f"{field.question_raw} {field.normalized_key}")
         prefer_numeric_coercion = (
             adapted_field.question_type is QuestionType.YEARS_EXPERIENCE
+            or adapted_field.question_type is QuestionType.SALARY_EXPECTATION
             or self._looks_like_experience_duration_question(normalized_question)
+            or _looks_like_salary_expectation_text(normalized_question)
             or (
                 _looks_like_generic_invalid_feedback(normalized_validation)
                 and "experience" in normalized_question
@@ -1642,6 +1716,8 @@ class LinkedInAnswerResolver:
         semantic_plan: SemanticFieldPlan | None,
     ) -> ResolvedFieldValue | None:
         if semantic_plan is None:
+            return None
+        if not _field_allows_ambiguous_autofill(field):
             return None
 
         planned_value = semantic_plan.answer
@@ -1939,6 +2015,39 @@ class LinkedInAnswerResolver:
             ),
         )
 
+    def _resolve_binary_years_experience_field_value(
+        self,
+        field: EasyApplyField,
+        settings: UserAgentSettings,
+    ) -> ResolvedFieldValue | None:
+        if field.question_type is not QuestionType.YEARS_EXPERIENCE:
+            return None
+        if not _field_is_binary_choice(field):
+            return None
+        minimum_years = _extract_minimum_years_requirement(
+            " ".join((field.question_raw, field.normalized_key, field.field_context))
+        )
+        if minimum_years is None:
+            return None
+        exact_years = self._resolve_exact_years_experience(field, settings)
+        if exact_years is None:
+            return None
+        try:
+            resolved_years = int(float(exact_years))
+        except ValueError:
+            return None
+        binary_value = "Yes" if resolved_years >= minimum_years else "No"
+        return ResolvedFieldValue(
+            value=binary_value,
+            answer_source=AnswerSource.PROFILE_SNAPSHOT,
+            fill_strategy=FillStrategy.DETERMINISTIC,
+            confidence=0.92,
+            reasoning=(
+                "binary_years_threshold_from_profile: "
+                f"{resolved_years} years compared against {minimum_years}+ required"
+            ),
+        )
+
     def _resolve_guardrail_fallback(
         self,
         field: EasyApplyField,
@@ -2058,12 +2167,7 @@ class LinkedInAnswerResolver:
                 reasoning="guardrail_resume_path",
             )
         if field.control_kind == "textarea":
-            textarea_value = self._first_default_response(settings) or "Open to discuss."
-            return GuardrailAnswer(
-                value=textarea_value,
-                confidence=0.4,
-                reasoning="guardrail_concise_free_text",
-            )
+            return None
         if field.input_type == "email":
             email = _non_empty_value(str(profile.email))
             if email is None:
@@ -2107,13 +2211,6 @@ class LinkedInAnswerResolver:
                 confidence=0.54,
                 reasoning="competitive_capability_inference",
             )
-        if field.question_type is QuestionType.FREE_TEXT_GENERIC:
-            free_text_value = self._first_default_response(settings) or "Open to discuss."
-            return GuardrailAnswer(
-                value=free_text_value,
-                confidence=0.36,
-                reasoning="guardrail_concise_free_text",
-            )
         return None
 
     def _adapt_field_for_validation_feedback(
@@ -2121,10 +2218,16 @@ class LinkedInAnswerResolver:
         field: EasyApplyField,
         normalized_validation: str,
     ) -> EasyApplyField:
-        if not _validation_requires_numeric(normalized_validation):
+        normalized_question = normalize_text(f"{field.question_raw} {field.normalized_key}")
+        salary_like_invalid = (
+            _looks_like_generic_invalid_feedback(normalized_validation)
+            and _looks_like_salary_expectation_text(normalized_question)
+            and not field.options
+            and field.control_kind in {"text", "textarea"}
+        )
+        if not _validation_requires_numeric(normalized_validation) and not salary_like_invalid:
             return field
 
-        normalized_question = normalize_text(f"{field.question_raw} {field.normalized_key}")
         adapted_question_type = field.question_type
         if adapted_question_type in {
             QuestionType.UNKNOWN,
@@ -2133,16 +2236,7 @@ class LinkedInAnswerResolver:
         }:
             if self._looks_like_experience_duration_question(normalized_question):
                 adapted_question_type = QuestionType.YEARS_EXPERIENCE
-            elif any(
-                token in normalized_question
-                for token in (
-                    "salary",
-                    "compensation",
-                    "pretensao",
-                    "faixa salarial",
-                    "remuneracao",
-                )
-            ):
+            elif _looks_like_salary_expectation_text(normalized_question):
                 adapted_question_type = QuestionType.SALARY_EXPECTATION
 
         return replace(
@@ -2296,6 +2390,47 @@ def _field_response_contract(field: EasyApplyField) -> dict[str, bool]:
         ),
         "keep_free_text_concise": field.control_kind == "textarea",
     }
+
+
+def _field_allows_ambiguous_autofill(field: EasyApplyField) -> bool:
+    if field.question_type in {QuestionType.FREE_TEXT_GENERIC, QuestionType.UNKNOWN}:
+        if field.control_kind in {"radio", "select", "checkbox"}:
+            return bool(field.options)
+        if field.control_kind in {"text", "textarea"}:
+            return field.required
+        return False
+    if field.control_kind in {"text", "textarea"} and field.question_type not in {
+        QuestionType.YEARS_EXPERIENCE,
+        QuestionType.SALARY_EXPECTATION,
+    }:
+        return False
+    return field.question_type in {
+        QuestionType.YES_NO_GENERIC,
+        QuestionType.YEARS_EXPERIENCE,
+        QuestionType.SALARY_EXPECTATION,
+    }
+
+
+def _field_is_binary_choice(field: EasyApplyField) -> bool:
+    if len(field.options) != 2:
+        return False
+    canonical_tokens = {_canonical_binary_token(option) for option in field.options}
+    return canonical_tokens == {"yes", "no"}
+
+
+def _extract_minimum_years_requirement(raw_text: str) -> int | None:
+    normalized_text = normalize_text(raw_text)
+    match = re.search(
+        r"(\d+)\s*(?:\+|plus)?\s*(?:years?|yrs?|anos?)\b",
+        normalized_text,
+    )
+    if match is None:
+        return None
+    try:
+        value = int(match.group(1))
+    except ValueError:
+        return None
+    return value if value >= 0 else None
 
 
 def _build_experience_inference_context(

@@ -138,7 +138,7 @@ class StagehandJobDetailExtraction:
             "structured_company_name": self.company_name or "",
             "location": self.location or "",
             "description_raw": self.description_raw or "",
-            "easy_apply": bool(self.easy_apply_visible),
+            "easy_apply": self.easy_apply_visible,
             "metadata_text": self.page_summary or "",
             "stagehand_apply_actions": [
                 {
@@ -170,7 +170,7 @@ class StagehandSearchResultCardExtraction:
             "title": self.title or "",
             "company_name": self.company_name or "",
             "location": self.location or "",
-            "easy_apply": bool(self.easy_apply_visible),
+            "easy_apply": self.easy_apply_visible,
         }
 
 

@@ -23,19 +23,19 @@ This guide describes the current internal-beta contract for `job-applier`.
 - Arbitrary LinkedIn form layouts with perfect success rates
 - Guaranteed success on every `Easy Apply` modal variation
 - Multi-board support outside LinkedIn
-- Visual CV theme editing from the panel
+- Visual CV theme editing from a dedicated UI
 - High-confidence tailoring for stacks that are not grounded in the base CV
 
-## Recommended panel setup
+## Recommended local setup
 
-1. Upload a truthful base CV in the `Profile` page.
+1. Upload or configure one truthful base CV.
 2. Choose `Resume mode`:
    - `static` if you want strict reuse of the uploaded CV
    - `dynamic` if you want per-job tailoring
 3. Choose `Default content language`:
    - keep `English` as the default unless your base profile is primarily maintained in Portuguese
    - the dynamic resume builder will still target the vacancy language when it has a strong signal
-4. Keep `Keywords / role targets` broad in the `Preferences` page.
+4. Keep `Keywords / role targets` broad in the local settings.
 
 Recommended target families:
 
@@ -49,7 +49,7 @@ Do not use overly narrow search targets such as `Python Automation Engineer` as 
 
 ## Capability profile review
 
-The `Profile` page now shows an inferred capability profile derived from the base CV.
+The local profile state now exposes an inferred capability profile derived from the base CV.
 
 Each capability row exposes:
 
@@ -115,13 +115,6 @@ Python quality:
 ```bash
 uv run ruff check .
 uv run mypy src
-```
-
-Panel build:
-
-```bash
-cd apps/panel
-npm run build
 ```
 
 Generate mock dynamic resumes for review:

@@ -71,6 +71,14 @@ class SubmissionRepository(Repository[ApplicationSubmission], Protocol):
     ) -> list[ApplicationSubmission]:
         """List submissions filtered by submitted timestamp."""
 
+    def list_recent_for_job_posting(
+        self,
+        job_posting_id: UUID,
+        *,
+        limit: int = 20,
+    ) -> list[ApplicationSubmission]:
+        """Return recent submissions for one job posting in reverse chronological order."""
+
 
 class AnswerRepository(Repository[ApplicationAnswer], Protocol):
     """Persistence contract for application answers."""

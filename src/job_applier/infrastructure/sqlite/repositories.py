@@ -450,6 +450,19 @@ class SqliteSubmissionRepository(
             models = session.scalars(statement).all()
             return [self._from_model(model) for model in models]
 
+    def list_recent_for_job_posting(
+        self,
+        job_posting_id: UUID,
+        *,
+        limit: int = 20,
+    ) -> list[ApplicationSubmission]:
+        statement = self._apply_ordering(
+            self._base_query().where(ApplicationSubmissionModel.job_posting_id == job_posting_id),
+        ).limit(limit)
+        with self._session_provider() as session:
+            models = session.scalars(statement).all()
+            return [self._from_model(model) for model in models]
+
 
 class SqliteAnswerRepository(
     SqliteRepository[ApplicationAnswer, ApplicationAnswerModel],

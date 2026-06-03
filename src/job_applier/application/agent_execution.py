@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict
@@ -388,6 +388,7 @@ class AgentExecutionOrchestrator:
         output_dir: Path | None = None,
         max_selected_jobs_per_run: int | None = None,
         test_minimum_score_threshold: float | None = None,
+        failed_submission_retry_limit: int | None = None,
         debug_stage: DebugExecutionStage = DebugExecutionStage.FULL,
         debug_max_jobs: int | None = None,
     ) -> None:
@@ -405,6 +406,11 @@ class AgentExecutionOrchestrator:
         self._test_minimum_score_threshold = (
             min(1.0, max(0.0, test_minimum_score_threshold))
             if test_minimum_score_threshold is not None
+            else None
+        )
+        self._failed_submission_retry_limit = (
+            max(1, failed_submission_retry_limit)
+            if failed_submission_retry_limit is not None
             else None
         )
         self._debug_stage = debug_stage
@@ -827,6 +833,85 @@ class AgentExecutionOrchestrator:
                     error_count=error_count,
                 )
 
+            chronic_failure_count = self._count_consecutive_failed_submissions(posting)
+            if (
+                self._failed_submission_retry_limit is not None
+                and chronic_failure_count >= self._failed_submission_retry_limit
+            ):
+                skip_notes = (
+                    "Skipping this production apply after "
+                    f"{chronic_failure_count} consecutive failed attempts for the same job "
+                    "posting. Use staged debug runs for deeper investigation."
+                )
+                skipped_submission = ApplicationSubmission(
+                    job_posting_id=posting.id,
+                    status=SubmissionStatus.SKIPPED,
+                    resume_mode=settings.profile.resume_mode,
+                    target_language=settings.profile.preferred_language,
+                    execution_origin=origin,
+                    notes=skip_notes,
+                )
+                if self._submission_repository is not None:
+                    self._submission_repository.save(skipped_submission)
+                self._emit_event(
+                    execution_id=execution_id,
+                    submission_id=skipped_submission.id,
+                    event_type=ExecutionEventType.STEP_REACHED,
+                    payload={
+                        "stage": "submit_skipped",
+                        "reason": "chronic_failures",
+                        "job_posting_id": str(posting.id),
+                        "submission_id": str(skipped_submission.id),
+                        "notes": skip_notes,
+                        "consecutive_failed_attempts": chronic_failure_count,
+                        "retry_limit": self._failed_submission_retry_limit,
+                    },
+                )
+                self._emit_event(
+                    execution_id=execution_id,
+                    submission_id=skipped_submission.id,
+                    event_type=ExecutionEventType.JOB_PROCESSED,
+                    payload={
+                        "job_posting_id": str(posting.id),
+                        "status": SubmissionStatus.SKIPPED.value,
+                        "submission_id": str(skipped_submission.id),
+                        "reason": "chronic_failures",
+                    },
+                )
+                update_progress_snapshot(
+                    {
+                        "status": "running",
+                        "current_stage": "submit_skipped",
+                        "current_job": {
+                            **current_job,
+                            "submission_id": str(skipped_submission.id),
+                            "skip_reason": "chronic_failures",
+                        },
+                        "debug_stage": stage.value,
+                        "jobs_seen": jobs_seen,
+                        "jobs_selected": jobs_selected,
+                        "successful_submissions": successful_submissions,
+                        "error_count": error_count,
+                    },
+                )
+                append_timeline_event(
+                    "submit_skipped",
+                    {
+                        **current_job,
+                        "submission_id": str(skipped_submission.id),
+                        "reason": "chronic_failures",
+                        "consecutive_failed_attempts": chronic_failure_count,
+                        "retry_limit": self._failed_submission_retry_limit,
+                    },
+                )
+                return not self._emit_selected_job_limit_if_needed(
+                    execution_id=execution_id,
+                    jobs=jobs_seen,
+                    jobs_selected=jobs_selected,
+                    successful_submissions=successful_submissions,
+                    error_count=error_count,
+                )
+
             try:
                 attempt = await self._job_submitter.submit(
                     settings,
@@ -1097,7 +1182,12 @@ class AgentExecutionOrchestrator:
                 error_count=error_count,
             )
 
-        if isinstance(self._job_fetcher, IncrementalJobFetcher):
+        use_incremental_fetch = isinstance(self._job_fetcher, IncrementalJobFetcher) and (
+            stage is not DebugExecutionStage.FULL
+        )
+
+        if use_incremental_fetch:
+            incremental_fetcher = cast(IncrementalJobFetcher, self._job_fetcher)
             summary = summary.model_copy(update={"jobs_seen": 0})
             self._execution_store.save_execution(summary)
             self._persist_run_summary(summary)
@@ -1157,14 +1247,14 @@ class AgentExecutionOrchestrator:
                 return await process_posting(posting)
 
             try:
-                if isinstance(self._job_fetcher, StageAwareIncrementalJobFetcher):
-                    jobs_seen = await self._job_fetcher.fetch_incremental_for_stage(
+                if isinstance(incremental_fetcher, StageAwareIncrementalJobFetcher):
+                    jobs_seen = await incremental_fetcher.fetch_incremental_for_stage(
                         settings,
                         process_incremental_job,
                         stage=stage,
                     )
                 else:
-                    jobs_seen = await self._job_fetcher.fetch_incremental(
+                    jobs_seen = await incremental_fetcher.fetch_incremental(
                         settings,
                         process_incremental_job,
                     )
@@ -1310,6 +1400,25 @@ class AgentExecutionOrchestrator:
         if self._submission_repository is None:
             return None
         return self._submission_repository.find_latest_successful_for_job_posting(posting.id)
+
+    def _count_consecutive_failed_submissions(self, posting: JobPosting) -> int:
+        if self._submission_repository is None:
+            return 0
+        if self._failed_submission_retry_limit is None:
+            return 0
+        recent_attempts = self._submission_repository.list_recent_for_job_posting(
+            posting.id,
+            limit=max(self._failed_submission_retry_limit * 3, 6),
+        )
+        failure_count = 0
+        for attempt in recent_attempts:
+            if attempt.execution_origin is not ExecutionOrigin.SCHEDULED:
+                continue
+            if attempt.status is SubmissionStatus.FAILED:
+                failure_count += 1
+                continue
+            break
+        return failure_count
 
     def list_recent_executions(self, *, limit: int = 10) -> list[ExecutionRunSummary]:
         """Return recent execution summaries."""

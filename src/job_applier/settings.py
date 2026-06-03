@@ -35,6 +35,7 @@ class RuntimeSettings(BaseSettings):
     agent_test_mode: bool = False
     agent_max_selected_jobs_per_run: int | None = None
     agent_test_minimum_score_threshold: float | None = None
+    agent_failed_submission_retry_limit: int | None = 3
     agent_debug_stage: DebugExecutionStage = DebugExecutionStage.FULL
     agent_debug_max_jobs: int | None = None
     playwright_headless: bool = False
@@ -178,6 +179,18 @@ class RuntimeSettings(BaseSettings):
         if self.agent_test_minimum_score_threshold is None:
             return None
         return min(1.0, max(0.0, self.agent_test_minimum_score_threshold))
+
+    @property
+    def resolved_agent_failed_submission_retry_limit(self) -> int | None:
+        """Return the consecutive failure budget for production apply attempts."""
+
+        if self.resolved_agent_debug_stage is not DebugExecutionStage.FULL:
+            return None
+        if self.agent_test_mode:
+            return None
+        if self.agent_failed_submission_retry_limit is None:
+            return None
+        return max(1, self.agent_failed_submission_retry_limit)
 
     @property
     def resolved_openai_responses_max_retries(self) -> int:

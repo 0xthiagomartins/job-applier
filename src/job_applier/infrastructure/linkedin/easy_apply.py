@@ -55,6 +55,7 @@ from job_applier.domain.entities import (
 from job_applier.domain.enums import (
     AnswerSource,
     ArtifactType,
+    DebugExecutionStage,
     ExecutionEventType,
     ExecutionOrigin,
     FillStrategy,
@@ -146,7 +147,7 @@ def _resume_field_matches_requested_cv(
     )
     if target_filename is None:
         return False
-    return _resume_option_match_score(field.current_value, target_filename) > 0
+    return _resume_text_matches_requested_cv(field.current_value, target_filename)
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,6 +340,27 @@ class PlaywrightLinkedInEasyApplyExecutor:
         self._dynamic_resume_builder = OhMyCvDynamicResumeBuilder(runtime_settings)
         self._session_manager: LinkedInSessionManager | None = None
 
+    def _is_production_apply_run(self) -> bool:
+        return (
+            self._runtime_settings.resolved_agent_debug_stage is DebugExecutionStage.FULL
+            and not self._runtime_settings.agent_test_mode
+        )
+
+    def _agentic_retry_budget(self, *, default: int, production_cap: int = 3) -> int:
+        if self._is_production_apply_run():
+            return max(1, min(default, production_cap))
+        return max(1, default)
+
+    def _easy_apply_step_revisit_limit(self) -> int | None:
+        if self._is_production_apply_run():
+            return 3
+        return None
+
+    def _easy_apply_iteration_limit(self) -> int:
+        if self._is_production_apply_run():
+            return 64
+        return 128
+
     async def execute(
         self,
         settings: UserAgentSettings,
@@ -355,6 +377,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
         execution_events: list[ExecutionEvent] = []
         artifacts: list[ArtifactSnapshot] = []
         uploaded_cv_paths: set[str] = set()
+        result: EasyApplyExecutionResult | None = None
+        primary_error: Exception | None = None
 
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(
@@ -396,10 +420,37 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         execution_events=tuple(execution_events),
                         artifacts=tuple(artifacts),
                     )
+                except Exception as exc:  # noqa: BLE001
+                    primary_error = exc
+                    raise
                 finally:
-                    await context.close()
+                    try:
+                        await context.close()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "linkedin_easy_apply_context_close_failed",
+                            extra={
+                                "job_posting_id": str(posting.id),
+                                "submission_id": str(submission_id),
+                                "close_error": str(exc),
+                            },
+                        )
+                        if primary_error is None and result is None:
+                            raise
             finally:
-                await browser.close()
+                try:
+                    await browser.close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "linkedin_easy_apply_browser_close_failed",
+                        extra={
+                            "job_posting_id": str(posting.id),
+                            "submission_id": str(submission_id),
+                            "close_error": str(exc),
+                        },
+                    )
+                    if primary_error is None and result is None:
+                        raise
 
     async def _execute_once(
         self,
@@ -833,15 +884,61 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     matched_specializations = prepared_submission_cv.matched_specializations
                     artifacts.extend(prepared_submission_cv.artifacts)
 
-                max_steps = 10
+                max_iterations = self._easy_apply_iteration_limit()
+                step_revisit_limit = self._easy_apply_step_revisit_limit()
                 last_known_step_index = 0
                 last_known_total_steps = 1
-                for _ in range(max_steps):
+                step_visit_counts: dict[int, int] = {}
+                for _ in range(max_iterations):
                     step = await self._extract_step(
                         page,
                         last_known_step_index=last_known_step_index,
                         last_known_total_steps=last_known_total_steps,
                     )
+                    step_visit_counts[step.step_index] = (
+                        step_visit_counts.get(step.step_index, 0) + 1
+                    )
+                    if (
+                        step_revisit_limit is not None
+                        and step_visit_counts[step.step_index] > step_revisit_limit
+                    ):
+                        notes = (
+                            "LinkedIn Easy Apply exceeded the production retry limit for "
+                            f"step {step.step_index + 1}."
+                        )
+                        artifacts.extend(
+                            await self._capture_debug_bundle(
+                                page,
+                                run_dir=run_dir,
+                                submission_id=submission_id,
+                                label=f"failure_step_{step.step_index + 1:02d}_retry_limit",
+                            ),
+                        )
+                        self._record_event(
+                            execution_events,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            event_type=ExecutionEventType.JOB_PROCESSED,
+                            payload={
+                                "job_posting_id": str(posting.id),
+                                "reason": "step_retry_limit_exceeded",
+                                "status": SubmissionStatus.FAILED.value,
+                                "notes": notes,
+                                "step_index": step.step_index,
+                                "step_visit_count": step_visit_counts[step.step_index],
+                                "retry_limit": step_revisit_limit,
+                            },
+                        )
+                        return EasyApplyExecutionResult(
+                            submission_id=submission_id,
+                            started_at=started_at,
+                            status=SubmissionStatus.FAILED,
+                            resume_mode=resume_mode,
+                            target_language=target_language,
+                            matched_role_target=matched_role_target,
+                            matched_specializations=matched_specializations,
+                            notes=notes,
+                        )
                     update_progress_snapshot(
                         {
                             "current_stage": "easy_apply_step_extracted",
@@ -1231,6 +1328,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             notes=remediation_notes or assessment_notes,
                         )
 
+                notes = "LinkedIn Easy Apply exceeded the maximum number of execution iterations."
                 artifacts.extend(
                     await self._capture_debug_bundle(
                         page,
@@ -1246,8 +1344,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     event_type=ExecutionEventType.JOB_PROCESSED,
                     payload={
                         "job_posting_id": str(posting.id),
-                        "reason": "max_steps_exceeded",
+                        "reason": "max_iterations_exceeded",
                         "status": SubmissionStatus.FAILED.value,
+                        "notes": notes,
                     },
                 )
                 return EasyApplyExecutionResult(
@@ -1258,7 +1357,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     target_language=target_language,
                     matched_role_target=matched_role_target,
                     matched_specializations=matched_specializations,
-                    notes="LinkedIn Easy Apply exceeded the maximum number of steps.",
+                    notes=notes,
                 )
         except Exception as exc:  # noqa: BLE001
             update_progress_snapshot(
@@ -1713,7 +1812,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         browser_agent = self._create_browser_agent(settings)
         recent_actions: list[dict[str, object]] = []
 
-        for attempt_index in range(6):
+        for attempt_index in range(self._agentic_retry_budget(default=6)):
             root = await self._easy_apply_root(page)
             locator = await self._find_control_locator(root, field)
             if locator is None:
@@ -2439,19 +2538,42 @@ class PlaywrightLinkedInEasyApplyExecutor:
         *,
         option_index: int,
     ) -> bool:
+        option_label = field.options[option_index] if len(field.options) > option_index else None
         option_locator = await self._resolve_radio_option_locator(
             root,
             field,
             option_index=option_index,
         )
         if option_locator is not None:
-            if await _radio_option_is_checked(option_locator):
+            try:
+                await option_locator.scroll_into_view_if_needed(timeout=2_000)
+            except Exception:  # noqa: BLE001
+                pass
+            if await self._radio_option_is_selected(
+                root,
+                field,
+                option_index=option_index,
+                option_locator=option_locator,
+            ):
                 return True
             if await self._activate_radio_option(root, option_locator):
                 return True
+            if option_label and await self._click_radio_text_target(option_locator, option_label):
+                if await self._radio_option_is_selected(root, field, option_index=option_index):
+                    return True
+            if await self._force_radio_option_via_dom(
+                root,
+                field,
+                option_index=option_index,
+                option_label=option_label,
+            ):
+                if await self._radio_option_is_selected(root, field, option_index=option_index):
+                    return True
+            if await self._radio_option_is_selected(root, field, option_index=option_index):
+                return True
         return False
 
-    async def _resolve_radio_option_locator(
+    async def _resolve_radio_input_locator(
         self,
         root: Locator,
         field: EasyApplyField,
@@ -2472,9 +2594,400 @@ class PlaywrightLinkedInEasyApplyExecutor:
             )
             if await group.count() > option_index:
                 return group.nth(option_index)
+
+        group_locator = await self._resolve_radio_group_locator(root, field)
+        if group_locator is not None:
+            radios = group_locator.locator('input[type="radio"]')
+            if await radios.count() > option_index:
+                return radios.nth(option_index)
+
+            option_label = field.options[option_index] if len(field.options) > option_index else ""
+            normalized_label = option_label.strip()
+            if normalized_label:
+                try:
+                    label_target = group_locator.get_by_text(normalized_label, exact=True)
+                    if await label_target.count():
+                        input_locator = await self._resolve_radio_input_from_locator(
+                            label_target.first,
+                        )
+                        if input_locator is not None:
+                            return input_locator
+                except Exception:  # noqa: BLE001
+                    pass
         return None
 
+    async def _resolve_radio_group_locator(
+        self,
+        root: Locator,
+        field: EasyApplyField,
+    ) -> Locator | None:
+        if field.dom_ref:
+            direct_locator = root.locator(
+                _attribute_selector("data-job-applier-field-ref", field.dom_ref),
+            )
+            if await direct_locator.count():
+                group_locator = direct_locator.first.locator(
+                    "xpath=ancestor-or-self::*["
+                    "@data-job-applier-radio-group-ref or @role='radiogroup' or self::fieldset"
+                    "][1]"
+                )
+                if await group_locator.count():
+                    return group_locator.first
+
+        if field.option_refs:
+            for option_ref in field.option_refs:
+                locator = root.locator(
+                    _attribute_selector("data-job-applier-option-ref", option_ref),
+                )
+                if not await locator.count():
+                    continue
+                group_locator = locator.first.locator(
+                    "xpath=ancestor-or-self::*["
+                    "@data-job-applier-radio-group-ref or @role='radiogroup' or self::fieldset"
+                    "][1]"
+                )
+                if await group_locator.count():
+                    return group_locator.first
+
+        if field.name:
+            named_group = root.locator(
+                f'input[type="radio"]{_attribute_selector("name", field.name)}',
+            )
+            if await named_group.count():
+                group_locator = named_group.first.locator(
+                    "xpath=ancestor-or-self::*["
+                    "@data-job-applier-radio-group-ref or @role='radiogroup' or self::fieldset"
+                    "][1]"
+                )
+                if await group_locator.count():
+                    return group_locator.first
+
+        question_text = field.question_raw.strip()
+        if question_text:
+            literal = _xpath_literal(question_text)
+            question_locators = (
+                root.locator(
+                    "xpath="
+                    f".//*[self::legend or self::label or self::p][normalize-space()={literal}]"
+                    "/following-sibling::fieldset[1]"
+                ),
+                root.locator(
+                    "xpath="
+                    f".//*[self::legend or self::label or self::p][normalize-space()={literal}]"
+                    "/ancestor::*[self::div or self::section][1]"
+                    "//*[self::fieldset or @role='radiogroup'][1]"
+                ),
+            )
+            for question_locator in question_locators:
+                if await question_locator.count():
+                    return question_locator.first
+        return None
+
+    async def _resolve_radio_option_locator(
+        self,
+        root: Locator,
+        field: EasyApplyField,
+        *,
+        option_index: int,
+    ) -> Locator | None:
+        input_locator = await self._resolve_radio_input_locator(
+            root,
+            field,
+            option_index=option_index,
+        )
+        if input_locator is None:
+            return None
+
+        role_radio = input_locator.locator("xpath=ancestor-or-self::*[@role='radio'][1]")
+        if await role_radio.count():
+            return role_radio.first
+
+        explicit_label = await self._resolve_radio_explicit_label(root, input_locator)
+        if explicit_label is not None:
+            return explicit_label
+
+        wrapping_label = input_locator.locator("xpath=ancestor::label[1]")
+        if await wrapping_label.count():
+            return wrapping_label.first
+
+        return input_locator
+
+    async def _resolve_radio_explicit_label(
+        self,
+        root: Locator,
+        locator: Locator,
+    ) -> Locator | None:
+        input_id = await _radio_option_input_id(locator)
+        if not input_id:
+            return None
+        label = root.locator(f'label[for="{input_id}"]')
+        if not await label.count():
+            return None
+        return label.first
+
+    async def _resolve_radio_input_from_locator(self, locator: Locator) -> Locator | None:
+        try:
+            input_locator = locator.locator("xpath=ancestor-or-self::input[@type='radio'][1]")
+            if await input_locator.count():
+                return input_locator.first
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            nested_input = locator.locator('input[type="radio"]')
+            if await nested_input.count():
+                return nested_input.first
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    async def _radio_option_is_selected(
+        self,
+        root: Locator,
+        field: EasyApplyField,
+        *,
+        option_index: int,
+        option_locator: Locator | None = None,
+    ) -> bool:
+        locator = option_locator or await self._resolve_radio_option_locator(
+            root,
+            field,
+            option_index=option_index,
+        )
+        if locator is not None and await _radio_option_is_checked(locator):
+            return True
+
+        refreshed_locator = await self._resolve_radio_option_locator(
+            root,
+            field,
+            option_index=option_index,
+        )
+        if refreshed_locator is None:
+            return False
+        return await _radio_option_is_checked(refreshed_locator)
+
+    async def _radio_click_target(self, locator: Locator) -> Locator:
+        role_radio = locator.locator("xpath=ancestor-or-self::*[@role='radio'][1]")
+        if await role_radio.count():
+            return role_radio.first
+
+        wrapping_label = locator.locator("xpath=ancestor::label[1]")
+        if await wrapping_label.count():
+            return wrapping_label.first
+
+        return locator
+
+    async def _click_radio_text_target(self, locator: Locator, label: str) -> bool:
+        normalized_label = label.strip()
+        if not normalized_label:
+            return False
+
+        try:
+            candidate = locator.get_by_text(normalized_label, exact=True)
+            if not await candidate.count():
+                return False
+            text_target = candidate.first
+            await text_target.scroll_into_view_if_needed(timeout=2_000)
+            await text_target.click(timeout=2_000, force=True)
+        except Exception:  # noqa: BLE001
+            return False
+        return await _radio_option_is_checked(locator)
+
+    async def _force_radio_option_via_dom(
+        self,
+        root: Locator,
+        field: EasyApplyField,
+        *,
+        option_index: int,
+        option_label: str | None,
+    ) -> bool:
+        option_ref = (
+            field.option_refs[option_index] if len(field.option_refs) > option_index else None
+        )
+        try:
+            activated = await root.evaluate(
+                """
+                (scope, { optionRef, fieldName, optionIndex, optionLabel }) => {
+                  if (!(scope instanceof Element)) {
+                    return false;
+                  }
+                  const collapse = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+                  const normalizedLabel = collapse(optionLabel);
+                  const cssEscape = globalThis.CSS?.escape
+                    ? globalThis.CSS.escape.bind(globalThis.CSS)
+                    : (value) => String(value).replace(/["\\\\]/g, '\\\\$&');
+                  const queryByOptionRef = () => {
+                    if (!optionRef) {
+                      return null;
+                    }
+                    return scope.querySelector(
+                      `[data-job-applier-option-ref="${cssEscape(optionRef)}"]`
+                    );
+                  };
+                  const queryByFieldName = () => {
+                    if (!fieldName) {
+                      return null;
+                    }
+                    const matches = scope.querySelectorAll(
+                      `input[type="radio"][name="${cssEscape(fieldName)}"]`
+                    );
+                    return matches[optionIndex] instanceof HTMLInputElement
+                      ? matches[optionIndex]
+                      : null;
+                  };
+                  const queryByLabelText = () => {
+                    if (!normalizedLabel) {
+                      return null;
+                    }
+                    const candidates = scope.querySelectorAll(
+                      '[role="radio"], label, div, p, span'
+                    );
+                    for (const candidate of candidates) {
+                      if (!(candidate instanceof Element)) {
+                        continue;
+                      }
+                      if (
+                        collapse(candidate.innerText || candidate.textContent || '')
+                          !== normalizedLabel
+                      ) {
+                        continue;
+                      }
+                      const roleRadio = candidate.closest('[role="radio"]');
+                      if (roleRadio) {
+                        const nestedInput = roleRadio.querySelector('input[type="radio"]');
+                        if (nestedInput instanceof HTMLInputElement) {
+                          return nestedInput;
+                        }
+                      }
+                      const wrappingLabel = candidate.closest('label');
+                      const labeledInputId = (
+                        wrappingLabel?.getAttribute('for')
+                        || candidate.getAttribute('for')
+                      );
+                      if (labeledInputId) {
+                        const labeledInput = scope.querySelector(`#${cssEscape(labeledInputId)}`);
+                        if (labeledInput instanceof HTMLInputElement) {
+                          return labeledInput;
+                        }
+                      }
+                    }
+                    return null;
+                  };
+                  const input = queryByOptionRef() || queryByFieldName() || queryByLabelText();
+                  if (!(input instanceof HTMLInputElement)) {
+                    return false;
+                  }
+                  const roleRadio = input.closest('[role="radio"]');
+                  const explicitLabel = input.id
+                    ? scope.querySelector(`label[for="${cssEscape(input.id)}"]`)
+                    : null;
+                  const textTarget = roleRadio
+                    ? Array.from(roleRadio.querySelectorAll('p, span, div')).find((candidate) => {
+                        return (
+                          collapse(candidate.innerText || candidate.textContent || '')
+                          === normalizedLabel
+                        );
+                      })
+                    : null;
+                  const fieldset = input.closest('fieldset');
+                  const syncPeerState = () => {
+                    if (!(fieldset instanceof Element)) {
+                      return;
+                    }
+                    for (const peer of fieldset.querySelectorAll('input[type="radio"]')) {
+                      if (!(peer instanceof HTMLInputElement)) {
+                        continue;
+                      }
+                      peer.checked = peer === input;
+                      const peerRoleRadio = peer.closest('[role="radio"]');
+                      if (peerRoleRadio instanceof Element) {
+                        peerRoleRadio.setAttribute(
+                          'aria-checked',
+                          peer === input ? 'true' : 'false'
+                        );
+                      }
+                    }
+                  };
+                  const dispatchPointerSequence = (target) => {
+                    if (!(target instanceof HTMLElement)) {
+                      return;
+                    }
+                    const init = { bubbles: true, cancelable: true, composed: true, view: window };
+                    target.dispatchEvent(new PointerEvent('pointerdown', init));
+                    target.dispatchEvent(new MouseEvent('mousedown', init));
+                    target.dispatchEvent(new MouseEvent('click', init));
+                    target.dispatchEvent(new MouseEvent('mouseup', init));
+                    target.dispatchEvent(new PointerEvent('pointerup', init));
+                  };
+                  for (const target of [textTarget, roleRadio, explicitLabel, input]) {
+                    dispatchPointerSequence(target);
+                    if (input.checked || roleRadio?.getAttribute('aria-checked') === 'true') {
+                      syncPeerState();
+                      input.dispatchEvent(new Event('input', { bubbles: true }));
+                      input.dispatchEvent(new Event('change', { bubbles: true }));
+                      return true;
+                    }
+                  }
+                  const descriptor = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype,
+                    'checked'
+                  );
+                  descriptor?.set?.call(input, true);
+                  input.checked = true;
+                  input.dispatchEvent(new Event('input', { bubbles: true }));
+                  input.dispatchEvent(new Event('change', { bubbles: true }));
+                  if (roleRadio instanceof Element) {
+                    roleRadio.setAttribute('aria-checked', 'true');
+                  }
+                  syncPeerState();
+                  return input.checked || roleRadio?.getAttribute('aria-checked') === 'true';
+                }
+                """,
+                {
+                    "optionRef": option_ref,
+                    "fieldName": field.name,
+                    "optionIndex": option_index,
+                    "optionLabel": option_label,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(activated)
+
     async def _activate_radio_option(self, root: Locator, locator: Locator) -> bool:
+        input_locator = await self._resolve_radio_input_from_locator(locator)
+
+        if input_locator is not None:
+            try:
+                await input_locator.scroll_into_view_if_needed(timeout=2_000)
+            except Exception:  # noqa: BLE001
+                pass
+
+            try:
+                await input_locator.check(timeout=2_000, force=True)
+            except Exception:  # noqa: BLE001
+                pass
+            else:
+                if await _radio_option_is_checked(input_locator):
+                    return True
+
+            try:
+                await input_locator.click(timeout=2_000, force=True)
+            except Exception:  # noqa: BLE001
+                pass
+            else:
+                if await _radio_option_is_checked(input_locator):
+                    return True
+
+            try:
+                await input_locator.focus()
+                await input_locator.press("Space", timeout=2_000)
+            except Exception:  # noqa: BLE001
+                pass
+            else:
+                if await _radio_option_is_checked(input_locator):
+                    return True
+
         try:
             await locator.check(timeout=2_000)
         except Exception:  # noqa: BLE001
@@ -2483,26 +2996,150 @@ class PlaywrightLinkedInEasyApplyExecutor:
             if await _radio_option_is_checked(locator):
                 return True
 
-        input_id = await locator.get_attribute("id")
+        try:
+            await locator.click(timeout=2_000)
+        except Exception:  # noqa: BLE001
+            pass
+        else:
+            if await _radio_option_is_checked(locator):
+                return True
+
+        input_id = await _radio_option_input_id(locator)
         if input_id:
-            label = root.locator(f'label[for="{input_id}"]')
-            if await label.count():
+            label = await self._resolve_radio_explicit_label(root, locator)
+            if label is not None:
                 try:
-                    await label.first.click(timeout=2_000)
+                    await label.click(timeout=2_000)
                 except Exception:  # noqa: BLE001
                     pass
                 if await _radio_option_is_checked(locator):
                     return True
 
+        wrapping_label = locator.locator("xpath=ancestor::label[1]")
+        if await wrapping_label.count():
+            try:
+                await wrapping_label.first.click(timeout=2_000)
+            except Exception:  # noqa: BLE001
+                pass
+            if await _radio_option_is_checked(locator):
+                return True
+
+        role_radio = locator.locator("xpath=ancestor-or-self::*[@role='radio'][1]")
+        if await role_radio.count():
+            try:
+                await role_radio.first.click(timeout=2_000)
+            except Exception:  # noqa: BLE001
+                pass
+            if await _radio_option_is_checked(locator):
+                return True
+            try:
+                await role_radio.first.focus()
+                await role_radio.first.press("Space", timeout=2_000)
+            except Exception:  # noqa: BLE001
+                pass
+            if await _radio_option_is_checked(locator):
+                return True
+
         try:
             activated = await locator.evaluate(
                 """
                 (node) => {
-                  if (!(node instanceof HTMLElement)) {
+                  if (!(node instanceof Element)) {
                     return false;
                   }
-                  node.click();
-                  return node instanceof HTMLInputElement ? node.checked : true;
+                  const roleRadio = node.matches('[role="radio"]')
+                    ? node
+                    : node.closest('[role="radio"]') || node.querySelector('[role="radio"]');
+                  const input = node instanceof HTMLInputElement
+                    ? node
+                    : node.querySelector('input[type="radio"]')
+                      || roleRadio?.querySelector('input[type="radio"]');
+                  const fieldset = node.closest('fieldset')
+                    || roleRadio?.closest('fieldset')
+                    || input?.closest('fieldset');
+                  const explicitLabel = input instanceof HTMLInputElement && input.id
+                    ? document.querySelector(`label[for="${input.id}"]`)
+                    : null;
+                  const wrappingLabel = node.closest?.('label') || input?.closest?.('label');
+                  const pointerEvent = (type) =>
+                    new MouseEvent(type, {
+                      bubbles: true,
+                      cancelable: true,
+                      composed: true,
+                      view: window,
+                    });
+                  const syncPeerState = () => {
+                    if (!(fieldset instanceof Element)) {
+                      return;
+                    }
+                    const peerRadios = fieldset.querySelectorAll('[role="radio"]');
+                    for (const peer of peerRadios) {
+                      if (peer instanceof Element) {
+                        peer.setAttribute('aria-checked', peer === roleRadio ? 'true' : 'false');
+                      }
+                    }
+                    const peerInputs = fieldset.querySelectorAll('input[type="radio"]');
+                    for (const peerInput of peerInputs) {
+                      if (!(peerInput instanceof HTMLInputElement)) {
+                        continue;
+                      }
+                      peerInput.checked = peerInput === input;
+                    }
+                  };
+                  const clickTargets = [
+                    roleRadio,
+                    explicitLabel,
+                    wrappingLabel,
+                    node,
+                    input,
+                  ].filter((candidate) => candidate instanceof HTMLElement);
+                  for (const target of clickTargets) {
+                    target.dispatchEvent(pointerEvent('pointerdown'));
+                    target.dispatchEvent(pointerEvent('mousedown'));
+                    target.click();
+                    target.dispatchEvent(pointerEvent('mouseup'));
+                    target.dispatchEvent(pointerEvent('pointerup'));
+                    target.dispatchEvent(pointerEvent('pointerout'));
+                    if (
+                      (input instanceof HTMLInputElement && input.checked) ||
+                      (
+                        roleRadio instanceof Element &&
+                        roleRadio.getAttribute('aria-checked') === 'true'
+                      )
+                    ) {
+                      if (roleRadio instanceof Element) {
+                        roleRadio.setAttribute('aria-checked', 'true');
+                      }
+                      syncPeerState();
+                      return true;
+                    }
+                  }
+                  if (input instanceof HTMLInputElement) {
+                    const descriptor = Object.getOwnPropertyDescriptor(
+                      HTMLInputElement.prototype,
+                      'checked'
+                    );
+                    descriptor?.set?.call(input, true);
+                    input.checked = true;
+                    input.dispatchEvent(pointerEvent('pointerdown'));
+                    input.dispatchEvent(pointerEvent('mousedown'));
+                    input.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                    input.dispatchEvent(pointerEvent('mouseup'));
+                    input.dispatchEvent(pointerEvent('pointerup'));
+                    if (roleRadio instanceof Element) {
+                      roleRadio.setAttribute('aria-checked', 'true');
+                    }
+                    syncPeerState();
+                  }
+                  return (
+                    (input instanceof HTMLInputElement && input.checked) ||
+                    (
+                      roleRadio instanceof Element &&
+                      roleRadio.getAttribute('aria-checked') === 'true'
+                    )
+                  );
                 }
                 """
             )
@@ -2592,7 +3229,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         recent_actions: list[dict[str, object]] = []
         desired_state = "checked" if desired_checked else "unchecked"
 
-        for attempt_index in range(4):
+        for attempt_index in range(self._agentic_retry_budget(default=4)):
             root = await self._easy_apply_root(page)
             locator = await self._find_control_locator(root, field)
             if locator is None:
@@ -2648,7 +3285,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         browser_agent = self._create_browser_agent(settings)
         recent_actions: list[dict[str, object]] = []
 
-        for attempt_index in range(4):
+        for attempt_index in range(self._agentic_retry_budget(default=4)):
             root = await self._easy_apply_root(page)
             option_locator = await self._resolve_radio_option_locator(
                 root,
@@ -2657,11 +3294,15 @@ class PlaywrightLinkedInEasyApplyExecutor:
             )
             if option_locator is None:
                 return False
-            if await _radio_option_is_checked(option_locator):
+            click_target = await self._radio_click_target(option_locator)
+            if await self._radio_option_is_selected(
+                root,
+                field,
+                option_index=option_index,
+                option_locator=option_locator,
+            ):
                 return True
-            focus_locator = (
-                await self._field_interaction_focus_locator(root, field) or option_locator
-            )
+            focus_locator = await self._field_interaction_focus_locator(root, field) or click_target
             try:
                 action = await browser_agent.perform_single_task_action(
                     page=page,
@@ -2696,22 +3337,150 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 }
             )
             await page.wait_for_timeout(150)
-        return False
+            root = await self._easy_apply_root(page)
+            option_locator = await self._resolve_radio_option_locator(
+                root,
+                field,
+                option_index=option_index,
+            )
+            if option_locator is None:
+                return False
+            if await self._radio_option_is_selected(
+                root,
+                field,
+                option_index=option_index,
+                option_locator=option_locator,
+            ):
+                return True
+            if option_label and await self._click_radio_text_target(option_locator, option_label):
+                if await self._radio_option_is_selected(root, field, option_index=option_index):
+                    return True
+            if await self._activate_radio_option(root, option_locator):
+                return True
+            if await self._radio_option_is_selected(root, field, option_index=option_index):
+                return True
+        root = await self._easy_apply_root(page)
+        option_locator = await self._resolve_radio_option_locator(
+            root,
+            field,
+            option_index=option_index,
+        )
+        if option_locator is None:
+            return False
+        return await self._radio_option_is_selected(
+            root,
+            field,
+            option_index=option_index,
+            option_locator=option_locator,
+        )
 
     async def _find_control_locator(self, root: Locator, field: EasyApplyField) -> Locator | None:
         if field.dom_ref:
             locator = root.locator(_attribute_selector("data-job-applier-field-ref", field.dom_ref))
-            if await locator.count():
-                return locator.first
+            matched = await self._match_control_locator_candidates(locator, field)
+            if matched is not None:
+                return matched
         if field.dom_id:
             locator = root.locator(_attribute_selector("id", field.dom_id))
-            if await locator.count():
-                return locator.first
+            matched = await self._match_control_locator_candidates(locator, field)
+            if matched is not None:
+                return matched
         if field.name:
             locator = root.locator(_attribute_selector("name", field.name))
-            if await locator.count():
-                return locator.first
+            matched = await self._match_control_locator_candidates(locator, field)
+            if matched is not None:
+                return matched
         return None
+
+    async def _match_control_locator_candidates(
+        self,
+        candidates: Locator,
+        field: EasyApplyField,
+    ) -> Locator | None:
+        try:
+            candidate_count = await candidates.count()
+        except Exception:  # noqa: BLE001
+            return None
+        if candidate_count <= 0:
+            return None
+        for index in range(candidate_count):
+            candidate = candidates.nth(index)
+            matched = await self._match_control_locator(candidate, field)
+            if matched is not None:
+                return matched
+        return None
+
+    async def _match_control_locator(
+        self,
+        candidate: Locator,
+        field: EasyApplyField,
+    ) -> Locator | None:
+        if await self._locator_matches_control_kind(candidate, field):
+            return candidate
+        selector = self._control_selector_for_field(field)
+        if selector is None:
+            return candidate
+        try:
+            descendants = candidate.locator(selector)
+            if await descendants.count():
+                return descendants.first
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _control_selector_for_field(self, field: EasyApplyField) -> str | None:
+        if field.control_kind == "text":
+            return (
+                'input:not([type="radio"]):not([type="checkbox"]):not([type="hidden"]):'
+                'not([type="file"]), textarea'
+            )
+        if field.control_kind == "textarea":
+            return "textarea"
+        if field.control_kind == "select":
+            return "select"
+        if field.control_kind == "radio":
+            return '[role="radio"], input[type="radio"]'
+        if field.control_kind == "checkbox":
+            return '[role="checkbox"], input[type="checkbox"]'
+        return 'input[type="file"]'
+
+    async def _locator_matches_control_kind(
+        self,
+        locator: Locator,
+        field: EasyApplyField,
+    ) -> bool:
+        try:
+            payload = await locator.evaluate(
+                """
+                (node) => ({
+                  tag: node instanceof Element ? node.tagName.toLowerCase() : "",
+                  type: node instanceof HTMLInputElement ? node.type.toLowerCase() : "",
+                  role: node instanceof Element
+                    ? (node.getAttribute("role") || "").toLowerCase()
+                    : "",
+                })
+                """
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        tag = str((payload or {}).get("tag") or "").lower()
+        input_type = str((payload or {}).get("type") or "").lower()
+        role = str((payload or {}).get("role") or "").lower()
+        if field.control_kind == "text":
+            if tag == "textarea":
+                return True
+            if tag != "input":
+                return False
+            return input_type not in {"radio", "checkbox", "hidden", "file"}
+        if field.control_kind == "textarea":
+            return tag == "textarea"
+        if field.control_kind == "select":
+            return tag == "select"
+        if field.control_kind == "radio":
+            return role == "radio" or (tag == "input" and input_type == "radio")
+        if field.control_kind == "checkbox":
+            return role == "checkbox" or (tag == "input" and input_type == "checkbox")
+        return tag == "input" and input_type == "file"
 
     async def _field_interaction_focus_locator(
         self,
@@ -3294,7 +4063,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         recent_actions: list[dict[str, object]] = []
 
         try:
-            for step_index in range(6):
+            for step_index in range(self._agentic_retry_budget(default=6)):
                 if await self._easy_apply_modal_visible(page):
                     await self._wait_for_easy_apply_surface(page)
                     return
@@ -3620,7 +4389,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         recent_actions: list[dict[str, object]] = []
         last_action: BrowserAgentAction | None = None
         try:
-            for action_round in range(4):
+            for action_round in range(self._agentic_retry_budget(default=4)):
                 root = await self._easy_apply_root(page)
                 footer_action = await self._click_easy_apply_footer_primary_button(
                     page,
@@ -4004,7 +4773,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         execution_events: list[ExecutionEvent],
         recent_actions: tuple[dict[str, object], ...] = (),
     ) -> tuple[bool, str | None]:
-        for attempt_index in range(20):
+        for attempt_index in range(self._agentic_retry_budget(default=20, production_cap=6)):
             assessment = await self._assess_browser_state_with_agent(
                 page,
                 settings=settings,
@@ -4100,6 +4869,17 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 "The Easy Apply modal changed to a new surface without updating the step counter.",
             )
         root = await self._easy_apply_root(page)
+        if current_step.fields:
+            deterministic_blocker = await self._step_has_deterministic_blocker(
+                root,
+                current_step,
+            )
+            if not deterministic_blocker:
+                return (
+                    "pending",
+                    "No visible invalid or incomplete Easy Apply field remains after the latest "
+                    "action.",
+                )
         assessment = await self._assess_browser_state_with_agent(
             page,
             settings=settings,
@@ -4164,7 +4944,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         )
         recent_actions: list[dict[str, object]] = []
 
-        for remediation_round in range(4):
+        for remediation_round in range(self._agentic_retry_budget(default=4)):
             if not await self._easy_apply_modal_visible(page):
                 return "blocked", "The Easy Apply modal is no longer visible during remediation."
 
@@ -4197,6 +4977,17 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 )
 
             root = await self._easy_apply_root(page)
+            if current_step.fields:
+                deterministic_blocker = await self._step_has_deterministic_blocker(
+                    root,
+                    current_step,
+                )
+                if not deterministic_blocker:
+                    return (
+                        "complete",
+                        "No visible invalid or incomplete Easy Apply field remains after "
+                        "remediation.",
+                    )
             diagnosis = await self._assess_browser_state_with_agent(
                 page,
                 settings=settings,
@@ -4399,6 +5190,103 @@ class PlaywrightLinkedInEasyApplyExecutor:
             if await self._control_has_invalid_state(locator):
                 return locator
         return None
+
+    async def _step_has_deterministic_blocker(
+        self,
+        root: Locator,
+        step: EasyApplyStep,
+    ) -> bool:
+        for field in step.fields:
+            locator = await self._find_control_locator(root, field)
+            if locator is None:
+                continue
+            if field.control_kind in {"text", "textarea"}:
+                state = await self._inspect_text_field_interaction(locator)
+                if state.invalid or state.needs_agentic_follow_up:
+                    return True
+                if field.required and not state.has_value:
+                    return True
+                continue
+            control_state = await self._inspect_control_validation_state(locator)
+            if control_state.invalid:
+                return True
+            if field.required and not await self._field_has_live_required_value(
+                root,
+                field,
+                locator,
+                control_state=control_state,
+            ):
+                return True
+        return False
+
+    async def _field_has_live_required_value(
+        self,
+        root: Locator,
+        field: EasyApplyField,
+        locator: Locator,
+        *,
+        control_state: ControlValidationState | None = None,
+    ) -> bool:
+        match field.control_kind:
+            case "radio":
+                return await self._radio_field_has_selected_option(root, field)
+            case "checkbox":
+                return await _checkbox_option_is_checked(locator)
+            case _:
+                state = control_state or await self._inspect_control_validation_state(locator)
+                normalized_value = normalize_text(state.current_value)
+                return bool(
+                    normalized_value
+                    and normalized_value
+                    not in {
+                        "select an option",
+                        "choose an option",
+                        "select",
+                        "choose",
+                        "selecione",
+                        "selecione uma opcao",
+                    }
+                )
+
+    async def _radio_field_has_selected_option(
+        self,
+        root: Locator,
+        field: EasyApplyField,
+    ) -> bool:
+        if field.option_refs:
+            for option_ref in field.option_refs:
+                locator = root.locator(
+                    _attribute_selector("data-job-applier-option-ref", option_ref),
+                )
+                if not await locator.count():
+                    continue
+                if await _radio_option_is_checked(locator.first):
+                    return True
+            return False
+
+        if field.name:
+            group = root.locator(
+                f'input[type="radio"]{_attribute_selector("name", field.name)}',
+            )
+            count = await group.count()
+            for index in range(count):
+                if await _radio_option_is_checked(group.nth(index)):
+                    return True
+            return False
+
+        group_locator = await self._resolve_radio_group_locator(root, field)
+        if group_locator is not None:
+            group = group_locator.locator('input[type="radio"]')
+            count = await group.count()
+            for index in range(count):
+                if await _radio_option_is_checked(group.nth(index)):
+                    return True
+            return False
+
+        fallback_locator = await self._find_control_locator(root, field)
+        if fallback_locator is None:
+            return False
+        return await _radio_option_is_checked(fallback_locator)
 
     async def _control_has_invalid_state(self, locator: Locator) -> bool:
         return (await self._inspect_control_validation_state(locator)).invalid
@@ -5423,22 +6311,8 @@ class LinkedInEasyApplySubmitter(JobSubmitter):
                 successful_record=record,
             )
 
-        self._persist_execution_events(result.execution_events, keep_submission_link=False)
-
-        submission = ApplicationSubmission(
-            id=result.submission_id,
-            job_posting_id=posting.id,
-            status=result.status,
-            started_at=result.started_at,
-            resume_mode=result.resume_mode,
-            target_language=result.target_language,
-            matched_role_target=result.matched_role_target,
-            matched_specializations=result.matched_specializations,
-            cv_version=result.cv_version or settings.profile.cv_filename,
-            cover_letter_version=result.cover_letter_version,
-            execution_origin=origin,
-            notes=result.notes,
-        )
+        submission = self._persist_attempt_submission(result, posting, settings, origin)
+        self._persist_execution_events(result.execution_events, keep_submission_link=True)
         return SubmissionAttempt(submission=submission)
 
     def _persist_successful_submission(
@@ -5477,6 +6351,36 @@ class LinkedInEasyApplySubmitter(JobSubmitter):
             self._artifact_repository.save(artifact)
         return record
 
+    def _persist_attempt_submission(
+        self,
+        result: EasyApplyExecutionResult,
+        posting: JobPosting,
+        settings: UserAgentSettings,
+        origin: ExecutionOrigin,
+    ) -> ApplicationSubmission:
+        submission = ApplicationSubmission(
+            id=result.submission_id,
+            job_posting_id=posting.id,
+            status=result.status,
+            started_at=result.started_at,
+            resume_mode=result.resume_mode,
+            target_language=result.target_language,
+            matched_role_target=result.matched_role_target,
+            matched_specializations=result.matched_specializations,
+            cv_version=result.cv_version or settings.profile.cv_filename,
+            cover_letter_version=result.cover_letter_version,
+            execution_origin=origin,
+            notes=result.notes,
+        )
+        self._submission_repository.save(submission)
+        for answer in result.answers:
+            self._answer_repository.save(answer)
+        for recruiter_interaction in result.recruiter_interactions:
+            self._recruiter_repository.save(recruiter_interaction)
+        for artifact in result.artifacts:
+            self._artifact_repository.save(artifact)
+        return submission
+
     def _persist_execution_events(
         self,
         execution_events: tuple[ExecutionEvent, ...],
@@ -5493,6 +6397,16 @@ class LinkedInEasyApplySubmitter(JobSubmitter):
 def _attribute_selector(attribute: str, value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'[{attribute}="{escaped}"]'
+
+
+def _xpath_literal(value: str) -> str:
+    if "'" not in value:
+        return f"'{value}'"
+    if '"' not in value:
+        return f'"{value}"'
+    parts = value.split("'")
+    quoted_parts = [f"'{part}'" for part in parts]
+    return "concat(" + ', "\'", '.join(quoted_parts) + ")"
 
 
 def _existing_path(raw_path: str | None) -> Path | None:
@@ -5558,15 +6472,10 @@ def _pick_option_index(options: tuple[str, ...], *, preferred: str | None) -> in
 def _pick_resume_option_index(options: tuple[str, ...], filename: str) -> int | None:
     if not options:
         return None
-    scored_options = [
-        (_resume_option_match_score(option, filename), index)
-        for index, option in enumerate(options)
-    ]
-    scored_options.sort(reverse=True)
-    best_score, best_index = scored_options[0]
-    if best_score <= 0:
-        return None
-    return best_index
+    for index, option in enumerate(options):
+        if _resume_text_matches_requested_cv(option, filename):
+            return index
+    return None
 
 
 def _resume_option_match_score(option_text: str, filename: str) -> int:
@@ -5591,11 +6500,91 @@ def _resume_option_match_score(option_text: str, filename: str) -> int:
     return score
 
 
+def _resume_text_matches_requested_cv(text: str, target_filename: str) -> bool:
+    normalized_text = normalize_text(text)
+    if not normalized_text:
+        return False
+
+    normalized_filename = normalize_text(target_filename)
+    normalized_stem = normalize_text(Path(target_filename).stem)
+    if normalized_filename and normalized_filename in normalized_text:
+        return True
+    if normalized_stem and normalized_stem in normalized_text:
+        return True
+
+    extracted_filenames = re.findall(
+        r"[A-Za-z0-9][A-Za-z0-9._-]*\.(?:pdf|docx?|rtf)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    for candidate in extracted_filenames:
+        if normalize_text(candidate) == normalized_filename:
+            return True
+        if normalize_text(Path(candidate).stem) == normalized_stem:
+            return True
+    return False
+
+
 async def _radio_option_is_checked(locator: Locator) -> bool:
     try:
-        return await locator.is_checked()
+        if await locator.is_checked():
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        checked = await locator.evaluate(
+            """
+            (node) => {
+              if (!(node instanceof Element)) {
+                return false;
+              }
+              const input = node instanceof HTMLInputElement
+                ? node
+                : node.querySelector('input[type="radio"]');
+              if (input instanceof HTMLInputElement && input.checked) {
+                return true;
+              }
+              const roleRadio = node.matches('[role="radio"]')
+                ? node
+                : node.closest('[role="radio"]') || node.querySelector('[role="radio"]');
+              return (
+                roleRadio instanceof Element &&
+                roleRadio.getAttribute('aria-checked') === 'true'
+              );
+            }
+            """
+        )
     except Exception:  # noqa: BLE001
         return False
+    return bool(checked)
+
+
+async def _radio_option_input_id(locator: Locator) -> str | None:
+    try:
+        input_id = await locator.get_attribute("id")
+    except Exception:  # noqa: BLE001
+        input_id = None
+    if input_id:
+        return input_id
+    try:
+        nested_input_id = await locator.evaluate(
+            """
+            (node) => {
+              if (!(node instanceof Element)) {
+                return null;
+              }
+              const input = node instanceof HTMLInputElement
+                ? node
+                : node.querySelector('input[type="radio"]');
+              return input instanceof HTMLInputElement && input.id ? input.id : null;
+            }
+            """
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(nested_input_id, str) or not nested_input_id:
+        return None
+    return nested_input_id
 
 
 async def _checkbox_option_is_checked(locator: Locator) -> bool:

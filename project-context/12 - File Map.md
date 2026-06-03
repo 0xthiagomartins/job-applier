@@ -3,7 +3,6 @@
 ## Top-Level Areas
 
 - `src/`: backend application code
-- `apps/panel/`: Next.js panel
 - `scripts/`: operational scripts
 - `docs/`: repo-facing docs
 - `artifacts/`: runtime and debug outputs
@@ -47,13 +46,6 @@
 
 - `src/job_applier/interface/http/dependencies.py`
 
-## Panel Files To Know First
-
-- `apps/panel/components/profile-form.tsx`
-- `apps/panel/components/preferences-form.tsx`
-- `apps/panel/components/application-history.tsx`
-- `apps/panel/components/operational-dashboard.tsx`
-
 ## Scripts
 
 - `scripts/generate_mock_dynamic_resumes.py`
@@ -65,4 +57,3 @@
 - `artifacts/runtime/panel/settings.json`
 - `artifacts/runtime/artifacts/linkedin/submissions/...`
 - `artifacts/last-run/`
-

@@ -32,16 +32,14 @@ The current product flow is:
 - dynamic resume generation with CSS-backed PDF rendering
 - supported language-aware resume localization metadata in submission history
 - local artifact auditing for dynamic resumes
-- local runtime with FastAPI backend, Next.js panel, and SQLite persistence
+- local runtime with FastAPI backend and SQLite persistence
 
 The current repository already includes:
 
 - Python 3.14 project management with `uv`
-- FastAPI backend API with panel configuration endpoints
-- Next.js + TypeScript panel in `apps/panel`
+- FastAPI backend API
 - Ruff, mypy and pre-commit configuration
-- single-container on-premise runtime path with local SQLite fallback
-- automatic Alembic upgrade on startup
+- local SQLite runtime path
 - resume capability inference and review UI
 - dynamic resume audit tooling
 
@@ -117,26 +115,11 @@ This profile is used for screening questions such as years of experience. The us
    uv run uvicorn job_applier.main:app --reload
    ```
 
-5. Install panel dependencies:
-
-   ```bash
-   cd apps/panel
-   npm install
-   ```
-
-6. Start the panel locally:
-
-   ```bash
-   npm run dev
-   ```
-
-7. Check the backend health endpoint:
+5. Check the backend health endpoint:
 
    ```bash
    curl http://127.0.0.1:8000/health
    ```
-
-8. Open the panel at `http://127.0.0.1:3000`.
 
 ## LinkedIn runtime setup
 
@@ -160,7 +143,7 @@ Runtime behavior:
 - when `JOB_APPLIER_PLAYWRIGHT_MCP_URL` is configured, the login bootstrap runs through Playwright MCP and exports the storage state back to the Python app;
 - when `JOB_APPLIER_STAGEHAND_ENABLED=true`, the search flow can use Stagehand to semantically repair noisy LinkedIn job-detail extraction, especially in direct-target debugging and suspicious detail pages;
 - in headful mode, the browser stays visible so the user can solve captcha or checkpoint screens;
-- when the panel state is still empty, the app bootstraps a local profile automatically from `.env` and tries to import a CV from `~/Documents`.
+- when the local state is still empty, the app bootstraps a local profile automatically from `.env` and tries to import a CV from `~/Documents`.
 
 ## Resume and search configuration
 
@@ -174,7 +157,7 @@ Dynamic resume generation is still behind a feature flag.
 - the generated resume should preserve the base CV identity and only emphasize stack cues that are grounded in the uploaded CV or reviewed capability profile.
 - the profile also accepts a default content language; this is used as a fallback signal when the vacancy language is weak or ambiguous.
 
-The panel exposes:
+The local settings state exposes:
 
 - `static`: always apply with the uploaded base CV
 - `dynamic`: generate a per-job CV variant before application
@@ -251,7 +234,7 @@ uv run python scripts/audit_dynamic_resume.py \
 
 ## Quality commands
 
-This repository is currently validated through lint, type-check, panel build, scripts, artifacts, and real/staged runs rather than a maintained unit-test suite.
+This repository is currently validated through lint, type-check, scripts, artifacts, and real/staged runs rather than a maintained unit-test suite.
 
 Run lint:
 
@@ -265,26 +248,6 @@ Run type-check:
 ```bash
 uv run mypy src
 ```
-
-Frontend checks:
-
-```bash
-cd apps/panel
-npm run typecheck
-npm run build
-```
-
-## On-premise container
-
-The repository already includes a single `Dockerfile` for the on-premise flow:
-
-- backend API and panel run inside the same container;
-- if `JOB_APPLIER_PLAYWRIGHT_MCP_URL` is empty, the container also starts a local Playwright MCP sidecar and points the backend to `http://localhost:8931/mcp`;
-- if `JOB_APPLIER_PLAYWRIGHT_MCP_URL` is provided, the container skips the local MCP and uses the external one;
-- if `JOB_APPLIER_DATABASE_URL` is not provided, the app creates and uses a local SQLite file in `/data`;
-- for Linux hosts, Playwright can open a visible browser on the host display so the user can watch the automation and step in for captchas.
-
-Build and run details live in [docs/on-premise.md](docs/on-premise.md).
 
 ## Contributing
 

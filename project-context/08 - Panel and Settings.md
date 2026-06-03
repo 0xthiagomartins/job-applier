@@ -1,8 +1,8 @@
-# Panel and Settings
+# Settings and State
 
-## Panel Responsibilities
+## Local Settings Responsibilities
 
-The panel is the operational control plane for the local user.
+The local settings document is the operational control plane for the local user.
 
 It controls:
 
@@ -12,7 +12,7 @@ It controls:
 - default content language
 - search targets
 - capability profile overrides
-- run triggers and history views
+- runtime triggers and history views
 
 ## Important User Settings
 
@@ -64,7 +64,7 @@ The current local file prioritizes Brazilian targets first:
 
 ## Persistence Locations
 
-- panel document and local CV copies:
+- local settings document and local CV copies:
   - `artifacts/runtime/panel/`
 - local runtime database:
   - `artifacts/runtime/job-applier.db`
@@ -73,9 +73,8 @@ The current local file prioritizes Brazilian targets first:
 
 Before sharing the project with another harness or person, review:
 
-- panel state
+- local settings state
 - copied CVs
 - any saved session or runtime file
 
 Do not blindly ship `artifacts/runtime/`.
-

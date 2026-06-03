@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-from playwright.async_api import BrowserContext, Page, async_playwright
+from playwright.async_api import BrowserContext, Locator, Page, async_playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import SecretStr
 
@@ -772,7 +772,10 @@ def merge_job_detail_payload(
         "",
     )
     detail_easy_apply = detail_payload.get("easy_apply")
-    easy_apply = detail_easy_apply if isinstance(detail_easy_apply, bool) else listing.easy_apply
+    # Search-card Easy Apply evidence is the acquisition-stage source of truth.
+    # Detail enrichment may confirm availability, but it should not downgrade a listing that was
+    # already captured as Easy Apply. Runtime entrypoint availability is handled by the submitter.
+    easy_apply = listing.easy_apply or detail_easy_apply is True
 
     merged_listing = LinkedInCollectedJob(
         external_job_id=listing.external_job_id,
@@ -1120,19 +1123,47 @@ class PlaywrightLinkedInJobsClient:
             browser = await playwright.chromium.launch(
                 headless=self._runtime_settings.playwright_headless,
             )
+            jobs: list[LinkedInCollectedJob] | None = None
+            primary_error: Exception | None = None
             try:
                 for attempt in range(2):
                     context = await session_manager.create_authenticated_context(browser)
                     try:
-                        return await self._fetch_jobs_once(context, criteria)
+                        jobs = await self._fetch_jobs_once(context, criteria)
+                        return jobs
                     except LinkedInAuthError:
                         session_manager.clear_saved_state()
                         if attempt == 1:
                             raise
+                    except Exception as exc:  # noqa: BLE001
+                        primary_error = exc
+                        raise
                     finally:
-                        await context.close()
+                        try:
+                            await context.close()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "linkedin_search_context_close_failed",
+                                extra={
+                                    "close_error": str(exc),
+                                    "criteria": criteria.to_log_payload(),
+                                },
+                            )
+                            if primary_error is None and jobs is None:
+                                raise
             finally:
-                await browser.close()
+                try:
+                    await browser.close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "linkedin_search_browser_close_failed",
+                        extra={
+                            "close_error": str(exc),
+                            "criteria": criteria.to_log_payload(),
+                        },
+                    )
+                    if primary_error is None and jobs is None:
+                        raise
         msg = "LinkedIn search exhausted all authentication retries."
         raise LinkedInSearchError(msg)
 
@@ -1152,20 +1183,48 @@ class PlaywrightLinkedInJobsClient:
             browser = await playwright.chromium.launch(
                 headless=self._runtime_settings.playwright_headless,
             )
+            stream_completed = False
+            primary_error: Exception | None = None
             try:
                 for attempt in range(2):
                     context = await session_manager.create_authenticated_context(browser)
                     try:
                         await self._fetch_jobs_once(context, criteria, on_job=on_job)
+                        stream_completed = True
                         return
                     except LinkedInAuthError:
                         session_manager.clear_saved_state()
                         if attempt == 1:
                             raise
+                    except Exception as exc:  # noqa: BLE001
+                        primary_error = exc
+                        raise
                     finally:
-                        await context.close()
+                        try:
+                            await context.close()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "linkedin_search_context_close_failed",
+                                extra={
+                                    "close_error": str(exc),
+                                    "criteria": criteria.to_log_payload(),
+                                },
+                            )
+                            if primary_error is None and not stream_completed:
+                                raise
             finally:
-                await browser.close()
+                try:
+                    await browser.close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "linkedin_search_browser_close_failed",
+                        extra={
+                            "close_error": str(exc),
+                            "criteria": criteria.to_log_payload(),
+                        },
+                    )
+                    if primary_error is None and not stream_completed:
+                        raise
         msg = "LinkedIn search exhausted all authentication retries."
         raise LinkedInSearchError(msg)
 
@@ -1322,6 +1381,7 @@ class PlaywrightLinkedInJobsClient:
                     detailed_listing = await self._load_job_details_with_resilience(
                         context,
                         listing,
+                        results_page=page,
                     )
                     jobs.append(detailed_listing)
                     update_progress_snapshot(
@@ -2294,13 +2354,18 @@ class PlaywrightLinkedInJobsClient:
         context: BrowserContext,
         listing: LinkedInCollectedJob,
         *,
+        results_page: Page | None = None,
         prefer_stagehand: bool = False,
     ) -> LinkedInCollectedJob:
-        detail_page = await context.new_page()
+        detail_page = results_page or await context.new_page()
+        owns_detail_page = results_page is None
         try:
-            await self._pause_before_navigation(detail_page, reason="job_detail_open")
-            await detail_page.goto(listing.url, wait_until="domcontentloaded")
-            await self._ensure_authenticated_page(detail_page)
+            if owns_detail_page:
+                await self._pause_before_navigation(detail_page, reason="job_detail_open")
+                await detail_page.goto(listing.url, wait_until="domcontentloaded")
+                await self._ensure_authenticated_page(detail_page)
+            else:
+                await self._select_listing_detail_panel(detail_page, listing)
             await self._prepare_job_detail_page(detail_page)
             detail_payload = await detail_page.evaluate(
                 """
@@ -2414,13 +2479,46 @@ class PlaywrightLinkedInJobsClient:
                     }
                     return null;
                   };
+                  const collectCandidateTexts = (selectors) => {
+                    const values = [];
+                    for (const selector of selectors) {
+                      const nodes = document.querySelectorAll(selector);
+                      for (const node of nodes) {
+                        const text = nodeText(node);
+                        if (text && !values.includes(text)) {
+                          values.push(text);
+                        }
+                      }
+                    }
+                    return values;
+                  };
+                  const selectBestDescription = (candidates) => {
+                    let best = "";
+                    for (const candidate of candidates) {
+                      if (!candidate) {
+                        continue;
+                      }
+                      const normalized = collapse(candidate);
+                      if (!normalized) {
+                        continue;
+                      }
+                      if (normalized.length > best.length) {
+                        best = normalized;
+                      }
+                    }
+                    return best;
+                  };
 
-                  const descriptionRoot = firstNode([
+                  const descriptionCandidates = collectCandidateTexts([
                     ".jobs-description-content__text",
-                    "#job-details",
+                    ".jobs-description__container .jobs-box__html-content",
+                    ".jobs-box__html-content",
+                    ".jobs-description",
+                    "[class*='show-more-less-html__markup']",
                     "[data-job-detail-container] .jobs-box__html-content",
+                    "#job-details",
                   ]);
-                  const description = nodeText(descriptionRoot);
+                  const description = selectBestDescription(descriptionCandidates);
                   const title = firstText([
                     ".job-details-jobs-unified-top-card__job-title",
                     ".jobs-unified-top-card h1",
@@ -2545,7 +2643,8 @@ class PlaywrightLinkedInJobsClient:
                 prefer_stagehand=prefer_stagehand,
             )
         finally:
-            await detail_page.close()
+            if owns_detail_page:
+                await detail_page.close()
         merged_listing = merge_job_detail_payload(listing, detail_payload)
         append_timeline_event(
             "linkedin_job_detail_loaded",
@@ -2568,6 +2667,7 @@ class PlaywrightLinkedInJobsClient:
         context: BrowserContext,
         listing: LinkedInCollectedJob,
         *,
+        results_page: Page | None = None,
         prefer_stagehand: bool = False,
     ) -> LinkedInCollectedJob:
         last_error: str | None = None
@@ -2576,6 +2676,7 @@ class PlaywrightLinkedInJobsClient:
                 return await self._load_job_details(
                     context,
                     listing,
+                    results_page=results_page,
                     prefer_stagehand=prefer_stagehand,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -2706,11 +2807,7 @@ class PlaywrightLinkedInJobsClient:
                 company_name=_collapse_text(repair.company_name) or listing.company_name,
                 location=_collapse_text(repair.location) or listing.location,
                 description_raw=listing.description_raw,
-                easy_apply=(
-                    repair.easy_apply_visible
-                    if repair.easy_apply_visible is not None
-                    else listing.easy_apply
-                ),
+                easy_apply=listing.easy_apply or repair.easy_apply_visible is True,
                 metadata_text=listing.metadata_text,
                 workplace_type=listing.workplace_type,
                 seniority=listing.seniority,
@@ -3085,6 +3182,142 @@ class PlaywrightLinkedInJobsClient:
                 continue
         await page.evaluate("window.scrollTo({ top: 0, behavior: 'instant' })")
         await page.wait_for_timeout(300)
+        await self._expand_job_detail_content(page)
+
+    async def _select_listing_detail_panel(
+        self,
+        page: Page,
+        listing: LinkedInCollectedJob,
+    ) -> None:
+        target_job_id = listing.external_job_id or self._extract_job_id_from_url(listing.url)
+        current_job_id = await page.evaluate(
+            "() => new URL(window.location.href).searchParams.get('currentJobId') || ''"
+        )
+        if target_job_id and current_job_id == target_job_id:
+            return
+
+        candidate_locators: list[Locator] = []
+        if target_job_id:
+            candidate_locators.append(page.locator(f"a[href*='/jobs/view/{target_job_id}']"))
+        candidate_locators.extend(
+            (
+                page.locator(f"a[href='{listing.url}']"),
+                page.locator(f"a[href='{listing.url}/']"),
+            )
+        )
+
+        clicked = False
+        for locator in candidate_locators:
+            if not await locator.count():
+                continue
+            try:
+                await locator.first.scroll_into_view_if_needed()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await locator.first.click(timeout=5_000)
+                clicked = True
+                break
+            except Exception:  # noqa: BLE001
+                continue
+
+        if not clicked:
+            msg = f"Could not activate the LinkedIn result card for {listing.url}."
+            raise LinkedInSearchError(msg)
+
+        if target_job_id:
+            try:
+                await page.wait_for_function(
+                    """
+                    (jobId) => {
+                      const currentUrl = new URL(window.location.href);
+                      return currentUrl.searchParams.get("currentJobId") === jobId
+                        || currentUrl.pathname.includes(`/jobs/view/${jobId}`);
+                    }
+                    """,
+                    arg=target_job_id,
+                    timeout=10_000,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        await page.wait_for_timeout(650)
+
+    async def _expand_job_detail_content(self, page: Page) -> None:
+        try:
+            expanded = await page.evaluate(
+                """
+                () => {
+                  const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                  const isVisible = (element) => {
+                    if (!element) {
+                      return false;
+                    }
+                    const style = window.getComputedStyle(element);
+                    if (
+                      style.display === "none"
+                      || style.visibility === "hidden"
+                      || style.opacity === "0"
+                    ) {
+                      return false;
+                    }
+                    const rect = element.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  };
+                  const jobDetailContainers = [
+                    document.querySelector(".jobs-description"),
+                    document.querySelector(".jobs-description__container"),
+                    document.querySelector("#job-details"),
+                    document.querySelector("[data-job-detail-container]"),
+                  ].filter(Boolean);
+                  const buttons = Array.from(
+                    document.querySelectorAll("button, [role='button'], a"),
+                  );
+                  let clickCount = 0;
+                  for (const button of buttons) {
+                    if (!isVisible(button)) {
+                      continue;
+                    }
+                    const label = collapse(
+                      [
+                        button.innerText || button.textContent || "",
+                        button.getAttribute("aria-label") || "",
+                        button.getAttribute("title") || "",
+                      ].join(" "),
+                    );
+                    if (!label) {
+                      continue;
+                    }
+                    if (
+                      !/^(show|see|read|view|mostrar|ver)/i.test(label)
+                      && !/(show more|see more|read more|view more|mostrar mais|ver mais)/i.test(
+                        label,
+                      )
+                    ) {
+                      continue;
+                    }
+                    const container = button.closest([
+                      ".jobs-description",
+                      ".jobs-description__container",
+                      "#job-details",
+                      "[data-job-detail-container]",
+                    ].join(", "));
+                    if (container == null && jobDetailContainers.length > 0) {
+                      continue;
+                    }
+                    button.click();
+                    clickCount += 1;
+                    if (clickCount >= 3) {
+                      break;
+                    }
+                  }
+                  return clickCount;
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            return
+        if isinstance(expanded, int) and expanded > 0:
+            await page.wait_for_timeout(400)
 
 
 def _workplace_option_name(workplace_type: WorkplaceType) -> str:

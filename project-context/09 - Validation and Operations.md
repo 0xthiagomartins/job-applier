@@ -9,13 +9,6 @@ uv run ruff check .
 uv run mypy src
 ```
 
-Panel:
-
-```bash
-cd apps/panel
-npm run build
-```
-
 ## Artifact Review
 
 Latest run bundle:
@@ -82,4 +75,3 @@ When something looks wrong:
 3. the rendered PDF
 4. the entrypoint assessment events
 5. scorer output and matched role target
-
