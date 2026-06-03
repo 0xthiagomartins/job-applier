@@ -243,31 +243,3 @@ class ArtifactSnapshotModel(Base):
     submission: Mapped[ApplicationSubmissionModel] = relationship(
         back_populates="artifact_snapshots",
     )
-
-
-class ApplyActionMemoryModel(Base):
-    """Persisted adaptive Easy Apply memory entry."""
-
-    __tablename__ = "apply_action_memories"
-    __table_args__ = (
-        Index("ix_apply_action_memories_task_type", "task_type"),
-        Index("ix_apply_action_memories_expires_at", "expires_at"),
-        Index(
-            "ux_apply_action_memories_task_signature",
-            "task_type",
-            "signature_hash",
-            unique=True,
-        ),
-    )
-
-    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
-    task_type: Mapped[str] = mapped_column(String(128), nullable=False)
-    signature_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    signature_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
-    strategy_payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
-    success_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    last_succeeded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

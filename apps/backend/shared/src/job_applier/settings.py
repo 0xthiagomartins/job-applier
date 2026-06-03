@@ -23,6 +23,7 @@ class RuntimeSettings(BaseSettings):
     output_dir: Path = Path("artifacts/last-run")
     panel_storage_dir: Path | None = None
     database_url: str | None = None
+    apply_action_memory_cache_dir: Path | None = None
     backend_host: str = "0.0.0.0"
     backend_port: int = 8000
     panel_port: int = 3000
@@ -102,6 +103,12 @@ class RuntimeSettings(BaseSettings):
         if self.database_url:
             return self.database_url
         return f"sqlite:///{(self.data_dir / 'job-applier.db').resolve()}"
+
+    @property
+    def resolved_apply_action_memory_cache_dir(self) -> Path:
+        """Return the cache directory used by adaptive Easy Apply memory."""
+
+        return self.apply_action_memory_cache_dir or self.data_dir / "cache" / "apply-action-memory"
 
     @property
     def resolved_playwright_mcp_url(self) -> str:
@@ -269,6 +276,7 @@ def initialize_runtime_environment(settings: RuntimeSettings) -> None:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     settings.resolved_panel_storage_dir.mkdir(parents=True, exist_ok=True)
+    settings.resolved_apply_action_memory_cache_dir.mkdir(parents=True, exist_ok=True)
     settings.resolved_linkedin_storage_state_path.parent.mkdir(parents=True, exist_ok=True)
     settings.resolved_linkedin_artifacts_dir.mkdir(parents=True, exist_ok=True)
     settings.resolved_stagehand_cache_dir.mkdir(parents=True, exist_ok=True)

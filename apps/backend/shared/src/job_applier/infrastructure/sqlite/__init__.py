@@ -7,7 +7,6 @@ from job_applier.infrastructure.sqlite.database import (
 )
 from job_applier.infrastructure.sqlite.repositories import (
     SqliteAnswerRepository,
-    SqliteApplyActionMemoryRepository,
     SqliteArtifactSnapshotRepository,
     SqliteExecutionEventRepository,
     SqliteJobPostingRepository,
@@ -20,7 +19,6 @@ from job_applier.infrastructure.sqlite.repositories import (
 
 __all__ = [
     "Base",
-    "SqliteApplyActionMemoryRepository",
     "SqliteAnswerRepository",
     "SqliteArtifactSnapshotRepository",
     "SqliteExecutionEventRepository",

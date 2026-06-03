@@ -11,6 +11,7 @@ from job_applier.infrastructure import (
     LocalPanelSettingsStore,
     MirroredExecutionStore,
 )
+from job_applier.infrastructure.cache import DiskCacheApplyActionMemoryRepository
 from job_applier.infrastructure.linkedin import (
     LinkedInEasyApplySubmitter,
     LinkedInJobFetcher,
@@ -19,7 +20,6 @@ from job_applier.infrastructure.linkedin import (
 )
 from job_applier.infrastructure.sqlite import (
     SqliteAnswerRepository,
-    SqliteApplyActionMemoryRepository,
     SqliteArtifactSnapshotRepository,
     SqliteExecutionEventRepository,
     SqliteJobPostingRepository,
@@ -120,10 +120,11 @@ def get_submission_history_repository() -> SqliteSubmissionHistoryRepository:
 
 
 @lru_cache(maxsize=1)
-def get_apply_action_memory_repository() -> SqliteApplyActionMemoryRepository:
-    """Return the SQLite-backed adaptive apply memory repository."""
+def get_apply_action_memory_repository() -> DiskCacheApplyActionMemoryRepository:
+    """Return the disk-backed adaptive apply memory repository."""
 
-    return SqliteApplyActionMemoryRepository(get_database_session_factory())
+    settings = get_runtime_settings()
+    return DiskCacheApplyActionMemoryRepository(settings.resolved_apply_action_memory_cache_dir)
 
 
 @lru_cache(maxsize=1)
