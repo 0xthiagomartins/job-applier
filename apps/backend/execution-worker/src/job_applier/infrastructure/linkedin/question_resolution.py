@@ -1696,6 +1696,19 @@ class LinkedInAnswerResolver:
         if field.prefilled and field_has_meaningful_current_value(field):
             return None
 
+        accessibility_answer = _resolve_accessibility_accommodation_answer(field)
+        if accessibility_answer is not None:
+            return ResolvedFieldValue(
+                value=accessibility_answer.value,
+                answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
+                fill_strategy=FillStrategy.BEST_EFFORT,
+                ambiguity_flag=True,
+                confidence=accessibility_answer.confidence,
+                reasoning=accessibility_answer.reasoning,
+            )
+        if _looks_like_accessibility_accommodation_question(field):
+            return None
+
         sensitive_guardrail = _resolve_sensitive_demographic_guardrail(field)
         if sensitive_guardrail is not None:
             return ResolvedFieldValue(
@@ -2794,6 +2807,8 @@ def field_needs_semantic_step_planning(field: EasyApplyField) -> bool:
 
     if field.prefilled and field_has_meaningful_current_value(field):
         return False
+    if _looks_like_accessibility_accommodation_question(field):
+        return False
     if _looks_like_sensitive_demographic_question(field):
         return False
     if _looks_like_sensitive_demographic_gate_question(field):
@@ -3194,6 +3209,35 @@ def _looks_like_sensitive_demographic_question(field: EasyApplyField) -> bool:
     )
 
 
+def _looks_like_accessibility_accommodation_question(field: EasyApplyField) -> bool:
+    normalized = normalize_text(f"{field.question_raw} {field.normalized_key}")
+    if any(
+        token in normalized
+        for token in (
+            "accessibility",
+            "accessibilidade",
+            "accommodation",
+            "acomodacao",
+            "acomodação",
+            "reasonable accommodation",
+        )
+    ):
+        return True
+    option_text = normalize_text(" ".join(field.options[:12]))
+    return any(
+        token in option_text
+        for token in (
+            "audiodescricao",
+            "audiodescription",
+            "interprete de libras",
+            "sign language",
+            "elevador/rampa",
+            "wheelchair",
+            "braille",
+        )
+    )
+
+
 def _looks_like_sensitive_demographic_gate_question(field: EasyApplyField) -> bool:
     normalized = normalize_text(f"{field.question_raw} {field.normalized_key}")
     if not any(
@@ -3238,6 +3282,28 @@ def _pick_sensitive_opt_out_option(options: tuple[str, ...]) -> str | None:
     return None
 
 
+def _pick_accessibility_none_option(options: tuple[str, ...]) -> str | None:
+    none_tokens = (
+        "nao necessito",
+        "não necessito",
+        "nenhuma acessibilidade",
+        "sem necessidade",
+        "nao preciso",
+        "não preciso",
+        "no accessibility",
+        "no accommodation",
+        "do not need accommodation",
+        "none",
+    )
+    for option in options:
+        normalized_option = normalize_text(option)
+        if normalized_option in _PLACEHOLDER_OPTION_TOKENS:
+            continue
+        if any(token in normalized_option for token in none_tokens):
+            return option
+    return None
+
+
 def _resolve_sensitive_opt_out_answer(field: EasyApplyField) -> GuardrailAnswer | None:
     if not field.options:
         return None
@@ -3248,6 +3314,21 @@ def _resolve_sensitive_opt_out_answer(field: EasyApplyField) -> GuardrailAnswer 
         value=opt_out_option,
         confidence=0.92,
         reasoning="sensitive_question_opt_out",
+    )
+
+
+def _resolve_accessibility_accommodation_answer(field: EasyApplyField) -> GuardrailAnswer | None:
+    if not _looks_like_accessibility_accommodation_question(field):
+        return None
+    if not field.options:
+        return None
+    none_option = _pick_accessibility_none_option(field.options)
+    if none_option is None:
+        return None
+    return GuardrailAnswer(
+        value=none_option,
+        confidence=0.9,
+        reasoning="accessibility_accommodation_not_requested",
     )
 
 

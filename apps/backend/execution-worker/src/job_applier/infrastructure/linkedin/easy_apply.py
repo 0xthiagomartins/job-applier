@@ -99,6 +99,7 @@ from job_applier.infrastructure.linkedin.question_resolution import (
     LinkedInAnswerResolver,
     LinkedInQuestionExtractor,
     ResolvedFieldValue,
+    _looks_like_accessibility_accommodation_question,
     _looks_like_sensitive_demographic_gate_question,
     _looks_like_sensitive_demographic_question,
     _profile_first_name,
@@ -130,9 +131,11 @@ _FIELD_STATE_INSPECTION_TIMEOUT_MS = 5_000
 
 
 def _field_disallows_adaptive_resolution_memory(field: EasyApplyField) -> bool:
-    return _looks_like_sensitive_demographic_question(
-        field
-    ) or _looks_like_sensitive_demographic_gate_question(field)
+    return (
+        _looks_like_accessibility_accommodation_question(field)
+        or _looks_like_sensitive_demographic_question(field)
+        or _looks_like_sensitive_demographic_gate_question(field)
+    )
 
 
 class LinkedInEasyApplyError(RuntimeError):

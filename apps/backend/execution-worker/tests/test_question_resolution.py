@@ -276,6 +276,36 @@ class LinkedInAnswerResolverSensitiveGuardrailTests(unittest.IsolatedAsyncioTest
         self.assertIsNone(resolved)
         self.assertEqual(self.generator.calls, 0)
 
+    async def test_accessibility_accommodation_prefers_explicit_no_need_option(self) -> None:
+        field = EasyApplyField(
+            question_raw=(
+                "Você precisa de algum tipo de acessibilidade para participar do processo "
+                "seletivo e/ou no seu dia-a-dia?"
+            ),
+            normalized_key="accessibility_accommodation",
+            question_type=QuestionType.UNKNOWN,
+            control_kind="select",
+            required=True,
+            options=(
+                "Select an option",
+                "Descrição de imagens e audiodescrição de vídeos",
+                "Elevador/Rampa",
+                "Não necessito de nenhuma acessibilidade",
+            ),
+        )
+
+        resolved = await self.resolver.resolve(
+            field,
+            self.settings,
+            posting=self.posting,
+        )
+
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved.value, "Não necessito de nenhuma acessibilidade")
+        self.assertEqual(resolved.reasoning, "accessibility_accommodation_not_requested")
+        self.assertEqual(self.generator.calls, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

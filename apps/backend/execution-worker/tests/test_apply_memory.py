@@ -433,6 +433,58 @@ class AdaptiveApplyMemoryTests(unittest.TestCase):
             )
         )
 
+    def test_executor_skips_accessibility_resolution_memory_replay_and_promotion(self) -> None:
+        field = EasyApplyField(
+            question_raw="Você precisa de algum tipo de acessibilidade?",
+            normalized_key="accessibility_accommodation",
+            question_type=QuestionType.UNKNOWN,
+            control_kind="select",
+            input_type="select",
+            required=True,
+            options=(
+                "Select an option",
+                "Elevador/Rampa",
+                "Não necessito de nenhuma acessibilidade",
+            ),
+        )
+        signature = build_field_resolution_task_signature(
+            task_type=TASK_RESOLVE_SELECT,
+            field=field,
+        )
+        promoted = self.memory.promote_successful_resolution(
+            task_type=TASK_RESOLVE_SELECT,
+            signature_payload=signature,
+            field=field,
+            resolved_value="Não necessito de nenhuma acessibilidade",
+        )
+        if promoted is None:
+            self.fail("expected stored memory entry for setup")
+
+        executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
+        executor._apply_memory = self.memory
+
+        (
+            memory_entry,
+            task_type,
+            signature_payload,
+            resolution,
+        ) = executor._replay_field_resolution_memory(field)
+        self.assertIsNone(memory_entry)
+        self.assertIsNone(task_type)
+        self.assertIsNone(signature_payload)
+        self.assertIsNone(resolution)
+
+        self.assertFalse(
+            executor._should_promote_field_resolution_memory(
+                field,
+                ResolvedFieldValue(
+                    value="Não necessito de nenhuma acessibilidade",
+                    answer_source=AnswerSource.AI,
+                    fill_strategy=FillStrategy.AUTOFILL_AI,
+                ),
+            )
+        )
+
     def test_executor_emits_explicit_memory_timeline_events(self) -> None:
         now = datetime.now(tz=UTC)
         stored = self.repository.save(
