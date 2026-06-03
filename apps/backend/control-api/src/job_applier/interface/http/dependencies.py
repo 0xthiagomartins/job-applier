@@ -19,6 +19,7 @@ from job_applier.infrastructure.linkedin import (
 )
 from job_applier.infrastructure.sqlite import (
     SqliteAnswerRepository,
+    SqliteApplyActionMemoryRepository,
     SqliteArtifactSnapshotRepository,
     SqliteExecutionEventRepository,
     SqliteJobPostingRepository,
@@ -119,6 +120,13 @@ def get_submission_history_repository() -> SqliteSubmissionHistoryRepository:
 
 
 @lru_cache(maxsize=1)
+def get_apply_action_memory_repository() -> SqliteApplyActionMemoryRepository:
+    """Return the SQLite-backed adaptive apply memory repository."""
+
+    return SqliteApplyActionMemoryRepository(get_database_session_factory())
+
+
+@lru_cache(maxsize=1)
 def get_linkedin_jobs_client() -> PlaywrightLinkedInJobsClient:
     """Return the Playwright LinkedIn search client."""
 
@@ -132,6 +140,7 @@ def get_linkedin_easy_apply_executor() -> PlaywrightLinkedInEasyApplyExecutor:
     return PlaywrightLinkedInEasyApplyExecutor(
         get_runtime_settings(),
         execution_event_repository=get_execution_event_repository(),
+        apply_action_memory_repository=get_apply_action_memory_repository(),
     )
 
 

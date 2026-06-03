@@ -282,3 +282,56 @@ class ArtifactSnapshot:
         object.__setattr__(self, "path", ensure_non_empty(self.path, "path"))
         object.__setattr__(self, "sha256", ensure_non_empty(self.sha256, "sha256"))
         object.__setattr__(self, "created_at", ensure_utc(self.created_at, "created_at"))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ApplyActionMemory:
+    """Reusable structural memory for repeated Easy Apply micro-interactions."""
+
+    task_type: str
+    signature_hash: str
+    signature_json: str
+    strategy_payload_json: str
+    id: UUID = field(default_factory=uuid4)
+    success_count: int = 0
+    failure_count: int = 0
+    created_at: datetime = field(default_factory=utc_now)
+    last_used_at: datetime | None = None
+    last_succeeded_at: datetime | None = None
+    expires_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "task_type", ensure_non_empty(self.task_type, "task_type"))
+        object.__setattr__(
+            self,
+            "signature_hash",
+            ensure_non_empty(self.signature_hash, "signature_hash"),
+        )
+        object.__setattr__(
+            self,
+            "signature_json",
+            ensure_non_empty(self.signature_json, "signature_json"),
+        )
+        object.__setattr__(
+            self,
+            "strategy_payload_json",
+            ensure_non_empty(self.strategy_payload_json, "strategy_payload_json"),
+        )
+        object.__setattr__(self, "created_at", ensure_utc(self.created_at, "created_at"))
+        object.__setattr__(self, "expires_at", ensure_utc(self.expires_at, "expires_at"))
+        if self.last_used_at is not None:
+            object.__setattr__(self, "last_used_at", ensure_utc(self.last_used_at, "last_used_at"))
+        if self.last_succeeded_at is not None:
+            object.__setattr__(
+                self,
+                "last_succeeded_at",
+                ensure_utc(self.last_succeeded_at, "last_succeeded_at"),
+            )
+        if self.success_count < 0:
+            msg = "success_count must be zero or greater"
+            raise ValueError(msg)
+        if self.failure_count < 0:
+            msg = "failure_count must be zero or greater"
+            raise ValueError(msg)
+        json.loads(self.signature_json)
+        json.loads(self.strategy_payload_json)

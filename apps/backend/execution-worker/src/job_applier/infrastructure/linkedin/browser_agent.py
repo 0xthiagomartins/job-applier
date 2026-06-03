@@ -2514,6 +2514,34 @@ class OpenAIResponsesBrowserAgent:
         msg = f"Browser agent could not complete a safe single action for {task_name}."
         raise BrowserAutomationError(msg)
 
+    async def capture_task_snapshot(
+        self,
+        *,
+        page: Page,
+        focus_locator: Locator | None = None,
+        priority_locator: Locator | None = None,
+    ) -> BrowserAgentSnapshot:
+        """Capture the compact browser snapshot used by the planner."""
+
+        await self._align_priority_locator_into_view(page, priority_locator)
+        return await self._snapshotter.capture(
+            page,
+            focus_locator=focus_locator,
+            priority_locator=priority_locator,
+        )
+
+    async def replay_action(
+        self,
+        *,
+        page: Page,
+        action: BrowserAgentAction,
+        values: Mapping[BrowserValueSource, str],
+        snapshot: BrowserAgentSnapshot | None = None,
+    ) -> None:
+        """Execute a precomputed action without asking the model to plan again."""
+
+        await self._execute_action(page=page, action=action, values=values, snapshot=snapshot)
+
     async def _align_priority_locator_into_view(
         self,
         page: Page,

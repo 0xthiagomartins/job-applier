@@ -14,6 +14,7 @@ from job_applier.application.history import (
 from job_applier.domain.entities import (
     ApplicationAnswer,
     ApplicationSubmission,
+    ApplyActionMemory,
     ArtifactSnapshot,
     ExecutionEvent,
     JobPosting,
@@ -113,6 +114,22 @@ class ArtifactSnapshotRepository(Repository[ArtifactSnapshot], Protocol):
 
     def list_for_submission(self, submission_id: UUID) -> list[ArtifactSnapshot]:
         """List artifacts linked to one submission."""
+
+
+class ApplyActionMemoryRepository(Repository[ApplyActionMemory], Protocol):
+    """Persistence contract for adaptive Easy Apply memory entries."""
+
+    def find_active_by_task_signature(
+        self,
+        *,
+        task_type: str,
+        signature_hash: str,
+        now: datetime,
+    ) -> ApplyActionMemory | None:
+        """Return one non-expired memory entry for the given structural signature."""
+
+    def delete_expired(self, *, now: datetime) -> int:
+        """Delete expired memory entries and return how many rows were removed."""
 
 
 class SubmissionHistoryRepository(Protocol):

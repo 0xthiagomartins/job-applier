@@ -3,6 +3,7 @@
 from job_applier.domain.entities import (
     ApplicationAnswer,
     ApplicationSubmission,
+    ApplyActionMemory,
     ArtifactSnapshot,
     ExecutionEvent,
     JobPosting,
@@ -31,6 +32,7 @@ from job_applier.domain.versioning import Ruleset
 __all__ = [
     "AnswerSource",
     "AgentExecutionStatus",
+    "ApplyActionMemory",
     "ApplicationAnswer",
     "ApplicationSubmission",
     "ArtifactSnapshot",

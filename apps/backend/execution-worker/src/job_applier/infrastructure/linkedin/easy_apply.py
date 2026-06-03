@@ -33,6 +33,7 @@ from job_applier.application.agent_execution import (
 from job_applier.application.config import UserAgentSettings
 from job_applier.application.repositories import (
     AnswerRepository,
+    ApplyActionMemoryRepository,
     ArtifactSnapshotRepository,
     ExecutionEventRepository,
     ProfileSnapshotRepository,
@@ -46,6 +47,7 @@ from job_applier.application.snapshotting import (
 from job_applier.domain.entities import (
     ApplicationAnswer,
     ApplicationSubmission,
+    ApplyActionMemory,
     ArtifactSnapshot,
     ExecutionEvent,
     JobPosting,
@@ -65,6 +67,15 @@ from job_applier.domain.enums import (
     SupportedLanguage,
 )
 from job_applier.infrastructure.language_support import detect_job_posting_language
+from job_applier.infrastructure.linkedin.apply_memory import (
+    TASK_FINALIZE_CHECKBOX,
+    TASK_FINALIZE_FIELD,
+    TASK_FINALIZE_RADIO,
+    TASK_PRIMARY_ACTION,
+    AdaptiveApplyMemory,
+    build_field_task_signature,
+    build_step_task_signature,
+)
 from job_applier.infrastructure.linkedin.auth import (
     LinkedInAuthError,
     LinkedInCredentials,
@@ -72,6 +83,7 @@ from job_applier.infrastructure.linkedin.auth import (
 )
 from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserAgentAction,
+    BrowserAgentSnapshot,
     BrowserAutomationError,
     BrowserDomSnapshotter,
     BrowserTaskAssessment,
@@ -330,6 +342,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         *,
         answer_resolver: LinkedInAnswerResolver | None = None,
         execution_event_repository: ExecutionEventRepository | None = None,
+        apply_action_memory_repository: ApplyActionMemoryRepository | None = None,
     ) -> None:
         self._runtime_settings = runtime_settings
         self._answer_resolver = answer_resolver or LinkedInAnswerResolver()
@@ -338,6 +351,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
         self._recruiter_connector = PlaywrightRecruiterConnector(runtime_settings)
         self._execution_event_repository = execution_event_repository
         self._dynamic_resume_builder = OhMyCvDynamicResumeBuilder(runtime_settings)
+        self._apply_memory = (
+            AdaptiveApplyMemory(apply_action_memory_repository)
+            if apply_action_memory_repository is not None
+            else None
+        )
         self._session_manager: LinkedInSessionManager | None = None
 
     def _is_production_apply_run(self) -> bool:
@@ -1811,6 +1829,41 @@ class PlaywrightLinkedInEasyApplyExecutor:
     ) -> str:
         browser_agent = self._create_browser_agent(settings)
         recent_actions: list[dict[str, object]] = []
+        initial_root = await self._easy_apply_root(page)
+        initial_locator = await self._find_control_locator(initial_root, field)
+        if initial_locator is None:
+            msg = (
+                "LinkedIn removed the current form field while the agent was trying to finalize it."
+            )
+            raise LinkedInEasyApplyError(msg)
+        initial_state = await self._inspect_text_field_interaction(initial_locator)
+        signature_payload = build_field_task_signature(
+            task_type=TASK_FINALIZE_FIELD,
+            field=field,
+            visible_option_texts=initial_state.visible_option_texts,
+            validation_message=initial_state.validation_message,
+        )
+        stale_memory: ApplyActionMemory | None = None
+
+        memory_entry, _, _ = await self._attempt_replay_apply_memory(
+            browser_agent=browser_agent,
+            page=page,
+            task_type=TASK_FINALIZE_FIELD,
+            signature_payload=signature_payload,
+            available_values={"intended_field_value": target_value},
+            focus_locator=initial_locator,
+            priority_locator=initial_locator,
+        )
+        if memory_entry is not None:
+            root_after_memory = await self._easy_apply_root(page)
+            locator_after_memory = await self._find_control_locator(root_after_memory, field)
+            if locator_after_memory is not None:
+                memory_state = await self._inspect_text_field_interaction(locator_after_memory)
+                if self._text_field_interaction_complete(memory_state):
+                    self._record_apply_memory_success(memory_entry, task_type=TASK_FINALIZE_FIELD)
+                    return memory_state.current_value or target_value
+            self._record_apply_memory_failure(memory_entry, task_type=TASK_FINALIZE_FIELD)
+            stale_memory = memory_entry
 
         for attempt_index in range(self._agentic_retry_budget(default=6)):
             root = await self._easy_apply_root(page)
@@ -1825,6 +1878,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
             if self._text_field_interaction_complete(state):
                 return state.current_value or target_value
             focus_locator = await self._field_interaction_focus_locator(root, field)
+            snapshot = await browser_agent.capture_task_snapshot(
+                page=page,
+                focus_locator=focus_locator or root,
+                priority_locator=locator,
+            )
 
             action = await browser_agent.perform_single_task_action(
                 page=page,
@@ -1972,6 +2030,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 }
             )
             if post_state is not None and self._text_field_interaction_complete(post_state):
+                self._promote_apply_memory(
+                    task_type=TASK_FINALIZE_FIELD,
+                    signature_payload=signature_payload,
+                    action=action,
+                    snapshot=snapshot,
+                    existing_memory=stale_memory,
+                    replace_existing=stale_memory is not None,
+                )
                 return post_state.current_value or target_value
             if action.action_type in {"done", "fail"}:
                 break
@@ -3228,6 +3294,35 @@ class PlaywrightLinkedInEasyApplyExecutor:
         browser_agent = self._create_browser_agent(settings)
         recent_actions: list[dict[str, object]] = []
         desired_state = "checked" if desired_checked else "unchecked"
+        signature_payload = build_field_task_signature(
+            task_type=TASK_FINALIZE_CHECKBOX,
+            field=field,
+            required_state=desired_state,
+        )
+        stale_memory: ApplyActionMemory | None = None
+        initial_root = await self._easy_apply_root(page)
+        initial_locator = await self._find_control_locator(initial_root, field)
+
+        memory_entry, _, _ = await self._attempt_replay_apply_memory(
+            browser_agent=browser_agent,
+            page=page,
+            task_type=TASK_FINALIZE_CHECKBOX,
+            signature_payload=signature_payload,
+            available_values={},
+            focus_locator=initial_locator or initial_root,
+            priority_locator=initial_locator,
+        )
+        if memory_entry is not None:
+            root = await self._easy_apply_root(page)
+            locator = await self._find_control_locator(root, field)
+            if (
+                locator is not None
+                and await _checkbox_option_is_checked(locator) == desired_checked
+            ):
+                self._record_apply_memory_success(memory_entry, task_type=TASK_FINALIZE_CHECKBOX)
+                return True
+            self._record_apply_memory_failure(memory_entry, task_type=TASK_FINALIZE_CHECKBOX)
+            stale_memory = memory_entry
 
         for attempt_index in range(self._agentic_retry_budget(default=4)):
             root = await self._easy_apply_root(page)
@@ -3237,6 +3332,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
             if await _checkbox_option_is_checked(locator) == desired_checked:
                 return True
             focus_locator = await self._field_interaction_focus_locator(root, field) or locator
+            snapshot = await browser_agent.capture_task_snapshot(
+                page=page,
+                focus_locator=focus_locator,
+                priority_locator=focus_locator,
+            )
             try:
                 action = await browser_agent.perform_single_task_action(
                     page=page,
@@ -3271,6 +3371,21 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 }
             )
             await page.wait_for_timeout(150)
+            root = await self._easy_apply_root(page)
+            locator = await self._find_control_locator(root, field)
+            if (
+                locator is not None
+                and await _checkbox_option_is_checked(locator) == desired_checked
+            ):
+                self._promote_apply_memory(
+                    task_type=TASK_FINALIZE_CHECKBOX,
+                    signature_payload=signature_payload,
+                    action=action,
+                    snapshot=snapshot,
+                    existing_memory=stale_memory,
+                    replace_existing=stale_memory is not None,
+                )
+                return True
         return False
 
     async def _complete_radio_interaction(
@@ -3284,6 +3399,50 @@ class PlaywrightLinkedInEasyApplyExecutor:
     ) -> bool:
         browser_agent = self._create_browser_agent(settings)
         recent_actions: list[dict[str, object]] = []
+        signature_payload = build_field_task_signature(
+            task_type=TASK_FINALIZE_RADIO,
+            field=field,
+            required_state=normalize_text(option_label),
+        )
+        stale_memory: ApplyActionMemory | None = None
+        initial_root = await self._easy_apply_root(page)
+        initial_option_locator = await self._resolve_radio_option_locator(
+            initial_root,
+            field,
+            option_index=option_index,
+        )
+        initial_click_target = (
+            await self._radio_click_target(initial_option_locator)
+            if initial_option_locator is not None
+            else None
+        )
+
+        memory_entry, _, _ = await self._attempt_replay_apply_memory(
+            browser_agent=browser_agent,
+            page=page,
+            task_type=TASK_FINALIZE_RADIO,
+            signature_payload=signature_payload,
+            available_values={},
+            focus_locator=initial_click_target or initial_root,
+            priority_locator=initial_click_target,
+        )
+        if memory_entry is not None:
+            root = await self._easy_apply_root(page)
+            option_locator = await self._resolve_radio_option_locator(
+                root,
+                field,
+                option_index=option_index,
+            )
+            if option_locator is not None and await self._radio_option_is_selected(
+                root,
+                field,
+                option_index=option_index,
+                option_locator=option_locator,
+            ):
+                self._record_apply_memory_success(memory_entry, task_type=TASK_FINALIZE_RADIO)
+                return True
+            self._record_apply_memory_failure(memory_entry, task_type=TASK_FINALIZE_RADIO)
+            stale_memory = memory_entry
 
         for attempt_index in range(self._agentic_retry_budget(default=4)):
             root = await self._easy_apply_root(page)
@@ -3303,6 +3462,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
             ):
                 return True
             focus_locator = await self._field_interaction_focus_locator(root, field) or click_target
+            snapshot = await browser_agent.capture_task_snapshot(
+                page=page,
+                focus_locator=focus_locator,
+                priority_locator=focus_locator,
+            )
             try:
                 action = await browser_agent.perform_single_task_action(
                     page=page,
@@ -3351,6 +3515,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 option_index=option_index,
                 option_locator=option_locator,
             ):
+                self._promote_apply_memory(
+                    task_type=TASK_FINALIZE_RADIO,
+                    signature_payload=signature_payload,
+                    action=action,
+                    snapshot=snapshot,
+                    existing_memory=stale_memory,
+                    replace_existing=stale_memory is not None,
+                )
                 return True
             if option_label and await self._click_radio_text_target(option_locator, option_label):
                 if await self._radio_option_is_selected(root, field, option_index=option_index):
@@ -4388,7 +4560,50 @@ class PlaywrightLinkedInEasyApplyExecutor:
         browser_agent = self._create_browser_agent(settings)
         recent_actions: list[dict[str, object]] = []
         last_action: BrowserAgentAction | None = None
+        signature_payload = build_step_task_signature(
+            task_type=TASK_PRIMARY_ACTION,
+            step_index=step.step_index,
+            total_steps=step.total_steps,
+            surface_text=step.surface_text,
+            fields=step.fields,
+        )
+        stale_memory: ApplyActionMemory | None = None
         try:
+            memory_entry, memory_action, _ = await self._attempt_replay_apply_memory(
+                browser_agent=browser_agent,
+                page=page,
+                task_type=TASK_PRIMARY_ACTION,
+                signature_payload=signature_payload,
+                available_values={},
+                focus_locator=await self._easy_apply_root(page),
+                priority_locator=None,
+            )
+            if memory_entry is not None and memory_action is not None:
+                memory_succeeded = False
+                if memory_action.action_intent == "advance_step":
+                    await self._wait_for_easy_apply_surface(page)
+                    current_step = await self._extract_step(
+                        page,
+                        last_known_step_index=step.step_index,
+                        last_known_total_steps=step.total_steps,
+                    )
+                    memory_succeeded = (
+                        current_step.step_index != step.step_index
+                        or _step_surface_changed(step, current_step)
+                    )
+                elif memory_action.action_intent == "submit_application":
+                    memory_succeeded = not await self._easy_apply_modal_visible(page)
+
+                if memory_succeeded:
+                    self._record_apply_memory_success(memory_entry, task_type=TASK_PRIMARY_ACTION)
+                    return memory_action
+
+                self._record_apply_memory_failure(memory_entry, task_type=TASK_PRIMARY_ACTION)
+                stale_memory = memory_entry
+            elif memory_entry is not None:
+                self._record_apply_memory_failure(memory_entry, task_type=TASK_PRIMARY_ACTION)
+                stale_memory = memory_entry
+
             for action_round in range(self._agentic_retry_budget(default=4)):
                 root = await self._easy_apply_root(page)
                 footer_action = await self._click_easy_apply_footer_primary_button(
@@ -4421,6 +4636,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         },
                     )
                     return footer_action
+                snapshot = await browser_agent.capture_task_snapshot(
+                    page=page,
+                    focus_locator=root,
+                    priority_locator=None,
+                )
                 action = await browser_agent.perform_single_task_action(
                     page=page,
                     available_values={},
@@ -4513,6 +4733,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 }:
                     if action.action_intent == "advance_step":
                         await self._wait_for_easy_apply_surface(page)
+                    self._promote_apply_memory(
+                        task_type=TASK_PRIMARY_ACTION,
+                        signature_payload=signature_payload,
+                        action=action,
+                        snapshot=snapshot,
+                        existing_memory=stale_memory,
+                        replace_existing=stale_memory is not None,
+                    )
                     return action
                 if action.action_type in {"done", "fail"}:
                     return action
@@ -5913,6 +6141,125 @@ class PlaywrightLinkedInEasyApplyExecutor:
             openai_retry_max_delay_seconds=(
                 self._runtime_settings.openai_responses_retry_max_delay_seconds
             ),
+        )
+
+    async def _attempt_replay_apply_memory(
+        self,
+        *,
+        browser_agent: OpenAIResponsesBrowserAgent,
+        page: Page,
+        task_type: str,
+        signature_payload: dict[str, object],
+        available_values: dict[str, str],
+        focus_locator: Locator | None = None,
+        priority_locator: Locator | None = None,
+    ) -> tuple[ApplyActionMemory | None, BrowserAgentAction | None, BrowserAgentSnapshot | None]:
+        if self._apply_memory is None:
+            return None, None, None
+
+        memory = self._apply_memory.find_active_memory(
+            task_type=task_type,
+            signature_payload=signature_payload,
+        )
+        if memory is None:
+            return None, None, None
+
+        snapshot = await browser_agent.capture_task_snapshot(
+            page=page,
+            focus_locator=focus_locator,
+            priority_locator=priority_locator,
+        )
+        action = self._apply_memory.replay_action(memory=memory, snapshot=snapshot)
+        if action is None:
+            return memory, None, snapshot
+
+        try:
+            await browser_agent.replay_action(
+                page=page,
+                action=action,
+                values=available_values,
+                snapshot=snapshot,
+            )
+        except BrowserAutomationError:
+            return memory, None, snapshot
+
+        logger.info(
+            "linkedin_apply_memory_replayed",
+            extra={
+                "task_type": task_type,
+                "signature_hash": memory.signature_hash,
+                "action_type": action.action_type,
+                "action_intent": action.action_intent,
+            },
+        )
+        return memory, action, snapshot
+
+    def _record_apply_memory_success(
+        self,
+        memory: ApplyActionMemory | None,
+        *,
+        task_type: str,
+    ) -> None:
+        if self._apply_memory is None or memory is None:
+            return
+        refreshed = self._apply_memory.record_memory_hit_success(memory)
+        logger.info(
+            "linkedin_apply_memory_refreshed",
+            extra={
+                "task_type": task_type,
+                "signature_hash": refreshed.signature_hash,
+                "success_count": refreshed.success_count,
+            },
+        )
+
+    def _record_apply_memory_failure(
+        self,
+        memory: ApplyActionMemory | None,
+        *,
+        task_type: str,
+    ) -> None:
+        if self._apply_memory is None or memory is None:
+            return
+        updated = self._apply_memory.record_memory_hit_failure(memory)
+        logger.info(
+            "linkedin_apply_memory_degraded",
+            extra={
+                "task_type": task_type,
+                "signature_hash": updated.signature_hash,
+                "failure_count": updated.failure_count,
+            },
+        )
+
+    def _promote_apply_memory(
+        self,
+        *,
+        task_type: str,
+        signature_payload: dict[str, object],
+        action: BrowserAgentAction,
+        snapshot: BrowserAgentSnapshot,
+        existing_memory: ApplyActionMemory | None = None,
+        replace_existing: bool = False,
+    ) -> None:
+        if self._apply_memory is None:
+            return
+        promoted = self._apply_memory.promote_successful_action(
+            task_type=task_type,
+            signature_payload=signature_payload,
+            action=action,
+            snapshot=snapshot,
+            existing_memory=existing_memory,
+            replace_existing=replace_existing,
+        )
+        if promoted is None:
+            return
+        logger.info(
+            "linkedin_apply_memory_promoted",
+            extra={
+                "task_type": task_type,
+                "signature_hash": promoted.signature_hash,
+                "replace_existing": replace_existing,
+                "success_count": promoted.success_count,
+            },
         )
 
     async def _pause_before_navigation(self, page: Page, *, reason: str) -> None:

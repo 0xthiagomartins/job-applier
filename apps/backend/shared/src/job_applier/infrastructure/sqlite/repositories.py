@@ -18,6 +18,7 @@ from job_applier.application.history import (
 )
 from job_applier.application.repositories import (
     AnswerRepository,
+    ApplyActionMemoryRepository,
     ArtifactSnapshotRepository,
     ExecutionEventRepository,
     JobPostingRepository,
@@ -29,6 +30,7 @@ from job_applier.application.repositories import (
 from job_applier.domain.entities import (
     ApplicationAnswer,
     ApplicationSubmission,
+    ApplyActionMemory,
     ArtifactSnapshot,
     ExecutionEvent,
     JobPosting,
@@ -55,6 +57,7 @@ from job_applier.infrastructure.sqlite.database import SessionProvider
 from job_applier.infrastructure.sqlite.models import (
     ApplicationAnswerModel,
     ApplicationSubmissionModel,
+    ApplyActionMemoryModel,
     ArtifactSnapshotModel,
     ExecutionEventModel,
     JobPostingModel,
@@ -285,6 +288,43 @@ def _artifact_from_model(model: ArtifactSnapshotModel) -> ArtifactSnapshot:
         path=model.path,
         sha256=model.sha256,
         created_at=_db_to_utc(model.created_at),
+    )
+
+
+def _apply_action_memory_to_model(entity: ApplyActionMemory) -> ApplyActionMemoryModel:
+    return ApplyActionMemoryModel(
+        id=entity.id,
+        task_type=entity.task_type,
+        signature_hash=entity.signature_hash,
+        signature_json=cast(dict[str, Any], _json_value_from_text(entity.signature_json)),
+        strategy_payload_json=cast(
+            dict[str, Any],
+            _json_value_from_text(entity.strategy_payload_json),
+        ),
+        success_count=entity.success_count,
+        failure_count=entity.failure_count,
+        created_at=entity.created_at,
+        last_used_at=entity.last_used_at,
+        last_succeeded_at=entity.last_succeeded_at,
+        expires_at=entity.expires_at,
+    )
+
+
+def _apply_action_memory_from_model(model: ApplyActionMemoryModel) -> ApplyActionMemory:
+    return ApplyActionMemory(
+        id=model.id,
+        task_type=model.task_type,
+        signature_hash=model.signature_hash,
+        signature_json=_json_text_from_value(model.signature_json),
+        strategy_payload_json=_json_text_from_value(model.strategy_payload_json),
+        success_count=model.success_count,
+        failure_count=model.failure_count,
+        created_at=_db_to_utc(model.created_at),
+        last_used_at=_db_to_utc(model.last_used_at) if model.last_used_at else None,
+        last_succeeded_at=(
+            _db_to_utc(model.last_succeeded_at) if model.last_succeeded_at else None
+        ),
+        expires_at=_db_to_utc(model.expires_at),
     )
 
 
@@ -615,6 +655,83 @@ class SqliteArtifactSnapshotRepository(
             return [self._from_model(model) for model in models]
 
 
+class SqliteApplyActionMemoryRepository(
+    SqliteRepository[ApplyActionMemory, ApplyActionMemoryModel],
+    ApplyActionMemoryRepository,
+):
+    @property
+    def model_type(self) -> type[ApplyActionMemoryModel]:
+        return ApplyActionMemoryModel
+
+    def _to_model(self, entity: ApplyActionMemory) -> ApplyActionMemoryModel:
+        return _apply_action_memory_to_model(entity)
+
+    def _from_model(self, model: ApplyActionMemoryModel) -> ApplyActionMemory:
+        return _apply_action_memory_from_model(model)
+
+    def _apply_ordering(
+        self,
+        statement: Select[tuple[ApplyActionMemoryModel]],
+    ) -> Select[tuple[ApplyActionMemoryModel]]:
+        return statement.order_by(
+            ApplyActionMemoryModel.last_succeeded_at.desc(),
+            ApplyActionMemoryModel.created_at.desc(),
+            ApplyActionMemoryModel.id,
+        )
+
+    def save(self, entity: ApplyActionMemory) -> ApplyActionMemory:
+        existing = self.find_by_task_signature(
+            task_type=entity.task_type,
+            signature_hash=entity.signature_hash,
+        )
+        if existing is not None:
+            entity = replace(entity, id=existing.id, created_at=existing.created_at)
+        return super().save(entity)
+
+    def find_by_task_signature(
+        self,
+        *,
+        task_type: str,
+        signature_hash: str,
+    ) -> ApplyActionMemory | None:
+        statement = self._base_query().where(
+            ApplyActionMemoryModel.task_type == task_type,
+            ApplyActionMemoryModel.signature_hash == signature_hash,
+        )
+        with self._session_provider() as session:
+            model = session.scalar(statement)
+            return None if model is None else self._from_model(model)
+
+    def find_active_by_task_signature(
+        self,
+        *,
+        task_type: str,
+        signature_hash: str,
+        now: datetime,
+    ) -> ApplyActionMemory | None:
+        statement = self._base_query().where(
+            ApplyActionMemoryModel.task_type == task_type,
+            ApplyActionMemoryModel.signature_hash == signature_hash,
+            ApplyActionMemoryModel.expires_at > now,
+        )
+        with self._session_provider() as session:
+            model = session.scalar(statement)
+            return None if model is None else self._from_model(model)
+
+    def delete_expired(self, *, now: datetime) -> int:
+        with self._session_provider() as session:
+            stale_models = session.scalars(
+                self._base_query().where(ApplyActionMemoryModel.expires_at <= now)
+            ).all()
+            deleted = 0
+            for model in stale_models:
+                session.delete(model)
+                deleted += 1
+            if deleted:
+                session.commit()
+            return deleted
+
+
 class SqliteSubmissionHistoryRepository(SubmissionHistoryRepository):
     """Query successful submissions with related audit context."""
 
@@ -736,8 +853,9 @@ def build_sqlite_repositories(
     SqliteRecruiterInteractionRepository,
     SqliteExecutionEventRepository,
     SqliteArtifactSnapshotRepository,
+    SqliteApplyActionMemoryRepository,
 ]:
-    """Build the seven concrete repositories expected by the MVP."""
+    """Build the concrete repositories used by the local runtime."""
 
     return (
         SqliteJobPostingRepository(session_provider),
@@ -747,4 +865,5 @@ def build_sqlite_repositories(
         SqliteRecruiterInteractionRepository(session_provider),
         SqliteExecutionEventRepository(session_provider),
         SqliteArtifactSnapshotRepository(session_provider),
+        SqliteApplyActionMemoryRepository(session_provider),
     )
