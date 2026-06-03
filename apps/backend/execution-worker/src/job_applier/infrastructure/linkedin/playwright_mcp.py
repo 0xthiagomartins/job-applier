@@ -264,7 +264,10 @@ class PlaywrightMcpHttpClient:
     async def click(self, *, ref: str, element: str | None = None) -> None:
         """Click one ref from the last snapshot."""
 
-        arguments: dict[str, object] = {"ref": ref}
+        # Newer Playwright MCP builds require `target`, while older flows in this
+        # codebase still reason in terms of snapshot refs. Send both to stay
+        # compatible across transports and server revisions.
+        arguments: dict[str, object] = {"ref": ref, "target": ref}
         if element:
             arguments["element"] = element
         await self.call_tool("browser_click", arguments)
@@ -279,7 +282,7 @@ class PlaywrightMcpHttpClient:
     ) -> None:
         """Type text into one MCP snapshot target."""
 
-        arguments: dict[str, object] = {"ref": ref, "text": text}
+        arguments: dict[str, object] = {"ref": ref, "target": ref, "text": text}
         if element:
             arguments["element"] = element
         if submit:
@@ -567,7 +570,7 @@ class PlaywrightMcpStdioClient:
         return extract_mcp_text_content(result)
 
     async def click(self, *, ref: str, element: str | None = None) -> None:
-        arguments: dict[str, object] = {"ref": ref}
+        arguments: dict[str, object] = {"ref": ref, "target": ref}
         if element:
             arguments["element"] = element
         await self.call_tool("browser_click", arguments)
@@ -580,7 +583,7 @@ class PlaywrightMcpStdioClient:
         element: str | None = None,
         submit: bool = False,
     ) -> None:
-        arguments: dict[str, object] = {"ref": ref, "text": text}
+        arguments: dict[str, object] = {"ref": ref, "target": ref, "text": text}
         if element:
             arguments["element"] = element
         if submit:
