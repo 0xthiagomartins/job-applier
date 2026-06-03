@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Generate dynamic resume variants for a fixed set of mock job scenarios."""
 
 from __future__ import annotations
@@ -193,7 +192,7 @@ def main() -> int:
                     "scenario": scenario.slug,
                     "status": "skipped",
                     "reason": "no_cv_available",
-                },
+                }
             )
             continue
 
@@ -211,7 +210,7 @@ def main() -> int:
                 "submission_cv_path": str(prepared.submission_cv_path),
                 "markdown_path": str(prepared.markdown_path) if prepared.markdown_path else None,
                 "css_path": str(prepared.css_path) if prepared.css_path else None,
-            },
+            }
         )
 
     manifest_path = batch_dir / "manifest.json"

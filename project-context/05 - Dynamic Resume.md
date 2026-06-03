@@ -60,7 +60,7 @@ The local auditor checks:
 Use:
 
 ```bash
-uv run python scripts/audit_dynamic_resume.py \
+uv run --all-packages python -m job_applier.tools.audit_dynamic_resume \
   --submission-dir artifacts/runtime/artifacts/linkedin/submissions/<submission-dir> \
   --job-title "Backend Engineer (Python / JavaScript)"
 ```
@@ -74,4 +74,3 @@ Portuguese dynamic resumes:
 - are materially better than earlier mixed-language artifacts
 - now preserve localized metadates better
 - still need final live validation to eliminate remaining English-heavy skill/interests suffix leaks in some cases
-

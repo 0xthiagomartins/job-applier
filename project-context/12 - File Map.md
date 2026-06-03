@@ -2,9 +2,8 @@
 
 ## Top-Level Areas
 
-- `src/`: backend application code
-- `scripts/`: operational scripts
-- `docs/`: repo-facing docs
+- `apps/backend/`: backend application code split by responsibility
+- `apps/frontend/`: frontend placeholder
 - `artifacts/`: runtime and debug outputs
 - `project-context/`: this Obsidian handoff vault
 
@@ -12,44 +11,44 @@
 
 ### Orchestration
 
-- `src/job_applier/application/agent_execution.py`
-- `src/job_applier/application/agent_scheduler.py`
+- `apps/backend/execution-worker/src/job_applier/application/agent_execution.py`
+- `apps/backend/execution-worker/src/job_applier/application/agent_scheduler.py`
 
 ### Scoring
 
-- `src/job_applier/application/job_scoring.py`
+- `apps/backend/execution-worker/src/job_applier/application/job_scoring.py`
 
 ### Settings and config
 
-- `src/job_applier/settings.py`
-- `src/job_applier/application/config.py`
+- `apps/backend/shared/src/job_applier/settings.py`
+- `apps/backend/shared/src/job_applier/application/config.py`
 
 ### LinkedIn search and apply
 
-- `src/job_applier/infrastructure/linkedin/search.py`
-- `src/job_applier/infrastructure/linkedin/easy_apply.py`
-- `src/job_applier/infrastructure/linkedin/question_resolution.py`
+- `apps/backend/execution-worker/src/job_applier/infrastructure/linkedin/search.py`
+- `apps/backend/execution-worker/src/job_applier/infrastructure/linkedin/easy_apply.py`
+- `apps/backend/execution-worker/src/job_applier/infrastructure/linkedin/question_resolution.py`
 
 ### Dynamic resume and language support
 
-- `src/job_applier/infrastructure/resume_dynamic.py`
-- `src/job_applier/infrastructure/language_support.py`
-- `src/job_applier/infrastructure/candidate_capabilities.py`
+- `apps/backend/resume-worker/src/job_applier/infrastructure/resume_dynamic.py`
+- `apps/backend/shared/src/job_applier/infrastructure/language_support.py`
+- `apps/backend/shared/src/job_applier/infrastructure/candidate_capabilities.py`
 
 ### Persistence
 
-- `src/job_applier/infrastructure/sqlite/repositories.py`
-- `src/job_applier/infrastructure/sqlite/models.py`
+- `apps/backend/shared/src/job_applier/infrastructure/sqlite/repositories.py`
+- `apps/backend/shared/src/job_applier/infrastructure/sqlite/models.py`
 - `alembic/versions/`
 
 ### HTTP composition
 
-- `src/job_applier/interface/http/dependencies.py`
+- `apps/backend/control-api/src/job_applier/interface/http/dependencies.py`
 
 ## Scripts
 
-- `scripts/generate_mock_dynamic_resumes.py`
-- `scripts/audit_dynamic_resume.py`
+- `apps/backend/resume-worker/src/job_applier/tools/generate_mock_dynamic_resumes.py`
+- `apps/backend/resume-worker/src/job_applier/tools/audit_dynamic_resume.py`
 
 ## Runtime State
 

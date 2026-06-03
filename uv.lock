@@ -2,6 +2,15 @@ version = 1
 revision = 2
 requires-python = ">=3.14"
 
+[manifest]
+members = [
+    "job-applier-control-api",
+    "job-applier-execution-worker",
+    "job-applier-resume-worker",
+    "job-applier-shared",
+    "job-applier-workspace",
+]
+
 [[package]]
 name = "alembic"
 version = "1.18.4"
@@ -231,22 +240,87 @@ wheels = [
 ]
 
 [[package]]
-name = "job-applier"
+name = "job-applier-control-api"
 version = "0.1.0"
-source = { editable = "." }
+source = { editable = "apps/backend/control-api" }
+dependencies = [
+    { name = "fastapi" },
+    { name = "job-applier-execution-worker" },
+    { name = "job-applier-shared" },
+    { name = "python-multipart" },
+    { name = "uvicorn" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.115.0,<1.0.0" },
+    { name = "job-applier-execution-worker", editable = "apps/backend/execution-worker" },
+    { name = "job-applier-shared", editable = "apps/backend/shared" },
+    { name = "python-multipart", specifier = ">=0.0.20,<1.0.0" },
+    { name = "uvicorn", specifier = ">=0.35.0,<1.0.0" },
+]
+
+[[package]]
+name = "job-applier-execution-worker"
+version = "0.1.0"
+source = { editable = "apps/backend/execution-worker" }
+dependencies = [
+    { name = "job-applier-resume-worker" },
+    { name = "job-applier-shared" },
+    { name = "playwright" },
+    { name = "pydantic" },
+    { name = "stagehand" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "job-applier-resume-worker", editable = "apps/backend/resume-worker" },
+    { name = "job-applier-shared", editable = "apps/backend/shared" },
+    { name = "playwright", specifier = ">=1.52.0,<2.0.0" },
+    { name = "pydantic", specifier = ">=2.11.0,<3.0.0" },
+    { name = "stagehand", specifier = ">=3.19.4" },
+]
+
+[[package]]
+name = "job-applier-resume-worker"
+version = "0.1.0"
+source = { editable = "apps/backend/resume-worker" }
+dependencies = [
+    { name = "job-applier-shared" },
+    { name = "pyyaml" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "job-applier-shared", editable = "apps/backend/shared" },
+    { name = "pyyaml", specifier = ">=6.0.0,<7.0.0" },
+]
+
+[[package]]
+name = "job-applier-shared"
+version = "0.1.0"
+source = { editable = "apps/backend/shared" }
 dependencies = [
     { name = "alembic" },
     { name = "email-validator" },
-    { name = "fastapi" },
-    { name = "playwright" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
-    { name = "pyyaml" },
-    { name = "python-multipart" },
     { name = "sqlalchemy" },
-    { name = "stagehand" },
-    { name = "uvicorn" },
 ]
+
+[package.metadata]
+requires-dist = [
+    { name = "alembic", specifier = ">=1.16.0,<2.0.0" },
+    { name = "email-validator", specifier = ">=2.2.0,<3.0.0" },
+    { name = "pydantic", specifier = ">=2.11.0,<3.0.0" },
+    { name = "pydantic-settings", specifier = ">=2.10.0,<3.0.0" },
+    { name = "sqlalchemy", specifier = ">=2.0.40,<3.0.0" },
+]
+
+[[package]]
+name = "job-applier-workspace"
+version = "0.1.0"
+source = { editable = "." }
 
 [package.dev-dependencies]
 dev = [
@@ -257,19 +331,6 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "alembic", specifier = ">=1.16.0,<2.0.0" },
-    { name = "email-validator", specifier = ">=2.2.0,<3.0.0" },
-    { name = "fastapi", specifier = ">=0.115.0,<1.0.0" },
-    { name = "playwright", specifier = ">=1.52.0,<2.0.0" },
-    { name = "pydantic", specifier = ">=2.11.0,<3.0.0" },
-    { name = "pydantic-settings", specifier = ">=2.10.0,<3.0.0" },
-    { name = "pyyaml", specifier = ">=6.0.0,<7.0.0" },
-    { name = "python-multipart", specifier = ">=0.0.20,<1.0.0" },
-    { name = "sqlalchemy", specifier = ">=2.0.40,<3.0.0" },
-    { name = "stagehand", specifier = ">=3.19.4" },
-    { name = "uvicorn", specifier = ">=0.35.0,<1.0.0" },
-]
 
 [package.metadata.requires-dev]
 dev = [

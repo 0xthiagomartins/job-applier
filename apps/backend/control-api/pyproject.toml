@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "job-applier-control-api"
+version = "0.1.0"
+description = "FastAPI control surface for Job Applier."
+requires-python = ">=3.14"
+license = { text = "MIT" }
+authors = [{ name = "Thiago Martins" }]
+dependencies = [
+  "job-applier-execution-worker",
+  "job-applier-shared",
+  "fastapi>=0.115.0,<1.0.0",
+  "python-multipart>=0.0.20,<1.0.0",
+  "uvicorn>=0.35.0,<1.0.0",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+include = ["job_applier*"]

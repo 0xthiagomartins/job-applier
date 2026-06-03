@@ -10,9 +10,11 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-SRC_DIR = ROOT_DIR / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.append(str(SRC_DIR))
+
+for src_dir in sorted((ROOT_DIR / "apps" / "backend").glob("*/src")):
+    src_dir_str = str(src_dir)
+    if src_dir_str not in sys.path:
+        sys.path.append(src_dir_str)
 
 from job_applier.infrastructure.sqlite import models  # noqa: F401,E402
 from job_applier.infrastructure.sqlite.database import Base  # noqa: E402

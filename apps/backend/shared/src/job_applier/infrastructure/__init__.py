@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from pkgutil import extend_path
 from typing import TYPE_CHECKING, Any
+
+__path__ = extend_path(__path__, __name__)
 
 if TYPE_CHECKING:
     from job_applier.infrastructure.in_memory.audit_store import (

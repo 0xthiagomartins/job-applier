@@ -292,10 +292,20 @@ def sqlite_path_from_url(database_url: str) -> Path | None:
     return Path(database_url.removeprefix(prefix))
 
 
+def _find_project_root(start: Path) -> Path:
+    """Locate the repository root from a file path within the backend apps tree."""
+
+    for candidate in (start, *start.parents):
+        if (candidate / "alembic.ini").exists():
+            return candidate
+    msg = f"Could not locate project root from {start}"
+    raise FileNotFoundError(msg)
+
+
 def run_database_migrations(settings: RuntimeSettings) -> None:
     """Run Alembic migrations against the configured database."""
 
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = _find_project_root(Path(__file__).resolve())
     alembic_config = Config(str(project_root / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(project_root / "alembic"))
     alembic_config.set_main_option("sqlalchemy.url", settings.resolved_database_url)

@@ -1,28 +1,16 @@
 [build-system]
-requires = ["hatchling>=1.27.0"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
 
 [project]
-name = "job_applier"
+name = "job-applier-workspace"
 version = "0.1.0"
-description = "Assisted job application automation with strong submission auditability."
+description = "Monorepo workspace for Job Applier backend applications."
 readme = "README.md"
 requires-python = ">=3.14"
 license = { text = "MIT" }
 authors = [{ name = "Thiago Martins" }]
-dependencies = [
-  "alembic>=1.16.0,<2.0.0",
-  "email-validator>=2.2.0,<3.0.0",
-  "fastapi>=0.115.0,<1.0.0",
-  "playwright>=1.52.0,<2.0.0",
-  "pydantic-settings>=2.10.0,<3.0.0",
-  "pydantic>=2.11.0,<3.0.0",
-  "pyyaml>=6.0.0,<7.0.0",
-  "python-multipart>=0.0.20,<1.0.0",
-  "sqlalchemy>=2.0.40,<3.0.0",
-  "uvicorn>=0.35.0,<1.0.0",
-  "stagehand>=3.19.4",
-]
+dependencies = []
 
 [dependency-groups]
 dev = [
@@ -32,13 +20,36 @@ dev = [
   "ruff>=0.11.0,<1.0.0",
 ]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/job_applier"]
+[tool.setuptools]
+package-dir = { "" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["workspace_meta"]
+
+[tool.uv.workspace]
+members = [
+  "apps/backend/control-api",
+  "apps/backend/execution-worker",
+  "apps/backend/resume-worker",
+  "apps/backend/shared",
+]
+
+[tool.uv.sources]
+job-applier-control-api = { workspace = true }
+job-applier-execution-worker = { workspace = true }
+job-applier-resume-worker = { workspace = true }
+job-applier-shared = { workspace = true }
 
 [tool.ruff]
 target-version = "py314"
 line-length = 100
-src = ["src"]
+src = [
+  "apps/backend/control-api/src",
+  "apps/backend/execution-worker/src",
+  "apps/backend/resume-worker/src",
+  "apps/backend/shared/src",
+]
 
 [tool.ruff.lint]
 select = [
@@ -55,4 +66,11 @@ strict = true
 pretty = true
 show_error_codes = true
 warn_unreachable = true
-mypy_path = ["src"]
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = [
+  "apps/backend/control-api/src",
+  "apps/backend/execution-worker/src",
+  "apps/backend/resume-worker/src",
+  "apps/backend/shared/src",
+]

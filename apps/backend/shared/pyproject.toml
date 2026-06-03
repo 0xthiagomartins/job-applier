@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "job-applier-shared"
+version = "0.1.0"
+description = "Shared domain, persistence, settings, and runtime utilities for Job Applier."
+requires-python = ">=3.14"
+license = { text = "MIT" }
+authors = [{ name = "Thiago Martins" }]
+dependencies = [
+  "alembic>=1.16.0,<2.0.0",
+  "email-validator>=2.2.0,<3.0.0",
+  "pydantic-settings>=2.10.0,<3.0.0",
+  "pydantic>=2.11.0,<3.0.0",
+  "sqlalchemy>=2.0.40,<3.0.0",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+include = ["job_applier*"]

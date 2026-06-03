@@ -6,7 +6,7 @@ Python:
 
 ```bash
 uv run ruff check .
-uv run mypy src
+uv run mypy apps/backend
 ```
 
 ## Artifact Review
@@ -27,13 +27,13 @@ Durable evidence:
 Generate mock scenarios:
 
 ```bash
-uv run python scripts/generate_mock_dynamic_resumes.py --offline
+uv run --all-packages python -m job_applier.tools.generate_mock_dynamic_resumes --offline
 ```
 
 Audit a resume:
 
 ```bash
-uv run python scripts/audit_dynamic_resume.py \
+uv run --all-packages python -m job_applier.tools.audit_dynamic_resume \
   --submission-dir artifacts/runtime/artifacts/linkedin/submissions/<submission-dir> \
   --job-title "Backend Engineer (Python / JavaScript)"
 ```

@@ -8,8 +8,6 @@ Job Applier is an internal-beta LinkedIn `Easy Apply` automation system with:
 - competitive-but-plausible screening answers grounded in a real base CV
 - strong artifact capture for debugging, auditing, and resume review
 
-For the current internal-beta operating contract, see [docs/internal-beta.md](docs/internal-beta.md).
-
 ## What the product is today
 
 The current product flow is:
@@ -100,7 +98,7 @@ This profile is used for screening questions such as years of experience. The us
 2. Sync the environment:
 
    ```bash
-   uv sync --all-groups
+   uv sync --all-packages --all-groups
    ```
 
 3. Install the git hooks:
@@ -112,7 +110,7 @@ This profile is used for screening questions such as years of experience. The us
 4. Start the backend API locally:
 
    ```bash
-   uv run uvicorn job_applier.main:app --reload
+   uv run --package job-applier-control-api uvicorn job_applier.main:app --reload
    ```
 
 5. Check the backend health endpoint:
@@ -221,13 +219,13 @@ You can also override the per-stage inspection budget with `JOB_APPLIER_AGENT_DE
 Generate mock dynamic resumes for review:
 
 ```bash
-uv run python scripts/generate_mock_dynamic_resumes.py --offline
+uv run --all-packages python -m job_applier.tools.generate_mock_dynamic_resumes --offline
 ```
 
 Audit one generated resume artifact:
 
 ```bash
-uv run python scripts/audit_dynamic_resume.py \
+uv run --all-packages python -m job_applier.tools.audit_dynamic_resume \
   --submission-dir artifacts/runtime/artifacts/linkedin/submissions/<submission-dir> \
   --job-title "Backend Engineer (Python / JavaScript)"
 ```
@@ -246,7 +244,7 @@ uv run ruff format --check .
 Run type-check:
 
 ```bash
-uv run mypy src
+uv run mypy apps/backend
 ```
 
 ## Contributing

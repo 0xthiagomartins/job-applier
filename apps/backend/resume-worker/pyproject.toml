@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "job-applier-resume-worker"
+version = "0.1.0"
+description = "Dynamic resume generation worker for Job Applier."
+requires-python = ">=3.14"
+license = { text = "MIT" }
+authors = [{ name = "Thiago Martins" }]
+dependencies = [
+  "job-applier-shared",
+  "pyyaml>=6.0.0,<7.0.0",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+include = ["job_applier*"]
