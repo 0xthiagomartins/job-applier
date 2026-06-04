@@ -25,6 +25,7 @@ from job_applier.infrastructure.sqlite import (
     SqliteJobPostingRepository,
     SqliteProfileSnapshotRepository,
     SqliteRecruiterInteractionRepository,
+    SqliteResumeSourceSnapshotRepository,
     SqliteSubmissionHistoryRepository,
     SqliteSubmissionRepository,
     create_session_factory,
@@ -92,6 +93,13 @@ def get_profile_snapshot_repository() -> SqliteProfileSnapshotRepository:
 
 
 @lru_cache(maxsize=1)
+def get_resume_source_snapshot_repository() -> SqliteResumeSourceSnapshotRepository:
+    """Return the SQLite-backed canonical resume source snapshot repository."""
+
+    return SqliteResumeSourceSnapshotRepository(get_database_session_factory())
+
+
+@lru_cache(maxsize=1)
 def get_recruiter_repository() -> SqliteRecruiterInteractionRepository:
     """Return the SQLite-backed recruiter interaction repository."""
 
@@ -142,6 +150,7 @@ def get_linkedin_easy_apply_executor() -> PlaywrightLinkedInEasyApplyExecutor:
         get_runtime_settings(),
         execution_event_repository=get_execution_event_repository(),
         apply_action_memory_repository=get_apply_action_memory_repository(),
+        resume_source_snapshot_repository=get_resume_source_snapshot_repository(),
     )
 
 

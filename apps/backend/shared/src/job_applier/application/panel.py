@@ -319,6 +319,13 @@ class PanelSettingsDocument(PanelModel):
     schedule: StoredScheduleSection = Field(default_factory=StoredScheduleSection)
 
 
+class ResumeSourceSnapshotUpdateInput(BaseModel):
+    """Validated payload used to persist a reviewed canonical resume snapshot."""
+
+    snapshot: dict[str, Any]
+    source_resume_language: SupportedLanguage | None = None
+
+
 class PanelOverview(BaseModel):
     """Simple derived overview for the panel landing page."""
 

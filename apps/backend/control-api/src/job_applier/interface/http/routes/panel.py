@@ -19,6 +19,7 @@ from job_applier.application.panel import (
     AIFormInput,
     PreferencesFormInput,
     ProfileFormInput,
+    ResumeSourceSnapshotUpdateInput,
     ScheduleFormInput,
     calculate_next_execution_at,
     parse_capability_override_json,
@@ -38,9 +39,83 @@ from job_applier.infrastructure.candidate_capabilities import (
     capability_profile_to_payload,
 )
 from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
-from job_applier.interface.http.dependencies import get_panel_settings_store
+from job_applier.infrastructure.resume_dynamic import (
+    OhMyCvDynamicResumeBuilder,
+    ResolvedResumeSourceSnapshot,
+)
+from job_applier.interface.http.dependencies import (
+    get_panel_settings_store,
+    get_resume_source_snapshot_repository,
+)
+from job_applier.settings import get_runtime_settings
 
 api_router = APIRouter(prefix="/api/panel", tags=["panel-api"])
+
+
+def _resume_source_snapshot_response(
+    snapshot: ResolvedResumeSourceSnapshot | None,
+) -> dict[str, object]:
+    if snapshot is None:
+        return {
+            "snapshot_available": False,
+            "snapshot": None,
+        }
+    return {
+        "snapshot_available": True,
+        "owner_key": snapshot.owner_key,
+        "cv_sha256": snapshot.cv_sha256,
+        "source_cv_path": str(snapshot.source_cv_path),
+        "source_cv_filename": snapshot.source_cv_filename,
+        "source_resume_language": snapshot.source_resume_language.value,
+        "snapshot_schema_version": snapshot.snapshot_schema_version,
+        "snapshot_origin": snapshot.snapshot_origin,
+        "user_edited": snapshot.user_edited,
+        "created_at": snapshot.created_at.isoformat() if snapshot.created_at else None,
+        "updated_at": snapshot.updated_at.isoformat() if snapshot.updated_at else None,
+        "snapshot": {
+            "header_role": snapshot.snapshot.header_role,
+            "summary": snapshot.snapshot.summary,
+            "experience_entries": [
+                {
+                    "title": entry.title,
+                    "company_name": entry.company_name,
+                    "date_range": entry.date_range,
+                    "bullets": list(entry.bullets),
+                }
+                for entry in snapshot.snapshot.experience_entries
+            ],
+            "certifications": [
+                {"name": entry.name, "issuer": entry.issuer}
+                for entry in snapshot.snapshot.certifications
+            ],
+            "education_entries": [
+                {
+                    "institution": entry.institution,
+                    "degree": entry.degree,
+                    "location": entry.location,
+                    "date_range": entry.date_range,
+                }
+                for entry in snapshot.snapshot.education_entries
+            ],
+            "skill_lines": list(snapshot.snapshot.skill_lines),
+            "additional_sections": [
+                {"title": title, "lines": list(lines)}
+                for title, lines in snapshot.snapshot.additional_sections
+            ],
+            "word_count": snapshot.snapshot.word_count,
+            "phone": snapshot.snapshot.phone,
+            "email": snapshot.snapshot.email,
+            "city": snapshot.snapshot.city,
+            "portfolio_hint": snapshot.snapshot.portfolio_hint,
+        },
+    }
+
+
+def _build_resume_snapshot_service() -> OhMyCvDynamicResumeBuilder:
+    return OhMyCvDynamicResumeBuilder(
+        get_runtime_settings(),
+        resume_source_snapshot_repository=get_resume_source_snapshot_repository(),
+    )
 
 
 @api_router.get("/profile")
@@ -56,6 +131,59 @@ async def get_profile(
             "cv_uploaded": bool(document.profile.cv_path),
         },
     )
+
+
+@api_router.get("/resume-source-snapshot")
+async def get_resume_source_snapshot(
+    store: Annotated[LocalPanelSettingsStore, Depends(get_panel_settings_store)],
+) -> JSONResponse:
+    """Return the current persisted canonical snapshot for the uploaded base CV."""
+
+    document = store.load()
+    try:
+        settings = build_user_agent_settings(document)
+    except PanelSettingsConfigurationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    snapshot = _build_resume_snapshot_service().get_or_create_source_snapshot(settings=settings)
+    return JSONResponse(content=_resume_source_snapshot_response(snapshot))
+
+
+@api_router.post("/resume-source-snapshot/refresh")
+async def refresh_resume_source_snapshot(
+    store: Annotated[LocalPanelSettingsStore, Depends(get_panel_settings_store)],
+) -> JSONResponse:
+    """Force a rebuild of the persisted canonical snapshot from the current base CV."""
+
+    document = store.load()
+    try:
+        settings = build_user_agent_settings(document)
+    except PanelSettingsConfigurationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    snapshot = _build_resume_snapshot_service().refresh_source_snapshot(settings=settings)
+    return JSONResponse(content=_resume_source_snapshot_response(snapshot))
+
+
+@api_router.put("/resume-source-snapshot")
+async def save_resume_source_snapshot(
+    payload: ResumeSourceSnapshotUpdateInput,
+    store: Annotated[LocalPanelSettingsStore, Depends(get_panel_settings_store)],
+) -> JSONResponse:
+    """Persist a reviewed canonical snapshot override for the current base CV."""
+
+    document = store.load()
+    try:
+        settings = build_user_agent_settings(document)
+    except PanelSettingsConfigurationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        snapshot = _build_resume_snapshot_service().update_source_snapshot(
+            settings=settings,
+            snapshot_payload=payload.snapshot,
+            source_resume_language=payload.source_resume_language,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return JSONResponse(content=_resume_source_snapshot_response(snapshot))
 
 
 @api_router.get("/state")

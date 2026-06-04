@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 
+from pydantic import SecretStr
+
 from job_applier.application.config import (
     AgentConfig,
     AIConfig,
@@ -25,6 +27,7 @@ from job_applier.infrastructure.linkedin.question_resolution import (
     GeneratedAnswer,
     LinkedInAnswerResolver,
     LinkedInQuestionClassifier,
+    OpenAIResponsesRateLimitError,
     SemanticFieldPlan,
 )
 
@@ -122,6 +125,15 @@ class _RecordingAnswerGenerator:
     async def generate(self, **_: object) -> GeneratedAnswer | None:
         self.calls += 1
         return self.answer
+
+
+class _RateLimitAnswerGenerator:
+    async def generate(self, **_: object) -> GeneratedAnswer | None:
+        msg = (
+            "OpenAI Responses API rate limit while generating a LinkedIn Easy Apply "
+            "autofill answer. This is not a LinkedIn page-rate-limit signal."
+        )
+        raise OpenAIResponsesRateLimitError(msg)
 
 
 def _build_settings() -> UserAgentSettings:
@@ -258,6 +270,32 @@ class LinkedInAnswerResolverSensitiveGuardrailTests(unittest.IsolatedAsyncioTest
         self.assertEqual(resolved.reasoning, "sensitive_demographic_gate_decline")
         self.assertEqual(self.generator.calls, 0)
 
+
+class LinkedInAnswerResolverRateLimitTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.generator = _RecordingAnswerGenerator()
+        self.resolver = LinkedInAnswerResolver(ambiguous_answer_generator=self.generator)
+        self.settings = _build_settings()
+        self.posting = _build_posting()
+
+    async def test_resolve_propagates_openai_rate_limit(self) -> None:
+        resolver = LinkedInAnswerResolver(ambiguous_answer_generator=_RateLimitAnswerGenerator())
+        settings = _build_settings().model_copy(
+            update={"ai": AIConfig(model="gpt-5", api_key=SecretStr("test-key"))}
+        )
+        posting = _build_posting()
+        field = EasyApplyField(
+            question_raw="What is your current company?",
+            normalized_key="current_employer",
+            question_type=QuestionType.FREE_TEXT_GENERIC,
+            control_kind="text",
+            input_type="text",
+            required=True,
+        )
+
+        with self.assertRaises(OpenAIResponsesRateLimitError):
+            await resolver.resolve(field, settings, posting=posting)
+
     async def test_optional_disability_type_question_stays_blank_without_opt_out(self) -> None:
         field = EasyApplyField(
             question_raw="Qual é o tipo de deficiência?",
@@ -305,6 +343,53 @@ class LinkedInAnswerResolverSensitiveGuardrailTests(unittest.IsolatedAsyncioTest
         self.assertEqual(resolved.value, "Não necessito de nenhuma acessibilidade")
         self.assertEqual(resolved.reasoning, "accessibility_accommodation_not_requested")
         self.assertEqual(self.generator.calls, 0)
+
+    async def test_optional_checkbox_defaults_to_no_without_ai(self) -> None:
+        field = EasyApplyField(
+            question_raw="Autorizo receber comunicações sobre futuras oportunidades",
+            normalized_key="future_opportunities_opt_in",
+            question_type=QuestionType.YES_NO_GENERIC,
+            control_kind="checkbox",
+            required=False,
+            options=("Yes", "No"),
+        )
+
+        resolved = await self.resolver.resolve(
+            field,
+            self.settings,
+            posting=self.posting,
+        )
+
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved.value, "No")
+        self.assertEqual(resolved.answer_source, AnswerSource.RULE)
+        self.assertEqual(resolved.fill_strategy, FillStrategy.DETERMINISTIC)
+        self.assertEqual(resolved.reasoning, "optional_checkbox_declined_by_default")
+        self.assertEqual(self.generator.calls, 0)
+
+    async def test_optional_checkbox_allows_explicit_default_response_override(self) -> None:
+        settings = _build_settings()
+        settings.profile.default_responses["future_opportunities_opt_in"] = "Yes"
+        field = EasyApplyField(
+            question_raw="Autorizo receber comunicações sobre futuras oportunidades",
+            normalized_key="future_opportunities_opt_in",
+            question_type=QuestionType.YES_NO_GENERIC,
+            control_kind="checkbox",
+            required=False,
+            options=("Yes", "No"),
+        )
+
+        resolved = await self.resolver.resolve(
+            field,
+            settings,
+            posting=self.posting,
+        )
+
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved.value, "Yes")
+        self.assertEqual(resolved.answer_source, AnswerSource.DEFAULT_RESPONSE)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ class RuntimeSettings(BaseSettings):
     panel_storage_dir: Path | None = None
     database_url: str | None = None
     apply_action_memory_cache_dir: Path | None = None
+    local_owner_key: str = "local-default"
     backend_host: str = "0.0.0.0"
     backend_port: int = 8000
     panel_port: int = 3000
@@ -95,6 +96,12 @@ class RuntimeSettings(BaseSettings):
         """Return the path used to persist panel state."""
 
         return self.panel_storage_dir or self.data_dir / "panel"
+
+    @property
+    def resolved_local_owner_key(self) -> str:
+        """Return the local owner scope key used by single-user persistence."""
+
+        return self.local_owner_key.strip() or "local-default"
 
     @property
     def resolved_database_url(self) -> str:

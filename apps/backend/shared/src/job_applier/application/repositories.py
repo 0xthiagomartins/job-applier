@@ -20,6 +20,7 @@ from job_applier.domain.entities import (
     JobPosting,
     ProfileSnapshot,
     RecruiterInteraction,
+    ResumeSourceSnapshotRecord,
 )
 
 EntityT = TypeVar("EntityT")
@@ -90,6 +91,18 @@ class AnswerRepository(Repository[ApplicationAnswer], Protocol):
 
 class ProfileSnapshotRepository(Repository[ProfileSnapshot], Protocol):
     """Persistence contract for immutable profile snapshots."""
+
+
+class ResumeSourceSnapshotRepository(Repository[ResumeSourceSnapshotRecord], Protocol):
+    """Persistence contract for persisted canonical base-resume snapshots."""
+
+    def find_by_owner_and_cv_sha256(
+        self,
+        *,
+        owner_key: str,
+        cv_sha256: str,
+    ) -> ResumeSourceSnapshotRecord | None:
+        """Return the current snapshot record for one owner and one base CV hash."""
 
 
 class RecruiterInteractionRepository(Repository[RecruiterInteraction], Protocol):

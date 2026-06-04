@@ -86,6 +86,41 @@ class ProfileSnapshotModel(Base):
     )
 
 
+class ResumeSourceSnapshotModel(Base):
+    """Persisted canonical snapshot of one base resume for one owner scope."""
+
+    __tablename__ = "resume_source_snapshots"
+    __table_args__ = (
+        Index("ix_resume_source_snapshots_owner_key", "owner_key"),
+        Index("ix_resume_source_snapshots_cv_sha256", "cv_sha256"),
+        Index("ix_resume_source_snapshots_updated_at", "updated_at"),
+        Index(
+            "ux_resume_source_snapshots_owner_key_cv_sha256",
+            "owner_key",
+            "cv_sha256",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    owner_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    cv_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_cv_filename: Mapped[str | None] = mapped_column(String(255))
+    source_cv_path: Mapped[str | None] = mapped_column(Text)
+    source_resume_text: Mapped[str | None] = mapped_column(Text)
+    source_resume_language: Mapped[str] = mapped_column(String(8), nullable=False, default="en")
+    snapshot_schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    snapshot_origin: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="deterministic_v1",
+    )
+    user_edited: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class ApplicationSubmissionModel(Base):
     """Persisted submission attempt."""
 

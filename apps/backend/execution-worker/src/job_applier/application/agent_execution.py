@@ -76,6 +76,14 @@ _TERMINAL_EASY_APPLY_LIMIT_MARKERS = (
     "maximum number of easy apply",
 )
 
+_TERMINAL_OPENAI_RATE_LIMIT_MARKERS = (
+    "openai responses api rate limit",
+    "insufficient_quota",
+    "rate limit while the linkedin browser agent",
+    "rate limit while planning a linkedin easy apply semantic step",
+    "rate limit while generating a linkedin easy apply autofill answer",
+)
+
 
 def _should_release_selected_job_slot(submission: ApplicationSubmission) -> bool:
     notes = (submission.notes or "").strip().lower()
@@ -89,6 +97,17 @@ def _should_halt_execution_for_easy_apply_limit(submission: ApplicationSubmissio
     if not notes:
         return False
     return any(marker in notes for marker in _TERMINAL_EASY_APPLY_LIMIT_MARKERS)
+
+
+def _notes_hit_terminal_openai_rate_limit(notes: str | None) -> bool:
+    normalized_notes = (notes or "").strip().lower()
+    if not normalized_notes:
+        return False
+    return any(marker in normalized_notes for marker in _TERMINAL_OPENAI_RATE_LIMIT_MARKERS)
+
+
+def _should_halt_execution_for_openai_rate_limit(submission: ApplicationSubmission) -> bool:
+    return _notes_hit_terminal_openai_rate_limit(submission.notes)
 
 
 class PanelSettingsConfigurationError(ValueError):
@@ -956,6 +975,31 @@ class AgentExecutionOrchestrator:
                         "error_count": error_count,
                     },
                 )
+                if _notes_hit_terminal_openai_rate_limit(latest_error):
+                    append_timeline_event(
+                        "openai_rate_limit_reached",
+                        {
+                            **current_job,
+                            "notes": latest_error,
+                        },
+                    )
+                    update_progress_snapshot(
+                        {
+                            "status": "running",
+                            "current_stage": "openai_rate_limit_reached",
+                            "current_job": {
+                                **current_job,
+                                "skip_reason": "openai_rate_limit_reached",
+                            },
+                            "debug_stage": stage.value,
+                            "jobs_seen": jobs_seen,
+                            "jobs_selected": jobs_selected,
+                            "successful_submissions": successful_submissions,
+                            "error_count": error_count,
+                            "last_error": latest_error,
+                        },
+                    )
+                    return False
                 return not self._emit_selected_job_limit_if_needed(
                     execution_id=execution_id,
                     jobs=jobs_seen,
@@ -1110,6 +1154,33 @@ class AgentExecutionOrchestrator:
                                 **current_job,
                                 "submission_id": str(submission.id),
                                 "skip_reason": "easy_apply_limit_reached",
+                            },
+                            "debug_stage": stage.value,
+                            "jobs_seen": jobs_seen,
+                            "jobs_selected": jobs_selected,
+                            "successful_submissions": successful_submissions,
+                            "error_count": error_count,
+                            "last_error": latest_error,
+                        },
+                    )
+                    return False
+                if _should_halt_execution_for_openai_rate_limit(submission):
+                    append_timeline_event(
+                        "openai_rate_limit_reached",
+                        {
+                            **current_job,
+                            "submission_id": str(submission.id),
+                            "notes": latest_error,
+                        },
+                    )
+                    update_progress_snapshot(
+                        {
+                            "status": "running",
+                            "current_stage": "openai_rate_limit_reached",
+                            "current_job": {
+                                **current_job,
+                                "submission_id": str(submission.id),
+                                "skip_reason": "openai_rate_limit_reached",
                             },
                             "debug_stage": stage.value,
                             "jobs_seen": jobs_seen,

@@ -38,6 +38,7 @@ from job_applier.application.repositories import (
     ExecutionEventRepository,
     ProfileSnapshotRepository,
     RecruiterInteractionRepository,
+    ResumeSourceSnapshotRepository,
     SubmissionRepository,
 )
 from job_applier.application.snapshotting import (
@@ -359,6 +360,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         answer_resolver: LinkedInAnswerResolver | None = None,
         execution_event_repository: ExecutionEventRepository | None = None,
         apply_action_memory_repository: ApplyActionMemoryRepository | None = None,
+        resume_source_snapshot_repository: ResumeSourceSnapshotRepository | None = None,
     ) -> None:
         self._runtime_settings = runtime_settings
         self._answer_resolver = answer_resolver or LinkedInAnswerResolver()
@@ -366,7 +368,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
         self._recruiter_candidate_finder = LinkedInRecruiterCandidateFinder()
         self._recruiter_connector = PlaywrightRecruiterConnector(runtime_settings)
         self._execution_event_repository = execution_event_repository
-        self._dynamic_resume_builder = OhMyCvDynamicResumeBuilder(runtime_settings)
+        self._dynamic_resume_builder = OhMyCvDynamicResumeBuilder(
+            runtime_settings,
+            resume_source_snapshot_repository=resume_source_snapshot_repository,
+        )
         self._apply_memory = (
             AdaptiveApplyMemory(apply_action_memory_repository)
             if apply_action_memory_repository is not None
@@ -1860,18 +1865,30 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     return None
                 should_check = normalize_text(resolution.value) in {"yes", "true", "1"}
                 if await self._set_checkbox_state(
-                    root,
-                    locator,
-                    desired_checked=should_check,
-                ):
-                    return "Yes" if should_check else "No"
-                if await self._complete_checkbox_interaction(
                     page=page,
+                    root=root,
                     field=field,
-                    settings=settings,
+                    locator=locator,
                     desired_checked=should_check,
                 ):
                     return "Yes" if should_check else "No"
+                try:
+                    if await asyncio.wait_for(
+                        self._complete_checkbox_interaction(
+                            page=page,
+                            field=field,
+                            settings=settings,
+                            desired_checked=should_check,
+                        ),
+                        timeout=(self._runtime_settings.linkedin_field_interaction_timeout_seconds),
+                    ):
+                        return "Yes" if should_check else "No"
+                except TimeoutError as exc:
+                    msg = (
+                        "Timed out while the browser agent was trying to finalize a "
+                        "LinkedIn Easy Apply checkbox."
+                    )
+                    raise LinkedInEasyApplyError(msg) from exc
                 msg = "Could not set the LinkedIn Easy Apply checkbox to the requested state."
                 raise LinkedInEasyApplyError(msg)
             case "radio":
@@ -1889,14 +1906,24 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 option = field.options[option_index]
                 if await self._check_radio_option(root, field, option):
                     return option
-                if await self._complete_radio_interaction(
-                    page=page,
-                    field=field,
-                    option_index=option_index,
-                    option_label=option,
-                    settings=settings,
-                ):
-                    return option
+                try:
+                    if await asyncio.wait_for(
+                        self._complete_radio_interaction(
+                            page=page,
+                            field=field,
+                            option_index=option_index,
+                            option_label=option,
+                            settings=settings,
+                        ),
+                        timeout=(self._runtime_settings.linkedin_field_interaction_timeout_seconds),
+                    ):
+                        return option
+                except TimeoutError as exc:
+                    msg = (
+                        "Timed out while the browser agent was trying to finalize a "
+                        "LinkedIn Easy Apply radio field."
+                    )
+                    raise LinkedInEasyApplyError(msg) from exc
                 return None
             case "file":
                 locator = await self._find_control_locator(root, field)
@@ -2585,8 +2612,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
             case "checkbox":
                 locator = await self._find_control_locator(root, field)
                 if locator is not None and await self._set_checkbox_state(
-                    root,
-                    locator,
+                    page=page,
+                    root=root,
+                    field=field,
+                    locator=locator,
                     desired_checked=True,
                 ):
                     return target_cv_name
@@ -2923,6 +2952,17 @@ class PlaywrightLinkedInEasyApplyExecutor:
         role_radio = locator.locator("xpath=ancestor-or-self::*[@role='radio'][1]")
         if await role_radio.count():
             return role_radio.first
+
+        wrapping_label = locator.locator("xpath=ancestor::label[1]")
+        if await wrapping_label.count():
+            return wrapping_label.first
+
+        return locator
+
+    async def _checkbox_click_target(self, locator: Locator) -> Locator:
+        role_checkbox = locator.locator("xpath=ancestor-or-self::*[@role='checkbox'][1]")
+        if await role_checkbox.count():
+            return role_checkbox.first
 
         wrapping_label = locator.locator("xpath=ancestor::label[1]")
         if await wrapping_label.count():
@@ -3304,12 +3344,21 @@ class PlaywrightLinkedInEasyApplyExecutor:
 
     async def _set_checkbox_state(
         self,
+        page: Page,
         root: Locator,
+        field: EasyApplyField,
         locator: Locator,
         *,
         desired_checked: bool,
     ) -> bool:
-        if await _checkbox_option_is_checked(locator) == desired_checked:
+        if await self._await_checkbox_state(
+            page=page,
+            field=field,
+            desired_checked=desired_checked,
+            locator=locator,
+            root=root,
+            attempts=1,
+        ):
             return True
 
         try:
@@ -3320,7 +3369,25 @@ class PlaywrightLinkedInEasyApplyExecutor:
         except Exception:  # noqa: BLE001
             pass
         else:
-            if await _checkbox_option_is_checked(locator) == desired_checked:
+            if await self._await_checkbox_state(
+                page=page,
+                field=field,
+                desired_checked=desired_checked,
+                locator=locator,
+            ):
+                return True
+
+        try:
+            await locator.set_checked(desired_checked, timeout=2_000, force=True)
+        except Exception:  # noqa: BLE001
+            pass
+        else:
+            if await self._await_checkbox_state(
+                page=page,
+                field=field,
+                desired_checked=desired_checked,
+                locator=locator,
+            ):
                 return True
 
         input_id = await locator.get_attribute("id")
@@ -3331,7 +3398,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     await label.first.click(timeout=2_000)
                 except Exception:  # noqa: BLE001
                     pass
-                if await _checkbox_option_is_checked(locator) == desired_checked:
+                if await self._await_checkbox_state(
+                    page=page,
+                    field=field,
+                    desired_checked=desired_checked,
+                    locator=locator,
+                ):
                     return True
 
         wrapping_label = locator.locator("xpath=ancestor::label[1]")
@@ -3340,35 +3412,252 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 await wrapping_label.first.click(timeout=2_000)
             except Exception:  # noqa: BLE001
                 pass
-            if await _checkbox_option_is_checked(locator) == desired_checked:
+            if await self._await_checkbox_state(
+                page=page,
+                field=field,
+                desired_checked=desired_checked,
+                locator=locator,
+            ):
                 return True
+
+        role_checkbox = locator.locator("xpath=ancestor-or-self::*[@role='checkbox'][1]")
+        if await role_checkbox.count():
+            try:
+                await role_checkbox.first.click(timeout=2_000)
+            except Exception:  # noqa: BLE001
+                pass
+            else:
+                if await self._await_checkbox_state(
+                    page=page,
+                    field=field,
+                    desired_checked=desired_checked,
+                    locator=role_checkbox.first,
+                ):
+                    return True
+            try:
+                await role_checkbox.first.click(timeout=2_000, force=True)
+            except Exception:  # noqa: BLE001
+                pass
+            else:
+                if await self._await_checkbox_state(
+                    page=page,
+                    field=field,
+                    desired_checked=desired_checked,
+                    locator=role_checkbox.first,
+                ):
+                    return True
+            try:
+                await role_checkbox.first.focus()
+                await role_checkbox.first.press("Space", timeout=2_000)
+            except Exception:  # noqa: BLE001
+                pass
+            else:
+                if await self._await_checkbox_state(
+                    page=page,
+                    field=field,
+                    desired_checked=desired_checked,
+                    locator=role_checkbox.first,
+                ):
+                    return True
+            try:
+                box = await role_checkbox.first.bounding_box()
+            except Exception:  # noqa: BLE001
+                box = None
+            if box:
+                click_positions = (
+                    (
+                        box["x"] + min(max(box["width"] * 0.08, 8.0), max(box["width"] - 2.0, 1.0)),
+                        box["y"] + (box["height"] / 2.0),
+                    ),
+                    (
+                        box["x"] + (box["width"] / 2.0),
+                        box["y"] + (box["height"] / 2.0),
+                    ),
+                )
+                for click_x, click_y in click_positions:
+                    try:
+                        await page.mouse.click(click_x, click_y)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if await self._await_checkbox_state(
+                        page=page,
+                        field=field,
+                        desired_checked=desired_checked,
+                        locator=role_checkbox.first,
+                    ):
+                        return True
 
         try:
             toggled = await locator.evaluate(
                 """
                 ({ node, desiredChecked }) => {
-                  if (!(node instanceof HTMLInputElement)) {
-                    return false;
+                  const pointerEvent = (type) =>
+                    new MouseEvent(type, {
+                      bubbles: true,
+                      cancelable: true,
+                      composed: true,
+                      view: window,
+                    });
+                  const checkbox = node instanceof HTMLInputElement
+                    ? node
+                    : node instanceof Element
+                      ? node.querySelector('input[type="checkbox"]')
+                      : null;
+                  const roleCheckbox = node instanceof Element
+                    ? (
+                      node.getAttribute("role") === "checkbox"
+                        ? node
+                        : (
+                          node.closest('[role="checkbox"]')
+                          || node.querySelector('[role="checkbox"]')
+                        )
+                    )
+                    : null;
+                  if (!(checkbox instanceof HTMLInputElement)) {
+                    if (!(roleCheckbox instanceof Element)) {
+                      return false;
+                    }
+                    const current = (
+                      (roleCheckbox.getAttribute("aria-checked") || "").toLowerCase() === "true"
+                    );
+                    if (current === desiredChecked) {
+                      return true;
+                    }
+                    if (roleCheckbox instanceof HTMLElement) {
+                      roleCheckbox.click();
+                    }
+                    return (
+                      roleCheckbox.getAttribute("aria-checked") || ""
+                    ).toLowerCase() === "true";
                   }
-                  if (node.checked === desiredChecked) {
+                  const ariaChecked = (
+                    roleCheckbox instanceof Element
+                      ? roleCheckbox.getAttribute("aria-checked")
+                      : ""
+                  ).toLowerCase();
+                  if (ariaChecked === "true" || ariaChecked === "false") {
+                    const current = ariaChecked === "true";
+                    if (current === desiredChecked) {
+                      return true;
+                    }
+                  }
+                  if (checkbox.checked === desiredChecked) {
                     return true;
                   }
-                  const label = node.labels?.[0] || node.closest("label");
-                  if (label instanceof HTMLElement) {
-                    label.click();
-                  } else {
-                    node.click();
+                  const explicitLabel = checkbox instanceof HTMLInputElement && checkbox.id
+                    ? document.querySelector(`label[for="${checkbox.id}"]`)
+                    : null;
+                  const wrappingLabel = node.closest?.("label") || checkbox?.closest?.("label");
+                  const clickTargets = [
+                    roleCheckbox,
+                    explicitLabel,
+                    wrappingLabel,
+                    node,
+                    checkbox,
+                  ].filter((candidate) => candidate instanceof HTMLElement);
+                  for (const target of clickTargets) {
+                    target.dispatchEvent(pointerEvent("pointerdown"));
+                    target.dispatchEvent(pointerEvent("mousedown"));
+                    target.click();
+                    target.dispatchEvent(pointerEvent("mouseup"));
+                    target.dispatchEvent(pointerEvent("pointerup"));
+                    target.dispatchEvent(pointerEvent("pointerout"));
+                    const ariaAfterClick = (
+                      roleCheckbox instanceof Element
+                        ? (roleCheckbox.getAttribute("aria-checked") || "").toLowerCase()
+                        : ""
+                    );
+                    if (
+                      checkbox.checked === desiredChecked
+                      || (
+                        (ariaAfterClick === "true" || ariaAfterClick === "false")
+                        && (ariaAfterClick === "true") === desiredChecked
+                      )
+                    ) {
+                      if (roleCheckbox instanceof Element) {
+                        roleCheckbox.setAttribute(
+                          "aria-checked",
+                          desiredChecked ? "true" : "false"
+                        );
+                      }
+                      checkbox.checked = desiredChecked;
+                      return true;
+                    }
                   }
-                  return node.checked === desiredChecked;
+                  const descriptor = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype,
+                    "checked"
+                  );
+                  descriptor?.set?.call(checkbox, desiredChecked);
+                  checkbox.checked = desiredChecked;
+                  checkbox.dispatchEvent(pointerEvent("pointerdown"));
+                  checkbox.dispatchEvent(pointerEvent("mousedown"));
+                  checkbox.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+                  checkbox.dispatchEvent(new Event("input", { bubbles: true }));
+                  checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+                  checkbox.dispatchEvent(pointerEvent("mouseup"));
+                  checkbox.dispatchEvent(pointerEvent("pointerup"));
+                  if (roleCheckbox instanceof Element) {
+                    roleCheckbox.setAttribute(
+                      "aria-checked",
+                      desiredChecked ? "true" : "false"
+                    );
+                  }
+                  return (
+                    checkbox.checked === desiredChecked
+                    || (
+                      roleCheckbox instanceof Element
+                      && (roleCheckbox.getAttribute("aria-checked") || "").toLowerCase()
+                        === (desiredChecked ? "true" : "false")
+                    )
+                  );
                 }
                 """,
                 {"desiredChecked": desired_checked},
             )
         except Exception:  # noqa: BLE001
             return False
-        if bool(toggled):
-            await asyncio.sleep(0.15)
-        return await _checkbox_option_is_checked(locator) == desired_checked
+        if not bool(toggled):
+            return False
+        return await self._await_checkbox_state(
+            page=page,
+            field=field,
+            desired_checked=desired_checked,
+            locator=locator,
+        )
+
+    async def _await_checkbox_state(
+        self,
+        *,
+        page: Page,
+        field: EasyApplyField,
+        desired_checked: bool,
+        locator: Locator | None = None,
+        root: Locator | None = None,
+        attempts: int = 10,
+        interval_ms: int = 150,
+    ) -> bool:
+        remaining_attempts = max(1, attempts)
+        current_root = root
+        while remaining_attempts > 0:
+            if (
+                locator is not None
+                and await _checkbox_option_is_checked(locator) == desired_checked
+            ):
+                return True
+            refreshed_root = current_root or await self._easy_apply_root(page)
+            refreshed_locator = await self._find_control_locator(refreshed_root, field)
+            if (
+                refreshed_locator is not None
+                and await _checkbox_option_is_checked(refreshed_locator) == desired_checked
+            ):
+                return True
+            remaining_attempts -= 1
+            if remaining_attempts <= 0:
+                return False
+            await page.wait_for_timeout(interval_ms)
+            current_root = None
+        return False
 
     async def _complete_checkbox_interaction(
         self,
@@ -3389,6 +3678,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
         stale_memory: ApplyActionMemory | None = None
         initial_root = await self._easy_apply_root(page)
         initial_locator = await self._find_control_locator(initial_root, field)
+        initial_click_target = (
+            await self._checkbox_click_target(initial_locator)
+            if initial_locator is not None
+            else None
+        )
 
         memory_entry, _, _ = await self._attempt_replay_apply_memory(
             browser_agent=browser_agent,
@@ -3396,15 +3690,19 @@ class PlaywrightLinkedInEasyApplyExecutor:
             task_type=TASK_FINALIZE_CHECKBOX,
             signature_payload=signature_payload,
             available_values={},
-            focus_locator=initial_locator or initial_root,
-            priority_locator=initial_locator,
+            focus_locator=initial_click_target or initial_root,
+            priority_locator=initial_click_target,
         )
         if memory_entry is not None:
             root = await self._easy_apply_root(page)
             locator = await self._find_control_locator(root, field)
-            if (
-                locator is not None
-                and await _checkbox_option_is_checked(locator) == desired_checked
+            if locator is not None and await self._await_checkbox_state(
+                page=page,
+                field=field,
+                desired_checked=desired_checked,
+                locator=locator,
+                root=root,
+                attempts=2,
             ):
                 self._record_apply_memory_success(memory_entry, task_type=TASK_FINALIZE_CHECKBOX)
                 return True
@@ -3416,13 +3714,21 @@ class PlaywrightLinkedInEasyApplyExecutor:
             locator = await self._find_control_locator(root, field)
             if locator is None:
                 return False
-            if await _checkbox_option_is_checked(locator) == desired_checked:
+            click_target = await self._checkbox_click_target(locator)
+            if await self._await_checkbox_state(
+                page=page,
+                field=field,
+                desired_checked=desired_checked,
+                locator=locator,
+                root=root,
+                attempts=1,
+            ):
                 return True
-            focus_locator = await self._field_interaction_focus_locator(root, field) or locator
+            focus_locator = await self._field_interaction_focus_locator(root, field) or click_target
             snapshot = await browser_agent.capture_task_snapshot(
                 page=page,
                 focus_locator=focus_locator,
-                priority_locator=focus_locator,
+                priority_locator=click_target,
             )
             try:
                 action = await browser_agent.perform_single_task_action(
@@ -3460,9 +3766,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
             await page.wait_for_timeout(150)
             root = await self._easy_apply_root(page)
             locator = await self._find_control_locator(root, field)
-            if (
-                locator is not None
-                and await _checkbox_option_is_checked(locator) == desired_checked
+            if locator is not None and await self._await_checkbox_state(
+                page=page,
+                field=field,
+                desired_checked=desired_checked,
+                locator=locator,
+                root=root,
             ):
                 self._promote_apply_memory(
                     task_type=TASK_FINALIZE_CHECKBOX,
@@ -7458,7 +7767,41 @@ async def _checkbox_option_is_checked(locator: Locator) -> bool:
     try:
         return await locator.is_checked()
     except Exception:  # noqa: BLE001
+        pass
+    try:
+        payload = await locator.evaluate(
+            """
+            (node) => {
+              if (!(node instanceof Element)) {
+                return null;
+              }
+              const roleCheckbox = node.getAttribute("role") === "checkbox"
+                ? node
+                : node.closest('[role="checkbox"]') || node.querySelector('[role="checkbox"]');
+              const ariaChecked = (
+                roleCheckbox instanceof Element
+                  ? roleCheckbox.getAttribute("aria-checked")
+                  : ""
+              ).toLowerCase();
+              if (ariaChecked === "true") {
+                return true;
+              }
+              if (ariaChecked === "false") {
+                return false;
+              }
+              const checkbox = node instanceof HTMLInputElement
+                ? node
+                : node.querySelector('input[type="checkbox"]');
+              if (checkbox instanceof HTMLInputElement) {
+                return checkbox.checked;
+              }
+              return null;
+            }
+            """
+        )
+    except Exception:  # noqa: BLE001
         return False
+    return bool(payload)
 
 
 def _build_file_artifact(

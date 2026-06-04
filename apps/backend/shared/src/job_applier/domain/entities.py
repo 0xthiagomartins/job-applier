@@ -226,6 +226,45 @@ class ProfileSnapshot:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ResumeSourceSnapshotRecord:
+    """Represents a persisted canonical snapshot of the user's base resume."""
+
+    owner_key: str
+    cv_sha256: str
+    snapshot_json: str
+    id: UUID = field(default_factory=uuid4)
+    source_cv_filename: str | None = None
+    source_cv_path: str | None = None
+    source_resume_text: str | None = None
+    source_resume_language: SupportedLanguage = SupportedLanguage.ENGLISH
+    snapshot_schema_version: int = 1
+    snapshot_origin: str = "deterministic_v1"
+    user_edited: bool = False
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "owner_key", ensure_non_empty(self.owner_key, "owner_key"))
+        object.__setattr__(self, "cv_sha256", ensure_non_empty(self.cv_sha256, "cv_sha256"))
+        object.__setattr__(
+            self,
+            "snapshot_json",
+            ensure_non_empty(self.snapshot_json, "snapshot_json"),
+        )
+        json.loads(self.snapshot_json)
+        object.__setattr__(self, "created_at", ensure_utc(self.created_at, "created_at"))
+        object.__setattr__(self, "updated_at", ensure_utc(self.updated_at, "updated_at"))
+        if self.snapshot_schema_version < 1:
+            msg = "snapshot_schema_version must be positive"
+            raise ValueError(msg)
+        object.__setattr__(
+            self,
+            "snapshot_origin",
+            ensure_non_empty(self.snapshot_origin, "snapshot_origin"),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class RecruiterInteraction:
     """Represents an attempted recruiter interaction for a submission."""
 

@@ -23,6 +23,7 @@ from job_applier.application.repositories import (
     JobPostingRepository,
     ProfileSnapshotRepository,
     RecruiterInteractionRepository,
+    ResumeSourceSnapshotRepository,
     SubmissionHistoryRepository,
     SubmissionRepository,
 )
@@ -34,6 +35,7 @@ from job_applier.domain.entities import (
     JobPosting,
     ProfileSnapshot,
     RecruiterInteraction,
+    ResumeSourceSnapshotRecord,
 )
 from job_applier.domain.enums import (
     AnswerSource,
@@ -60,6 +62,7 @@ from job_applier.infrastructure.sqlite.models import (
     JobPostingModel,
     ProfileSnapshotModel,
     RecruiterInteractionModel,
+    ResumeSourceSnapshotModel,
 )
 
 ModelT = TypeVar("ModelT")
@@ -215,6 +218,46 @@ def _snapshot_from_model(model: ProfileSnapshotModel) -> ProfileSnapshot:
         id=model.id,
         data_json=_json_text_from_value(model.data_json),
         created_at=_db_to_utc(model.created_at),
+    )
+
+
+def _resume_source_snapshot_to_model(
+    entity: ResumeSourceSnapshotRecord,
+) -> ResumeSourceSnapshotModel:
+    return ResumeSourceSnapshotModel(
+        id=entity.id,
+        owner_key=entity.owner_key,
+        cv_sha256=entity.cv_sha256,
+        source_cv_filename=entity.source_cv_filename,
+        source_cv_path=entity.source_cv_path,
+        source_resume_text=entity.source_resume_text,
+        source_resume_language=entity.source_resume_language.value,
+        snapshot_schema_version=entity.snapshot_schema_version,
+        snapshot_origin=entity.snapshot_origin,
+        user_edited=entity.user_edited,
+        snapshot_json=cast(dict[str, Any], _json_value_from_text(entity.snapshot_json)),
+        created_at=entity.created_at,
+        updated_at=entity.updated_at,
+    )
+
+
+def _resume_source_snapshot_from_model(
+    model: ResumeSourceSnapshotModel,
+) -> ResumeSourceSnapshotRecord:
+    return ResumeSourceSnapshotRecord(
+        id=model.id,
+        owner_key=model.owner_key,
+        cv_sha256=model.cv_sha256,
+        source_cv_filename=model.source_cv_filename,
+        source_cv_path=model.source_cv_path,
+        source_resume_text=model.source_resume_text,
+        source_resume_language=SupportedLanguage(model.source_resume_language),
+        snapshot_schema_version=model.snapshot_schema_version,
+        snapshot_origin=model.snapshot_origin,
+        user_edited=model.user_edited,
+        snapshot_json=_json_text_from_value(model.snapshot_json),
+        created_at=_db_to_utc(model.created_at),
+        updated_at=_db_to_utc(model.updated_at),
     )
 
 
@@ -517,6 +560,46 @@ class SqliteProfileSnapshotRepository(
         return statement.order_by(ProfileSnapshotModel.created_at.desc(), ProfileSnapshotModel.id)
 
 
+class SqliteResumeSourceSnapshotRepository(
+    SqliteRepository[ResumeSourceSnapshotRecord, ResumeSourceSnapshotModel],
+    ResumeSourceSnapshotRepository,
+):
+    @property
+    def model_type(self) -> type[ResumeSourceSnapshotModel]:
+        return ResumeSourceSnapshotModel
+
+    def _to_model(self, entity: ResumeSourceSnapshotRecord) -> ResumeSourceSnapshotModel:
+        return _resume_source_snapshot_to_model(entity)
+
+    def _from_model(self, model: ResumeSourceSnapshotModel) -> ResumeSourceSnapshotRecord:
+        return _resume_source_snapshot_from_model(model)
+
+    def _apply_ordering(
+        self,
+        statement: Select[tuple[ResumeSourceSnapshotModel]],
+    ) -> Select[tuple[ResumeSourceSnapshotModel]]:
+        return statement.order_by(
+            ResumeSourceSnapshotModel.updated_at.desc(),
+            ResumeSourceSnapshotModel.id,
+        )
+
+    def find_by_owner_and_cv_sha256(
+        self,
+        *,
+        owner_key: str,
+        cv_sha256: str,
+    ) -> ResumeSourceSnapshotRecord | None:
+        statement = (
+            self._base_query()
+            .where(ResumeSourceSnapshotModel.owner_key == owner_key)
+            .where(ResumeSourceSnapshotModel.cv_sha256 == cv_sha256)
+            .limit(1)
+        )
+        with self._session_provider() as session:
+            model = session.scalars(statement).first()
+            return None if model is None else self._from_model(model)
+
+
 class SqliteRecruiterInteractionRepository(
     SqliteRepository[RecruiterInteraction, RecruiterInteractionModel],
     RecruiterInteractionRepository,
@@ -733,6 +816,7 @@ def build_sqlite_repositories(
     SqliteSubmissionRepository,
     SqliteAnswerRepository,
     SqliteProfileSnapshotRepository,
+    SqliteResumeSourceSnapshotRepository,
     SqliteRecruiterInteractionRepository,
     SqliteExecutionEventRepository,
     SqliteArtifactSnapshotRepository,
@@ -744,6 +828,7 @@ def build_sqlite_repositories(
         SqliteSubmissionRepository(session_provider),
         SqliteAnswerRepository(session_provider),
         SqliteProfileSnapshotRepository(session_provider),
+        SqliteResumeSourceSnapshotRepository(session_provider),
         SqliteRecruiterInteractionRepository(session_provider),
         SqliteExecutionEventRepository(session_provider),
         SqliteArtifactSnapshotRepository(session_provider),

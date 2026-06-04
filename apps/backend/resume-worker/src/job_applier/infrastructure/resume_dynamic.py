@@ -15,6 +15,8 @@ import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -22,7 +24,11 @@ from uuid import UUID
 import yaml  # type: ignore[import-untyped]
 
 from job_applier.application.config import UserAgentSettings
+from job_applier.application.repositories import ResumeSourceSnapshotRepository
 from job_applier.domain.entities import JobPosting
+from job_applier.domain.entities import (
+    ResumeSourceSnapshotRecord as PersistedResumeSourceSnapshotRecord,
+)
 from job_applier.domain.enums import ResumeMode, SupportedLanguage
 from job_applier.infrastructure.candidate_capabilities import (
     build_candidate_capability_profile,
@@ -425,6 +431,24 @@ class ResumeSourceSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ResolvedResumeSourceSnapshot:
+    """Canonical persisted source-resume context used by dynamic resume generation."""
+
+    owner_key: str
+    cv_sha256: str
+    source_cv_path: Path
+    source_cv_filename: str | None
+    source_resume_text: str | None
+    source_resume_language: SupportedLanguage
+    snapshot: ResumeSourceSnapshot
+    snapshot_schema_version: int = 1
+    snapshot_origin: str = "deterministic_v1"
+    user_edited: bool = False
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ResumeHeaderItem:
     """Normalized header item parsed from Oh-My-CV front matter."""
 
@@ -467,9 +491,15 @@ class OhMyCvDynamicResumeBuilder:
     """Create a job-tailored resume variant and render it as PDF when enabled."""
 
     endpoint = "https://api.openai.com/v1/responses"
+    snapshot_schema_version = 1
 
-    def __init__(self, runtime_settings: RuntimeSettings) -> None:
+    def __init__(
+        self,
+        runtime_settings: RuntimeSettings,
+        resume_source_snapshot_repository: ResumeSourceSnapshotRepository | None = None,
+    ) -> None:
         self._runtime_settings = runtime_settings
+        self._resume_source_snapshot_repository = resume_source_snapshot_repository
 
     def build_for_job(
         self,
@@ -522,15 +552,15 @@ class OhMyCvDynamicResumeBuilder:
                 source_resume_language=settings.profile.preferred_language,
             )
 
-        resume_text = self._extract_resume_text(source_cv_path)
-        resume_snapshot = self._build_resume_source_snapshot(
-            settings=settings,
-            resume_text=resume_text,
+        source_snapshot = self.get_or_create_source_snapshot(settings=settings)
+        resume_text = source_snapshot.source_resume_text if source_snapshot is not None else None
+        resume_snapshot = (
+            source_snapshot.snapshot if source_snapshot is not None else ResumeSourceSnapshot()
         )
-        source_language_signal = self._detect_resume_source_language(
-            settings=settings,
-            resume_text=resume_text,
-            resume_snapshot=resume_snapshot,
+        source_resume_language = (
+            source_snapshot.source_resume_language
+            if source_snapshot is not None
+            else settings.profile.preferred_language
         )
         resume_markdown_result = self._build_tailored_markdown(
             settings=settings,
@@ -539,7 +569,7 @@ class OhMyCvDynamicResumeBuilder:
             matched_specializations=matched_specializations,
             resume_text=resume_text,
             resume_snapshot=resume_snapshot,
-            source_language=source_language_signal.language,
+            source_language=source_resume_language,
             target_language=target_language_signal.language,
         )
         if resume_markdown_result is None:
@@ -552,7 +582,7 @@ class OhMyCvDynamicResumeBuilder:
                 matched_role_target=matched_role_target,
                 matched_specializations=matched_specializations,
                 notes="dynamic_resume_markdown_generation_failed",
-                source_resume_language=source_language_signal.language,
+                source_resume_language=source_resume_language,
             )
         if not resume_markdown_result.language_alignment_satisfied:
             return DynamicResumeBuildResult(
@@ -613,6 +643,233 @@ class OhMyCvDynamicResumeBuilder:
             notes="dynamic_resume_ready",
             source_resume_language=resume_markdown_result.source_resume_language,
         )
+
+    def get_or_create_source_snapshot(
+        self,
+        *,
+        settings: UserAgentSettings,
+    ) -> ResolvedResumeSourceSnapshot | None:
+        """Return the persisted canonical source-resume snapshot for the current local owner."""
+
+        return self._resolve_source_snapshot(settings=settings, force_refresh=False)
+
+    def refresh_source_snapshot(
+        self,
+        *,
+        settings: UserAgentSettings,
+    ) -> ResolvedResumeSourceSnapshot | None:
+        """Rebuild the canonical source-resume snapshot from the current base CV."""
+
+        return self._resolve_source_snapshot(settings=settings, force_refresh=True)
+
+    def update_source_snapshot(
+        self,
+        *,
+        settings: UserAgentSettings,
+        snapshot_payload: dict[str, object],
+        source_resume_language: SupportedLanguage | None = None,
+    ) -> ResolvedResumeSourceSnapshot | None:
+        """Persist a user-reviewed snapshot override for the current base CV."""
+
+        current_snapshot = self.get_or_create_source_snapshot(settings=settings)
+        source_cv_path = _existing_path(settings.profile.cv_path)
+        if source_cv_path is None:
+            return None
+        cv_sha256 = self._compute_cv_sha256(source_cv_path)
+        candidate_snapshot = _resume_source_snapshot_from_payload(snapshot_payload)
+        now = datetime.now(UTC)
+        resolved = ResolvedResumeSourceSnapshot(
+            owner_key=self._runtime_settings.resolved_local_owner_key,
+            cv_sha256=cv_sha256,
+            source_cv_path=source_cv_path,
+            source_cv_filename=settings.profile.cv_filename or source_cv_path.name,
+            source_resume_text=(
+                current_snapshot.source_resume_text
+                if current_snapshot is not None
+                else self._extract_resume_text(source_cv_path)
+            ),
+            source_resume_language=(
+                source_resume_language
+                or (
+                    current_snapshot.source_resume_language
+                    if current_snapshot is not None
+                    else settings.profile.preferred_language
+                )
+            ),
+            snapshot=candidate_snapshot,
+            snapshot_schema_version=self.snapshot_schema_version,
+            snapshot_origin="user_edited",
+            user_edited=True,
+            created_at=current_snapshot.created_at if current_snapshot is not None else now,
+            updated_at=now,
+        )
+        persisted = self._persist_source_snapshot(
+            resolved=resolved,
+            existing_record=(
+                self._find_persisted_source_snapshot(
+                    owner_key=resolved.owner_key,
+                    cv_sha256=resolved.cv_sha256,
+                )
+            ),
+        )
+        return persisted or resolved
+
+    def _resolve_source_snapshot(
+        self,
+        *,
+        settings: UserAgentSettings,
+        force_refresh: bool,
+    ) -> ResolvedResumeSourceSnapshot | None:
+        source_cv_path = _existing_path(settings.profile.cv_path)
+        if source_cv_path is None:
+            return None
+
+        owner_key = self._runtime_settings.resolved_local_owner_key
+        cv_sha256 = self._compute_cv_sha256(source_cv_path)
+        existing_record = self._find_persisted_source_snapshot(
+            owner_key=owner_key,
+            cv_sha256=cv_sha256,
+        )
+        if existing_record is not None and not force_refresh:
+            try:
+                return self._resolved_source_snapshot_from_record(
+                    existing_record,
+                    source_cv_path=source_cv_path,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "resume_source_snapshot_deserialization_failed",
+                    extra={
+                        "owner_key": owner_key,
+                        "cv_sha256": cv_sha256,
+                        "source_cv_path": str(source_cv_path),
+                    },
+                )
+
+        resume_text = self._extract_resume_text(source_cv_path)
+        resume_snapshot = self._build_resume_source_snapshot(
+            settings=settings,
+            resume_text=resume_text,
+        )
+        source_language = self._detect_resume_source_language(
+            settings=settings,
+            resume_text=resume_text,
+            resume_snapshot=resume_snapshot,
+        ).language
+        now = datetime.now(UTC)
+        resolved = ResolvedResumeSourceSnapshot(
+            owner_key=owner_key,
+            cv_sha256=cv_sha256,
+            source_cv_path=source_cv_path,
+            source_cv_filename=settings.profile.cv_filename or source_cv_path.name,
+            source_resume_text=resume_text,
+            source_resume_language=source_language,
+            snapshot=resume_snapshot,
+            snapshot_schema_version=self.snapshot_schema_version,
+            snapshot_origin="deterministic_v1",
+            user_edited=False,
+            created_at=existing_record.created_at if existing_record is not None else now,
+            updated_at=now,
+        )
+        persisted = self._persist_source_snapshot(
+            resolved=resolved,
+            existing_record=existing_record,
+        )
+        return persisted or resolved
+
+    def _find_persisted_source_snapshot(
+        self,
+        *,
+        owner_key: str,
+        cv_sha256: str,
+    ) -> PersistedResumeSourceSnapshotRecord | None:
+        if self._resume_source_snapshot_repository is None:
+            return None
+        return self._resume_source_snapshot_repository.find_by_owner_and_cv_sha256(
+            owner_key=owner_key,
+            cv_sha256=cv_sha256,
+        )
+
+    def _persist_source_snapshot(
+        self,
+        *,
+        resolved: ResolvedResumeSourceSnapshot,
+        existing_record: PersistedResumeSourceSnapshotRecord | None,
+    ) -> ResolvedResumeSourceSnapshot | None:
+        if self._resume_source_snapshot_repository is None:
+            return None
+        snapshot_json = json.dumps(
+            _resume_snapshot_to_payload(resolved.snapshot),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        created_at = (
+            existing_record.created_at
+            if existing_record is not None
+            else (resolved.created_at or datetime.now(UTC))
+        )
+        updated_at = resolved.updated_at or datetime.now(UTC)
+        if existing_record is not None:
+            record = PersistedResumeSourceSnapshotRecord(
+                id=existing_record.id,
+                owner_key=resolved.owner_key,
+                cv_sha256=resolved.cv_sha256,
+                source_cv_filename=resolved.source_cv_filename,
+                source_cv_path=str(resolved.source_cv_path),
+                source_resume_text=resolved.source_resume_text,
+                source_resume_language=resolved.source_resume_language,
+                snapshot_schema_version=resolved.snapshot_schema_version,
+                snapshot_origin=resolved.snapshot_origin,
+                user_edited=resolved.user_edited,
+                snapshot_json=snapshot_json,
+                created_at=created_at,
+                updated_at=updated_at,
+            )
+        else:
+            record = PersistedResumeSourceSnapshotRecord(
+                owner_key=resolved.owner_key,
+                cv_sha256=resolved.cv_sha256,
+                source_cv_filename=resolved.source_cv_filename,
+                source_cv_path=str(resolved.source_cv_path),
+                source_resume_text=resolved.source_resume_text,
+                source_resume_language=resolved.source_resume_language,
+                snapshot_schema_version=resolved.snapshot_schema_version,
+                snapshot_origin=resolved.snapshot_origin,
+                user_edited=resolved.user_edited,
+                snapshot_json=snapshot_json,
+                created_at=created_at,
+                updated_at=updated_at,
+            )
+        saved = self._resume_source_snapshot_repository.save(record)
+        return self._resolved_source_snapshot_from_record(
+            saved,
+            source_cv_path=resolved.source_cv_path,
+        )
+
+    def _resolved_source_snapshot_from_record(
+        self,
+        record: PersistedResumeSourceSnapshotRecord,
+        *,
+        source_cv_path: Path,
+    ) -> ResolvedResumeSourceSnapshot:
+        return ResolvedResumeSourceSnapshot(
+            owner_key=record.owner_key,
+            cv_sha256=record.cv_sha256,
+            source_cv_path=source_cv_path,
+            source_cv_filename=record.source_cv_filename,
+            source_resume_text=record.source_resume_text,
+            source_resume_language=record.source_resume_language,
+            snapshot=_resume_source_snapshot_from_payload(json.loads(record.snapshot_json)),
+            snapshot_schema_version=record.snapshot_schema_version,
+            snapshot_origin=record.snapshot_origin,
+            user_edited=record.user_edited,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+    def _compute_cv_sha256(self, source_cv_path: Path) -> str:
+        return sha256(source_cv_path.read_bytes()).hexdigest()
 
     def _copy_source_cv(
         self,
@@ -3406,6 +3663,110 @@ def _resume_snapshot_to_payload(snapshot: ResumeSourceSnapshot) -> dict[str, obj
         "city": snapshot.city,
         "portfolio_hint": snapshot.portfolio_hint,
     }
+
+
+def _payload_optional_text(value: object) -> str | None:
+    return _normalize_optional_text(value) if isinstance(value, str) else None
+
+
+def _payload_items_list(value: object) -> list[object]:
+    return value if isinstance(value, list) else []
+
+
+def _resume_source_snapshot_from_payload(payload: dict[str, object]) -> ResumeSourceSnapshot:
+    experience_entries: list[ResumeExperienceEntry] = []
+    for item in _payload_items_list(payload.get("experience_entries")):
+        if not isinstance(item, dict):
+            continue
+        title = _payload_optional_text(item.get("title"))
+        if not title:
+            continue
+        bullets = tuple(
+            candidate
+            for candidate in (
+                _payload_optional_text(value) for value in _payload_items_list(item.get("bullets"))
+            )
+            if candidate
+        )
+        experience_entries.append(
+            ResumeExperienceEntry(
+                title=title,
+                company_name=_payload_optional_text(item.get("company_name")),
+                date_range=_payload_optional_text(item.get("date_range")),
+                bullets=bullets,
+            )
+        )
+
+    certifications: list[ResumeCertificationEntry] = []
+    for item in _payload_items_list(payload.get("certifications")):
+        if not isinstance(item, dict):
+            continue
+        name = _payload_optional_text(item.get("name"))
+        if not name:
+            continue
+        certifications.append(
+            ResumeCertificationEntry(
+                name=name,
+                issuer=_payload_optional_text(item.get("issuer")),
+            )
+        )
+
+    education_entries: list[ResumeEducationEntry] = []
+    for item in _payload_items_list(payload.get("education_entries")):
+        if not isinstance(item, dict):
+            continue
+        institution = _payload_optional_text(item.get("institution"))
+        if not institution:
+            continue
+        education_entries.append(
+            ResumeEducationEntry(
+                institution=institution,
+                degree=_payload_optional_text(item.get("degree")),
+                location=_payload_optional_text(item.get("location")),
+                date_range=_payload_optional_text(item.get("date_range")),
+            )
+        )
+
+    additional_sections: list[tuple[str, tuple[str, ...]]] = []
+    for item in _payload_items_list(payload.get("additional_sections")):
+        if not isinstance(item, dict):
+            continue
+        title = _payload_optional_text(item.get("title"))
+        if not title:
+            continue
+        lines = tuple(
+            candidate
+            for candidate in (
+                _payload_optional_text(value) for value in _payload_items_list(item.get("lines"))
+            )
+            if candidate
+        )
+        additional_sections.append((title, lines))
+
+    raw_skill_lines = _payload_items_list(payload.get("skill_lines"))
+    skill_lines = tuple(
+        candidate
+        for candidate in (_payload_optional_text(value) for value in raw_skill_lines)
+        if candidate
+    )
+
+    word_count_raw = payload.get("word_count")
+    word_count = word_count_raw if isinstance(word_count_raw, int) and word_count_raw >= 0 else 0
+
+    return ResumeSourceSnapshot(
+        header_role=_payload_optional_text(payload.get("header_role")),
+        summary=_payload_optional_text(payload.get("summary")),
+        experience_entries=tuple(experience_entries),
+        certifications=tuple(certifications),
+        education_entries=tuple(education_entries),
+        skill_lines=skill_lines,
+        additional_sections=tuple(additional_sections),
+        word_count=word_count,
+        phone=_payload_optional_text(payload.get("phone")),
+        email=_payload_optional_text(payload.get("email")),
+        city=_payload_optional_text(payload.get("city")),
+        portfolio_hint=_payload_optional_text(payload.get("portfolio_hint")),
+    )
 
 
 def _snapshot_has_structured_content(snapshot: ResumeSourceSnapshot) -> bool:

@@ -5,7 +5,8 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from typing import Any, cast
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 from job_applier.domain.entities import ApplyActionMemory
@@ -531,6 +532,207 @@ class AdaptiveApplyMemoryTests(unittest.TestCase):
         self.assertEqual(degrade_payload["task_type"], TASK_PRIMARY_ACTION)
         self.assertIn("success_count", refresh_payload)
         self.assertIn("failure_count", degrade_payload)
+
+
+class _FakeCheckboxLocator:
+    def __init__(
+        self,
+        *,
+        kind: str,
+        state: dict[str, object],
+        exists: bool = True,
+    ) -> None:
+        self.kind = kind
+        self.state = state
+        self.exists = exists
+        self.click_count = 0
+        self.space_press_count = 0
+
+    @property
+    def first(self) -> _FakeCheckboxLocator:
+        return self
+
+    async def count(self) -> int:
+        return 1 if self.exists else 0
+
+    def locator(self, selector: str) -> _FakeCheckboxLocator:
+        if not self.exists:
+            return self
+        if "@role='checkbox'" in selector:
+            return self.state["role_locator"]  # type: ignore[return-value]
+        return self.state["missing_locator"]  # type: ignore[return-value]
+
+    async def check(self, timeout: int | None = None) -> None:
+        msg = f"{self.kind} cannot be checked directly"
+        raise RuntimeError(msg)
+
+    async def uncheck(self, timeout: int | None = None) -> None:
+        msg = f"{self.kind} cannot be unchecked directly"
+        raise RuntimeError(msg)
+
+    async def set_checked(
+        self,
+        desired_checked: bool,
+        timeout: int | None = None,
+        force: bool | None = None,
+    ) -> None:
+        msg = f"{self.kind} cannot be set_checked directly"
+        raise RuntimeError(msg)
+
+    async def get_attribute(self, name: str) -> str | None:
+        if self.kind == "input" and name == "id":
+            return "checkbox-id"
+        if self.kind == "role" and name == "role":
+            return "checkbox"
+        return None
+
+    async def click(
+        self,
+        timeout: int | None = None,
+        force: bool | None = None,
+    ) -> None:
+        self.click_count += 1
+        if self.kind == "role" and bool(self.state.get("toggle_on_click", True)):
+            self.state["aria_checked"] = not bool(self.state["aria_checked"])
+
+    async def focus(self) -> None:
+        return None
+
+    async def press(self, key: str, timeout: int | None = None) -> None:
+        if self.kind == "role" and key == "Space" and bool(self.state.get("toggle_on_space", True)):
+            self.space_press_count += 1
+            self.state["aria_checked"] = not bool(self.state["aria_checked"])
+
+    async def bounding_box(self) -> dict[str, float] | None:
+        if self.kind == "role":
+            return {"x": 10.0, "y": 20.0, "width": 200.0, "height": 24.0}
+        return None
+
+    async def evaluate(self, script: str, payload: dict[str, object] | None = None) -> object:
+        if (
+            self.kind == "input"
+            and "desiredChecked" in script
+            and bool(self.state.get("toggle_via_evaluate", False))
+        ):
+            self.state["aria_checked"] = bool((payload or {}).get("desiredChecked"))
+            return True
+        return False
+
+
+class _FakeMouse:
+    def __init__(self, state: dict[str, object]) -> None:
+        self.state = state
+        self.click_count = 0
+
+    async def click(self, x: float, y: float) -> None:
+        self.click_count += 1
+        if bool(self.state.get("toggle_on_mouse", True)):
+            self.state["aria_checked"] = not bool(self.state["aria_checked"])
+
+
+class _FakePage:
+    def __init__(self, state: dict[str, object]) -> None:
+        self.mouse = _FakeMouse(state)
+
+    async def wait_for_timeout(self, timeout_ms: int) -> None:
+        return None
+
+
+class EasyApplyCheckboxStateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_set_checkbox_state_uses_ancestor_role_checkbox_for_hidden_input(self) -> None:
+        state: dict[str, object] = {"aria_checked": False}
+        missing_locator = _FakeCheckboxLocator(kind="missing", state=state, exists=False)
+        role_locator = _FakeCheckboxLocator(kind="role", state=state)
+        input_locator = _FakeCheckboxLocator(kind="input", state=state)
+        state["role_locator"] = role_locator
+        state["missing_locator"] = missing_locator
+
+        executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
+        cast(Any, executor)._easy_apply_root = AsyncMock(return_value=missing_locator)
+        cast(Any, executor)._find_control_locator = AsyncMock(return_value=input_locator)
+
+        field = EasyApplyField(
+            question_raw="Consent",
+            normalized_key="consent",
+            question_type=QuestionType.YES_NO_GENERIC,
+            control_kind="checkbox",
+            input_type="checkbox",
+            required=True,
+            dom_ref="job-applier-1",
+        )
+
+        async def fake_checkbox_option_is_checked(locator: _FakeCheckboxLocator) -> bool:
+            if locator.kind in {"input", "role"}:
+                return bool(state["aria_checked"])
+            return False
+
+        with patch(
+            "job_applier.infrastructure.linkedin.easy_apply._checkbox_option_is_checked",
+            side_effect=fake_checkbox_option_is_checked,
+        ):
+            applied = await PlaywrightLinkedInEasyApplyExecutor._set_checkbox_state(
+                executor,
+                page=cast(Any, _FakePage(state)),
+                root=cast(Any, missing_locator),
+                field=field,
+                locator=cast(Any, input_locator),
+                desired_checked=True,
+            )
+
+        self.assertTrue(applied)
+        self.assertTrue(bool(state["aria_checked"]))
+        self.assertGreaterEqual(role_locator.click_count + role_locator.space_press_count, 1)
+
+    async def test_set_checkbox_state_falls_back_to_dom_toggle_when_surface_clicks_fail(
+        self,
+    ) -> None:
+        state: dict[str, object] = {
+            "aria_checked": False,
+            "toggle_on_click": False,
+            "toggle_on_space": False,
+            "toggle_on_mouse": False,
+            "toggle_via_evaluate": True,
+        }
+        missing_locator = _FakeCheckboxLocator(kind="missing", state=state, exists=False)
+        role_locator = _FakeCheckboxLocator(kind="role", state=state)
+        input_locator = _FakeCheckboxLocator(kind="input", state=state)
+        state["role_locator"] = role_locator
+        state["missing_locator"] = missing_locator
+
+        executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
+        cast(Any, executor)._easy_apply_root = AsyncMock(return_value=missing_locator)
+        cast(Any, executor)._find_control_locator = AsyncMock(return_value=input_locator)
+
+        field = EasyApplyField(
+            question_raw="Consent",
+            normalized_key="consent",
+            question_type=QuestionType.YES_NO_GENERIC,
+            control_kind="checkbox",
+            input_type="checkbox",
+            required=True,
+            dom_ref="job-applier-1",
+        )
+
+        async def fake_checkbox_option_is_checked(locator: _FakeCheckboxLocator) -> bool:
+            if locator.kind in {"input", "role"}:
+                return bool(state["aria_checked"])
+            return False
+
+        with patch(
+            "job_applier.infrastructure.linkedin.easy_apply._checkbox_option_is_checked",
+            side_effect=fake_checkbox_option_is_checked,
+        ):
+            applied = await PlaywrightLinkedInEasyApplyExecutor._set_checkbox_state(
+                executor,
+                page=cast(Any, _FakePage(state)),
+                root=cast(Any, missing_locator),
+                field=field,
+                locator=cast(Any, input_locator),
+                desired_checked=True,
+            )
+
+        self.assertTrue(applied)
+        self.assertTrue(bool(state["aria_checked"]))
 
 
 if __name__ == "__main__":

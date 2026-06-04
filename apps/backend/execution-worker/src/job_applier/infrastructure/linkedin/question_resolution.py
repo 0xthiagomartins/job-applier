@@ -29,6 +29,11 @@ logger = logging.getLogger(__name__)
 
 ControlKind = Literal["text", "textarea", "select", "radio", "checkbox", "file"]
 
+
+class OpenAIResponsesRateLimitError(RuntimeError):
+    """Raised when OpenAI Responses API throttling should abort the current apply flow."""
+
+
 _PLACEHOLDER_OPTION_TOKENS = frozenset(
     {
         "",
@@ -1041,6 +1046,28 @@ def _extract_openai_output_text(response_data: dict[str, object]) -> str:
     return "\n".join(part.strip() for part in parts if part.strip()).strip()
 
 
+def summarize_openai_responses_error(
+    *,
+    status: int,
+    body: str,
+    operation: str,
+) -> str:
+    """Return a clearer OpenAI Responses API error for Easy Apply resolution flows."""
+
+    if status == 429:
+        return (
+            "OpenAI Responses API rate limit while "
+            f"{operation}. This is not a LinkedIn page-rate-limit signal."
+        )
+    if status >= 500:
+        return f"OpenAI Responses API failed while {operation}. Status: {status}."
+    excerpt = body[:220].strip()
+    return (
+        "OpenAI Responses API returned an error while "
+        f"{operation}. Status: {status}. Details: {excerpt}"
+    )
+
+
 class OpenAISemanticStepPlanner:
     """Use the OpenAI Responses API to plan one whole Easy Apply step at a time."""
 
@@ -1087,6 +1114,8 @@ class OpenAISemanticStepPlanner:
                 model=settings.ai.model,
                 prompt_payload=prompt_payload,
             )
+        except OpenAIResponsesRateLimitError:
+            raise
         except Exception:  # noqa: BLE001
             logger.exception(
                 "linkedin_easy_apply_semantic_step_failed",
@@ -1236,6 +1265,14 @@ class OpenAISemanticStepPlanner:
                 "openai_responses_http_error",
                 extra={"status": exc.code, "body": error_text},
             )
+            if exc.code == 429:
+                raise OpenAIResponsesRateLimitError(
+                    summarize_openai_responses_error(
+                        status=exc.code,
+                        body=error_text,
+                        operation="planning a LinkedIn Easy Apply semantic step",
+                    )
+                ) from exc
             raise
 
     def _build_prompt_payload(
@@ -1381,6 +1418,8 @@ class OpenAIResponsesAnswerGenerator:
                 model=settings.ai.model,
                 prompt_payload=prompt_payload,
             )
+        except OpenAIResponsesRateLimitError:
+            raise
         except Exception:  # noqa: BLE001
             logger.exception(
                 "linkedin_ai_autofill_failed",
@@ -1528,6 +1567,14 @@ class OpenAIResponsesAnswerGenerator:
                 "openai_responses_http_error",
                 extra={"status": exc.code, "body": error_text},
             )
+            if exc.code == 429:
+                raise OpenAIResponsesRateLimitError(
+                    summarize_openai_responses_error(
+                        status=exc.code,
+                        body=error_text,
+                        operation="generating a LinkedIn Easy Apply autofill answer",
+                    )
+                ) from exc
             raise
 
     def _build_prompt_payload(
@@ -1768,6 +1815,10 @@ class LinkedInAnswerResolver:
         if competitive_years_value is not None:
             return competitive_years_value
 
+        optional_checkbox_value = self._resolve_optional_checkbox_default(field)
+        if optional_checkbox_value is not None:
+            return optional_checkbox_value
+
         if not settings.ruleset.allow_best_effort_autofill:
             return None
 
@@ -1980,6 +2031,8 @@ class LinkedInAnswerResolver:
                 posting=posting,
                 validation_context=validation_context,
             )
+        except OpenAIResponsesRateLimitError:
+            raise
         except Exception:  # noqa: BLE001
             logger.exception(
                 "linkedin_ai_autofill_unhandled_error",
@@ -2228,6 +2281,24 @@ class LinkedInAnswerResolver:
                     "year range inferred from the base CV."
                 )
             ),
+        )
+
+    def _resolve_optional_checkbox_default(
+        self,
+        field: EasyApplyField,
+    ) -> ResolvedFieldValue | None:
+        if field.control_kind != "checkbox":
+            return None
+        if field.required:
+            return None
+        if field.question_type is QuestionType.RESUME_UPLOAD:
+            return None
+        return ResolvedFieldValue(
+            value="No",
+            answer_source=AnswerSource.RULE,
+            fill_strategy=FillStrategy.DETERMINISTIC,
+            confidence=0.92,
+            reasoning="optional_checkbox_declined_by_default",
         )
 
     def _resolve_binary_years_experience_field_value(
