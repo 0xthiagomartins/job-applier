@@ -40,3 +40,6 @@ test-results/
 # Local artifacts
 artifacts/*
 !artifacts/.gitkeep
+
+# Scratch / temporary operational scripts
+tmp/

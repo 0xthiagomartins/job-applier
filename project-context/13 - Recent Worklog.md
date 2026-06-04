@@ -4,55 +4,69 @@ This file summarizes the most relevant recent changes so a new harness does not 
 
 ## Important Recent Commits
 
-- `pending` `docs: add portable project-context vault for handoff`
-- `pending` `fix: localize standalone "Applied AI" in PT resume output`
+- `working tree` `persist canonical resume source snapshots and reuse them in dynamic resume generation`
+- `412d90d` `fix: harden accessibility field resolution`
+- `495734f` `fix: harden linkedin prod apply guardrails`
+- `98ade4b` `feat: replay adaptive field memory across apply flows`
+- `0776462` `test: harden adaptive apply memory replay`
+- `d3ebff5` `fix: warm apply memory from deterministic footer actions`
+- `aecb52d` `refactor: move apply memory storage to diskcache`
+- `c1559ed` `feat: add adaptive easy apply memory`
+- `7dc5c4b` `fix: align playwright mcp click and type payloads`
+- `e32b16a` `refactor: reorganize backend workspace structure`
+- `5ab3ed4` `chore: checkpoint backend cleanup and apply flow changes`
+- `598b89e` `fix: upload tailored resumes in linkedin easy apply`
+- `a1e3ea6` `fix: prefer env ai key over persisted panel state`
+- `53ada37` `docs: add portable project-context vault for handoff`
+- `5310e15` `fix: localize standalone "Applied AI" in PT resume output`
 - `adaf322` `fix: tighten portuguese dynamic resume localization`
 - `7725b9b` `fix: harden dynamic resume localization quality`
-- `5ab9e99` `fix: prefer specific backend targets for sparse job details`
-- `2f0728c` `fix: strengthen backend positioning in dynamic resumes`
-- `31a0618` `fix: stop runs when linkedin easy apply limit is reached`
-- `f3fa03d` `fix: broaden multilingual target matching and search queries`
-- `9bc07a3` `fix: batch multilingual resume translation payloads`
-- `295d5d6` `fix: harden sparse linkedin job detail extraction`
-- `e8ed4af` `feat: add language-aware dynamic resume targeting`
-- `16a5298` `feat: add a local auditor for dynamic resumes`
-- `001eeb1` `feat: expose reviewed capability profiles in the panel`
-- `dfe038f` `feat: infer competitive capability ranges from base resumes`
 
 ## Issues Recently Addressed
 
-- dynamic/static resume mode alignment
-- capability profile exposure and usage
-- multilingual dynamic resumes
-- backend-specific resume positioning
-- sparse job detail extraction
-- visible `Easy Apply` control detection
-- generic engineering title scoring
-- daily Easy Apply limit termination
+- backend workspace reorganization under `apps/backend/...`
+- removal of the old frontend surface
+- `.env` precedence for OpenAI key
+- dynamic resume PT localization
+- tailored resume upload in real `Easy Apply`
+- adaptive apply memory
+- diskcache-backed apply memory storage
+- replay of field-level memory across PT/EN flows
+- production fail-fast behavior on OpenAI `429`
+- accessibility/disability field handling
+- canonical resume source snapshot persistence
+- backend routes to inspect, refresh, and override the canonical snapshot
 
 ## Recent Real Successes
 
-Recent real successful applies existed before the PT localization loop, including:
-
-- English dynamic resume flows
-- Portuguese `Easy Apply` path success in earlier real runs
+- real successful PT submissions:
+  - `4418597669` `Jobgether` `Engenheiro de Software Pl. (Java)`
+  - `4419642311` `Itaú Unibanco` `Engenharia de software Sênior- JAVA`
+- real successful EN submissions:
+  - `4419915012` `Oowlish` `Senior Software Engineer (AI & Cloud Solutions)`
+  - `4422836187` `Crossing Hurdles` `Software Engineer`
 
 ## Current Hotspot
 
 The main remaining area to keep validating is:
 
-- Portuguese dynamic resume output quality in production-like artifacts
+- credit efficiency during real production validation
+- long employer-specific forms
+- how much adaptive apply memory reduces OpenAI calls in repeated flows
+- how much the persisted resume snapshot reduces repeated dynamic-resume setup cost
 
-The code has been tightened repeatedly, but this should still be treated as an active refinement area rather than a fully closed topic.
+There is no single known blocker in dynamic resume quality right now; the higher-value work is cost control and apply robustness.
 
 ## Suggested Next Validation
 
-Use a fresh PT vacancy with `Easy Apply` available and inspect:
+Use the fixed low-cost 3-job suite:
 
-- generated markdown
-- rendered PDF
-- auditor findings
-- whether the resume body and skill lines are consistently Portuguese except for intentional tech tokens
+1. `4418597669` `Jobgether` `PT`
+2. `4422383527` `CI&T` `PT`
+3. `4420980277` `CI&T` `EN`
+
+Use the `Jobgether` slot as the cheapest smoke test.
+Use the two `CI&T` slots only when validating apply memory, field resolution, or production guardrails.
 
 ## Handoff Readiness
 

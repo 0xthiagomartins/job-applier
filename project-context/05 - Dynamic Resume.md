@@ -7,7 +7,7 @@ Generate one resume per matched job without drifting away from the base CV.
 ## Core Inputs
 
 - base CV PDF
-- extracted resume snapshot
+- persisted canonical resume snapshot
 - matched role target
 - matched specializations
 - job title and usable detail context
@@ -17,14 +17,32 @@ Generate one resume per matched job without drifting away from the base CV.
 
 The builder uses a structured approach:
 
-1. extract a resume snapshot from the base CV
-2. create a heuristic adaptation plan
-3. optionally refine with AI
-4. sanitize the AI output against allowed evidence
-5. optionally localize to the target job language
-6. render markdown
-7. render PDF
-8. validate output and fall back when necessary
+1. reuse a persisted canonical resume snapshot when the base CV hash matches
+2. otherwise extract and persist a new snapshot from the base CV
+3. create a heuristic adaptation plan
+4. optionally refine with AI
+5. sanitize the AI output against allowed evidence
+6. optionally localize to the target job language
+7. render markdown
+8. render PDF
+9. validate output and fall back when necessary
+
+## Why The Snapshot Matters
+
+The snapshot is now a first-class persisted asset.
+
+Benefits:
+
+- the builder does not need to rebuild the factual CV structure on every job
+- the snapshot can be reviewed and edited independently of the raw CV file
+- future UI/editor work can operate on the snapshot directly
+- token and latency pressure should drop over time because less raw-CV work is repeated
+
+Important boundary:
+
+- the snapshot is still deterministic-first today
+- AI is not the sole source of truth for the snapshot
+- the snapshot remains grounded in the uploaded base CV
 
 ## Important Rules
 
@@ -71,6 +89,6 @@ English dynamic resumes are strong enough for beta.
 
 Portuguese dynamic resumes:
 
-- are materially better than earlier mixed-language artifacts
-- now preserve localized metadates better
-- still need final live validation to eliminate remaining English-heavy skill/interests suffix leaks in some cases
+- have already passed real successful apply flows
+- are materially better than the earlier mixed-language artifacts
+- should still be reaudited whenever localization prompts or rendering logic changes

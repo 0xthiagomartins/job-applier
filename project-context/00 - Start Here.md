@@ -34,9 +34,11 @@ Then inspect the repo before making assumptions.
 The project is functional for internal beta usage, including real successful submissions, but it is still a beta:
 
 - the core search -> score -> apply pipeline works
-- English flows are stronger than Portuguese flows
+- English and Portuguese dynamic resume flows both work in real runs
+- adaptive local apply memory now exists and replays successfully in production-like validation
+- the base CV now has a persisted canonical source snapshot reused across dynamic resume generation
 - multilingual dynamic resume generation exists
-- some Portuguese dynamic resume localization still needs polishing in live artifacts
+- the main operational concern now is cost and latency, not a known resume-quality blocker
 - LinkedIn surface changes remain a normal operational risk
 
 ## How To Use This Vault
@@ -66,4 +68,3 @@ Do not put these in shared vault exports unless you explicitly want to:
 - any personal data not required for debugging
 
 The repo contains local runtime state under `artifacts/runtime/`; that data should be curated before sharing outside your trusted environment.
-

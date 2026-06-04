@@ -27,14 +27,31 @@ Recent hardening improved this, but it remains a real risk surface.
 
 ## 3. Multilingual Dynamic Resume Quality
 
-Portuguese support is much better now, but still not fully closed.
+Portuguese support is much better now and has passed real submissions.
 
 Current specific risk:
 
-- some PT dynamic resume artifacts may still leak English-heavy skill or interests content
-- the latest fixes are in code, but that exact live validation is still an area to keep checking
+- localization/prompt changes can still regress PT output quality
+- PT artifacts should still be spot-audited after resume-worker changes
 
-## 4. Scoring Recall vs Precision
+## 4. OpenAI Cost And Rate Limits
+
+The current biggest operational risk is cost pressure during real validation.
+
+Risk factors:
+
+- long `Easy Apply` forms
+- semantic step planning
+- `autofill_ai` on repeated screening questions
+- PT dynamic resume localization
+
+Mitigations already in place:
+
+- adaptive local apply memory
+- production halt on OpenAI `429`
+- 3-attempt production retry ceilings
+
+## 5. Scoring Recall vs Precision
 
 The scorer is intentionally conservative now.
 
@@ -46,7 +63,7 @@ Tradeoff:
 
 - some relevant jobs may still be missed if titles are unusually phrased
 
-## 5. Telemetry Cleanliness
+## 6. Telemetry Cleanliness
 
 Functional outcomes are stronger than telemetry polish.
 
@@ -57,7 +74,7 @@ Some prior runs showed:
 
 This is not always a blocker, but it can slow debugging.
 
-## 6. External Service Dependence
+## 7. External Service Dependence
 
 The dynamic resume system depends on AI availability when doing full localization or advanced adaptation.
 
@@ -67,3 +84,11 @@ Risks:
 - API failures
 - environment policy restrictions on sending private data externally
 
+## 8. Expensive Employer-Specific Forms
+
+Some employers, especially CI&T-style flows, have long screening forms that are useful for validation but expensive for credits.
+
+Use them intentionally:
+
+- good for memory warmup and replay validation
+- bad as default smoke tests

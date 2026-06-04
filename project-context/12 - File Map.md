@@ -41,9 +41,16 @@
 - `apps/backend/shared/src/job_applier/infrastructure/sqlite/models.py`
 - `alembic/versions/`
 
+New persistence to know:
+
+- `resume_source_snapshots` table in SQLite
+- owner-scoped by `owner_key`
+- matched to the uploaded base CV by `cv_sha256`
+
 ### HTTP composition
 
 - `apps/backend/control-api/src/job_applier/interface/http/dependencies.py`
+- `apps/backend/control-api/src/job_applier/interface/http/routes/panel.py`
 
 ## Scripts
 
@@ -56,3 +63,7 @@
 - `artifacts/runtime/panel/settings.json`
 - `artifacts/runtime/artifacts/linkedin/submissions/...`
 - `artifacts/last-run/`
+
+Snapshot-related runtime state:
+
+- canonical base-resume snapshot rows now live in `artifacts/runtime/job-applier.db`

@@ -38,16 +38,16 @@ Supported today:
 - `static` and `dynamic` resume modes
 - dynamic resume rendering to PDF
 - capability inference from the base CV
-- English-first product behavior
-- supported multilingual targeting for Portuguese
-- local FastAPI + Next.js + SQLite runtime
+- supported multilingual targeting for Portuguese and English
+- adaptive local apply memory for repeated `Easy Apply` interactions
+- local FastAPI + Playwright + SQLite runtime
 
 Not promised today:
 
 - perfect success on every LinkedIn variation
 - all languages
 - all job boards
-- a visual resume theme editor
+- a local GUI/frontend
 - perfect high-recall scoring for every title naming pattern
 
 ## Product Principles
@@ -91,4 +91,3 @@ The current local configuration prioritizes Brazilian targets first:
 12. `Automation Engineer`
 13. `Automation Developer`
 14. `RPA Developer`
-

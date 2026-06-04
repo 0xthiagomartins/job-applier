@@ -86,7 +86,12 @@ The executor:
 - answers missing fields
 - advances until review/submit
 
-The current system supports recovery from some validation feedback, but the LinkedIn surface remains a beta-risk area.
+Important current behavior:
+
+- deterministic guards still own safety-critical decisions
+- adaptive local memory now replays repeated `Easy Apply` micro-interactions before calling OpenAI
+- OpenAI rate limits now halt production runs instead of looping indefinitely
+- the current biggest cost sink is long real-world forms, especially CI&T-style flows
 
 ## Observability
 
@@ -97,4 +102,3 @@ Key outputs:
 - `timeline.jsonl`
 - `run.log`
 - per-submission HTML/screenshots/PDFs/markdown
-
