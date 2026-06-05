@@ -193,6 +193,20 @@ def _non_empty_value(value: str | None) -> str | None:
     return stripped or None
 
 
+def _normalized_profile_city_value(value: str | None) -> str | None:
+    city = _non_empty_value(value)
+    if city is None:
+        return None
+    normalized = re.sub(r"\s+", " ", city).strip()
+    for delimiter in (" - ", " – ", " — ", ",", "|", "/"):
+        if delimiter in normalized:
+            normalized = normalized.split(delimiter, maxsplit=1)[0].strip()
+            break
+    if normalized.isupper():
+        normalized = normalized.title()
+    return normalized or city
+
+
 def _canonical_binary_token(value: str) -> str | None:
     normalized = normalize_text(value)
     if normalized in _YES_OPTION_TOKENS:
@@ -1002,7 +1016,8 @@ def _build_candidate_profile_payload(settings: UserAgentSettings) -> dict[str, o
         "last_name": _profile_last_name(settings.profile.name),
         "email": str(settings.profile.email),
         "phone": settings.profile.phone,
-        "city": settings.profile.city,
+        "city": _normalized_profile_city_value(settings.profile.city),
+        "profile_location_raw": settings.profile.city,
         "linkedin_url": (
             str(settings.profile.linkedin_url) if settings.profile.linkedin_url else None
         ),
@@ -2084,7 +2099,7 @@ class LinkedInAnswerResolver:
                     return self._resolve_phone_country_code(field)
                 return _non_empty_value(profile.phone)
             case QuestionType.CITY:
-                return _non_empty_value(profile.city)
+                return _normalized_profile_city_value(profile.city)
             case QuestionType.LINKEDIN_URL:
                 return str(profile.linkedin_url) if profile.linkedin_url else None
             case QuestionType.GITHUB_URL:
@@ -2117,7 +2132,7 @@ class LinkedInAnswerResolver:
             case "last_name" | "family_name" | "surname":
                 return _non_empty_value(_profile_last_name(settings.profile.name))
             case "city" | "current_city" | "location_city":
-                return _non_empty_value(settings.profile.city)
+                return _normalized_profile_city_value(settings.profile.city)
             case "email":
                 return _non_empty_value(str(settings.profile.email))
             case "phone_country_code":
@@ -2153,7 +2168,7 @@ class LinkedInAnswerResolver:
                 return self._resolve_phone_country_code(field)
             return _non_empty_value(settings.profile.phone)
         if "location_city" in normalized_slot or normalized_slot.endswith(("city", "current_city")):
-            return _non_empty_value(settings.profile.city)
+            return _normalized_profile_city_value(settings.profile.city)
         if "linkedin" in normalized_slot:
             return str(settings.profile.linkedin_url) if settings.profile.linkedin_url else None
         if "github" in normalized_slot:
@@ -2388,7 +2403,7 @@ class LinkedInAnswerResolver:
                 reasoning="guardrail_profile_identity",
             )
         if normalized_key in {"city", "current_city", "location_city"}:
-            city = _non_empty_value(profile.city)
+            city = _normalized_profile_city_value(profile.city)
             if city is None:
                 return None
             return GuardrailAnswer(

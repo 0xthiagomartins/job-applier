@@ -2137,22 +2137,50 @@ class OpenAIResponsesBrowserAgent:
                     raise BrowserAutomationError(stall_diagnosis.summary)
 
             remaining_seconds = max(1.0, deadline - asyncio.get_running_loop().time())
-            action = await asyncio.wait_for(
-                self._plan_action(
-                    snapshot=snapshot,
-                    goal=goal,
-                    task_name=task_name,
-                    available_values=available_values,
-                    step_index=step_index,
-                    recent_actions=recent_actions[-6:],
-                    execution_feedback=execution_feedback[-4:],
-                    snapshot_changed=snapshot_changed,
-                    extra_rules=extra_rules,
-                    allowed_action_types=allowed_action_types,
-                    stall_diagnosis=stall_diagnosis,
-                ),
-                timeout=remaining_seconds,
-            )
+            try:
+                action = await asyncio.wait_for(
+                    self._plan_action(
+                        snapshot=snapshot,
+                        goal=goal,
+                        task_name=task_name,
+                        available_values=available_values,
+                        step_index=step_index,
+                        recent_actions=recent_actions[-6:],
+                        execution_feedback=execution_feedback[-4:],
+                        snapshot_changed=snapshot_changed,
+                        extra_rules=extra_rules,
+                        allowed_action_types=allowed_action_types,
+                        stall_diagnosis=stall_diagnosis,
+                    ),
+                    timeout=remaining_seconds,
+                )
+            except BrowserAutomationError as exc:
+                feedback = {
+                    "step_index": step_index,
+                    "task_name": task_name,
+                    "failed_action_type": "planning",
+                    "element_id": None,
+                    "action_intent": None,
+                    "error_message": str(exc),
+                    "url": snapshot.url,
+                }
+                execution_feedback.append(feedback)
+                self._append_browser_agent_log(
+                    "browser-agent/task-trace.jsonl",
+                    {
+                        "kind": "task_plan_failed",
+                        "task_name": task_name,
+                        "step_index": step_index,
+                        "snapshot_signature": current_snapshot_signature,
+                        "feedback": feedback,
+                    },
+                )
+                logger.info(
+                    "linkedin_browser_agent_plan_failed",
+                    extra=feedback,
+                )
+                previous_snapshot_signature = ""
+                continue
             logger.info(
                 "linkedin_browser_agent_action_planned",
                 extra={

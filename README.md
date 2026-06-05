@@ -13,7 +13,7 @@ Job Applier is an internal-beta LinkedIn `Easy Apply` automation system with:
 The current product flow is:
 
 1. upload one truthful base CV
-2. configure broad role targets such as `Automation Engineer`, `RPA Developer`, `Backend Developer`, or `Full Stack Developer`
+2. configure broad role targets such as `Desenvolvedor RPA`, `Desenvolvedor Full Stack`, `Desenvolvedor de Automação`, or `Desenvolvedor Backend`
 3. let the system search LinkedIn `Easy Apply` jobs across those target families
 4. score each job against the configured targets
 5. either:
@@ -62,11 +62,10 @@ Targets should be broad role families, not narrow stack-specific job titles.
 
 Recommended targets:
 
-- `Automation Engineer`
-- `Automation Developer`
-- `RPA Developer`
-- `Backend Developer`
-- `Full Stack Developer`
+- `Desenvolvedor RPA`
+- `Desenvolvedor Full Stack`
+- `Desenvolvedor de Automação`
+- `Desenvolvedor Backend`
 
 Use stack cues such as `Python`, `AWS`, `TypeScript`, `JavaScript`, `UiPath`, or `LangChain` as scoring/tailoring signals, not as the primary job family.
 
@@ -166,11 +165,10 @@ The search pipeline works best when `Preferences > Keywords` are broad role fami
 
 Recommended targets:
 
-- `Automation Engineer`
-- `Automation Developer`
-- `RPA Developer`
-- `Backend Developer`
-- `Full Stack Developer`
+- `Desenvolvedor RPA`
+- `Desenvolvedor Full Stack`
+- `Desenvolvedor de Automação`
+- `Desenvolvedor Backend`
 
 Use stack-specific detail such as `Python`, `AWS`, `TypeScript`, `JavaScript`, `UiPath`, or `LangChain` as positive signals and tailoring cues, not as the main role family.
 

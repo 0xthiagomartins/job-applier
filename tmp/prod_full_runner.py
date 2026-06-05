@@ -4,11 +4,6 @@ import asyncio
 import json
 import os
 from datetime import datetime
-from typing import TYPE_CHECKING, cast
-
-if TYPE_CHECKING:
-    from job_applier.application.panel import PanelSettingsDocument
-    from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
 
 RUN_TOKEN = datetime.now().strftime("%Y%m%dT%H%M%S")
 
@@ -27,22 +22,9 @@ os.environ.setdefault("JOB_APPLIER_RESUME_DYNAMIC_ENABLED", "true")
 os.environ.setdefault("JOB_APPLIER_LINKEDIN_MAX_SEARCH_PAGES", "3")
 
 
-class FocusedPanelStore:
-    def __init__(self, wrapped: LocalPanelSettingsStore) -> None:
-        self._wrapped = wrapped
-
-    def load(self) -> PanelSettingsDocument:
-        state = self._wrapped.load()
-        preferences = state.preferences.model_copy(
-            update={"keywords": ("Backend Developer", "Desenvolvedor Backend")}
-        )
-        return state.model_copy(update={"preferences": preferences})
-
-
 async def main() -> None:
     from job_applier.application.agent_execution import AgentExecutionOrchestrator
     from job_applier.domain.enums import DebugExecutionStage, ExecutionOrigin
-    from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
     from job_applier.interface.http.dependencies import (
         get_execution_store,
         get_job_fetcher,
@@ -52,14 +34,12 @@ async def main() -> None:
         get_submission_repository,
         get_successful_submission_store,
     )
-    from job_applier.settings import get_runtime_settings
+    from job_applier.settings import get_runtime_settings, initialize_runtime_environment
 
     runtime = get_runtime_settings()
+    initialize_runtime_environment(runtime)
     orchestrator = AgentExecutionOrchestrator(
-        panel_store=cast(
-            LocalPanelSettingsStore,
-            FocusedPanelStore(get_panel_settings_store()),
-        ),
+        panel_store=get_panel_settings_store(),
         execution_store=get_execution_store(),
         successful_submission_store=get_successful_submission_store(),
         submission_repository=get_submission_repository(),

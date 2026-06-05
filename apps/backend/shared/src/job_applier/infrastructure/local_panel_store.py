@@ -215,10 +215,10 @@ class LocalPanelSettingsStore:
             ),
             preferences=StoredPreferencesSection(
                 keywords=(
-                    "Automation Engineer",
-                    "RPA Developer",
-                    "Backend Developer",
-                    "Full Stack Developer",
+                    "Desenvolvedor RPA",
+                    "Desenvolvedor Full Stack",
+                    "Desenvolvedor de Automação",
+                    "Desenvolvedor Backend",
                 ),
                 location="Remote",
                 posted_within_hours=24,

@@ -63,11 +63,10 @@ Not promised today:
 
 Broad families:
 
-- Automation Engineer
-- Automation Developer
-- RPA Developer
-- Backend Developer
-- Full Stack Developer
+- Desenvolvedor RPA
+- Desenvolvedor Full Stack
+- Desenvolvedor de Automação
+- Desenvolvedor Backend
 - Software Engineer
 - Software Developer
 
@@ -77,17 +76,7 @@ Portuguese aliases are also supported in the current local setup.
 
 The current local configuration prioritizes Brazilian targets first:
 
-1. `Engenheiro de Software`
+1. `Desenvolvedor RPA`
 2. `Desenvolvedor Full Stack`
-3. `Desenvolvedor Backend`
-4. `Desenvolvedor de Software`
-5. `Engenheiro de Automação`
-6. `Desenvolvedor de Automação`
-7. `Desenvolvedor RPA`
-8. `Software Engineer`
-9. `Full Stack Developer`
-10. `Backend Developer`
-11. `Software Developer`
-12. `Automation Engineer`
-13. `Automation Developer`
-14. `RPA Developer`
+3. `Desenvolvedor de Automação`
+4. `Desenvolvedor Backend`
