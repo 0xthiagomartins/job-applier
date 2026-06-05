@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict
@@ -54,6 +54,12 @@ from job_applier.observability import (
     update_progress_snapshot,
     write_output_json,
 )
+
+if TYPE_CHECKING:
+    from job_applier.infrastructure.linkedin.search_score_cache import (
+        CachedScoreDecision,
+        LinkedInSearchScoreCache,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -405,6 +411,7 @@ class AgentExecutionOrchestrator:
         job_scorer: JobScorer | None = None,
         job_submitter: JobSubmitter | None = None,
         output_dir: Path | None = None,
+        search_score_cache: LinkedInSearchScoreCache | None = None,
         max_selected_jobs_per_run: int | None = None,
         test_minimum_score_threshold: float | None = None,
         failed_submission_retry_limit: int | None = None,
@@ -419,6 +426,7 @@ class AgentExecutionOrchestrator:
         self._job_scorer = job_scorer or PassThroughJobScorer()
         self._job_submitter = job_submitter or NoOpJobSubmitter()
         self._output_dir = output_dir
+        self._search_score_cache = search_score_cache
         self._max_selected_jobs_per_run = (
             max(1, max_selected_jobs_per_run) if max_selected_jobs_per_run is not None else None
         )
@@ -648,7 +656,45 @@ class AgentExecutionOrchestrator:
             )
             append_timeline_event("score_job_started", current_job)
             try:
-                scored_job = await self._job_scorer.score(settings, posting)
+                scored_job: ScoredJobPosting
+                if self._search_score_cache is not None and stage is DebugExecutionStage.FULL:
+                    cached_score = self._search_score_cache.load_score_decision(
+                        settings=settings,
+                        posting=posting,
+                    )
+                    if cached_score is not None:
+                        scored_job = self._build_scored_job_from_cache(
+                            posting=posting,
+                            cached_score=cached_score,
+                        )
+                        append_timeline_event(
+                            "job_score_cache_hit",
+                            {
+                                **current_job,
+                                "selected": scored_job.selected,
+                                "score": scored_job.score,
+                                "matched_role_target": scored_job.matched_role_target,
+                            },
+                        )
+                    else:
+                        append_timeline_event("job_score_cache_miss", current_job)
+                        scored_job = await self._job_scorer.score(settings, posting)
+                        self._search_score_cache.save_score_decision(
+                            settings=settings,
+                            posting=posting,
+                            decision=self._build_cached_score_decision(scored_job),
+                        )
+                        append_timeline_event(
+                            "job_score_cache_saved",
+                            {
+                                **current_job,
+                                "selected": scored_job.selected,
+                                "score": scored_job.score,
+                                "matched_role_target": scored_job.matched_role_target,
+                            },
+                        )
+                else:
+                    scored_job = await self._job_scorer.score(settings, posting)
             except Exception as exc:  # noqa: BLE001
                 latest_error = str(exc)
                 error_count += 1
@@ -1463,6 +1509,39 @@ class AgentExecutionOrchestrator:
             },
         )
         return final_summary
+
+    def _build_scored_job_from_cache(
+        self,
+        *,
+        posting: JobPosting,
+        cached_score: CachedScoreDecision,
+    ) -> ScoredJobPosting:
+        """Hydrate one cached score decision back into the run DTO."""
+
+        return ScoredJobPosting(
+            posting=posting,
+            selected=cached_score.selected,
+            score=cached_score.score,
+            reason=cached_score.reason,
+            matched_role_target=cached_score.matched_role_target,
+            matched_specializations=cached_score.matched_specializations,
+        )
+
+    def _build_cached_score_decision(
+        self,
+        scored_job: ScoredJobPosting,
+    ) -> CachedScoreDecision:
+        """Convert one live score result into the cache payload type."""
+
+        from job_applier.infrastructure.linkedin.search_score_cache import CachedScoreDecision
+
+        return CachedScoreDecision(
+            selected=scored_job.selected,
+            score=scored_job.score,
+            reason=scored_job.reason,
+            matched_role_target=scored_job.matched_role_target,
+            matched_specializations=scored_job.matched_specializations,
+        )
 
     def _find_existing_successful_submission(
         self,

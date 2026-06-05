@@ -65,8 +65,17 @@ Low-cost validation strategy:
 
 - prefer direct target mode over broad search
 - prefer a fixed 3-job suite over large production rounds
+- when broad `full` validation is needed, reuse the built-in 1-hour search+score cache instead of rerunning the same campaigns cold
 - stop on the first OpenAI `429` in production
 - avoid forcing raw CV reprocessing when validating dynamic resume changes that can be inspected through the persisted snapshot
+
+Search+score cache behavior:
+
+- scope: repeated `full`-stage runs with the same target inputs
+- storage: `artifacts/runtime/cache/search-score/`
+- ttl: `1 hour`
+- reuse point: after campaign search/pagination and after rule-based scoring, before apply
+- expected effect: repeated validation runs should skip browser search work and skip scorer recomputation for cached postings
 
 Current recommended low-cost suite:
 
@@ -95,5 +104,6 @@ When something looks wrong:
 4. the entrypoint assessment events
 5. scorer output and matched role target
 6. any `apply_memory_*` events
-7. whether the run halted on an OpenAI `429` instead of retrying indefinitely
-8. whether the canonical resume snapshot is stale or user-edited
+7. any `linkedin_search_campaign_cache_*` or `job_score_cache_*` events
+8. whether the run halted on an OpenAI `429` instead of retrying indefinitely
+9. whether the canonical resume snapshot is stale or user-edited

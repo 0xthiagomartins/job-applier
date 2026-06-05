@@ -42,12 +42,14 @@ Main stack:
 - Playwright-based LinkedIn interaction
 - optional semantic repair flows
 - adaptive local apply memory backed by `diskcache`
+- 1-hour search and score cache backed by `diskcache`
 - artifact capture into local filesystem
 
 Responsibilities:
 
 - fetch job pages
 - determine whether `Easy Apply` is actually usable
+- avoid repeating identical search/pagination and score work during repeated full-stage validations
 - open and traverse the modal
 - answer fields
 - upload the right CV
@@ -58,6 +60,7 @@ Responsibilities:
 - `artifacts/runtime/job-applier.db`: main local database
 - `artifacts/runtime/panel/`: saved panel state and CV copies
 - `artifacts/runtime/cache/apply-action-memory/`: adaptive apply memory cache
+- `artifacts/runtime/cache/search-score/`: 1-hour search and score cache for repeated full-stage runs
 - `artifacts/runtime/artifacts/`: per-submission evidence bundles
 - `artifacts/last-run/`: latest-run troubleshooting bundle
 
@@ -65,6 +68,7 @@ Responsibilities:
 
 - search and detail extraction
 - job scoring
+- repeated full-run search/score cache reuse
 - capability profile inference
 - canonical resume source snapshot persistence
 - dynamic resume building and localization

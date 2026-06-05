@@ -36,6 +36,8 @@ This file summarizes the most relevant recent changes so a new harness does not 
 - accessibility/disability field handling
 - canonical resume source snapshot persistence
 - backend routes to inspect, refresh, and override the canonical snapshot
+- 1-hour diskcache-backed search+score reuse for repeated full-stage validations
+- stronger resume reassertion in the apply flow before falling back to picker reselection
 
 ## Recent Real Successes
 
@@ -54,6 +56,7 @@ The main remaining area to keep validating is:
 - long employer-specific forms
 - how much adaptive apply memory reduces OpenAI calls in repeated flows
 - how much the persisted resume snapshot reduces repeated dynamic-resume setup cost
+- how much the new 1-hour search+score cache reduces repeated full-stage validation cost
 
 There is no single known blocker in dynamic resume quality right now; the higher-value work is cost control and apply robustness.
 

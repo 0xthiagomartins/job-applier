@@ -927,6 +927,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 last_known_step_index = 0
                 last_known_total_steps = 1
                 step_visit_counts: dict[int, int] = {}
+                force_resume_reselection = False
                 for _ in range(max_iterations):
                     step = await self._extract_step(
                         page,
@@ -1044,7 +1045,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         execution_events=execution_events,
                         uploaded_cv_paths=uploaded_cv_paths,
                         submission_cv_path=submission_cv_path,
+                        force_resume_reselection=force_resume_reselection,
                     )
+                    if force_resume_reselection and any(
+                        field.question_type is QuestionType.RESUME_UPLOAD for field in step.fields
+                    ):
+                        force_resume_reselection = False
                     answers.extend(step_answers)
                     artifacts.extend(step_artifacts)
                     await self._retry_invalid_fields_after_primary_action(
@@ -1058,6 +1064,20 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         step_answers=tuple(step_answers),
                         repair_origin="pre_primary_action",
                     )
+
+                    review_repair_reason = await self._maybe_repair_easy_apply_review(
+                        page,
+                        step=step,
+                        settings=settings,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
+                        execution_events=execution_events,
+                        submission_cv_path=submission_cv_path,
+                    )
+                    if review_repair_reason is not None:
+                        if review_repair_reason == "resume_mismatch":
+                            force_resume_reselection = True
+                        continue
 
                     try:
                         update_progress_snapshot(
@@ -1076,6 +1096,54 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             execution_events=execution_events,
                         )
                     except LinkedInEasyApplyError as exc:
+                        if (
+                            step.step_index >= step.total_steps - 1
+                            and not step.fields
+                            and await self._submit_transition_requires_job_page_recheck(page)
+                        ):
+                            success, recheck_notes = await self._confirm_submission_via_job_page(
+                                page,
+                                posting=posting,
+                                settings=settings,
+                                execution_id=execution_id,
+                                submission_id=submission_id,
+                                execution_events=execution_events,
+                            )
+                            if success:
+                                submitted_at = utc_now()
+                                notes = recheck_notes or (
+                                    "LinkedIn closed the dialog during final submission and "
+                                    "the original vacancy now indicates the application was sent."
+                                )
+                                self._record_event(
+                                    execution_events,
+                                    execution_id=execution_id,
+                                    submission_id=submission_id,
+                                    event_type=ExecutionEventType.JOB_PROCESSED,
+                                    payload={
+                                        "job_posting_id": str(posting.id),
+                                        "status": SubmissionStatus.SUBMITTED.value,
+                                        "notes": notes,
+                                        "submitted_at": submitted_at.isoformat(),
+                                    },
+                                )
+                                return EasyApplyExecutionResult(
+                                    submission_id=submission_id,
+                                    started_at=started_at,
+                                    status=SubmissionStatus.SUBMITTED,
+                                    resume_mode=resume_mode,
+                                    target_language=target_language,
+                                    matched_role_target=matched_role_target,
+                                    matched_specializations=matched_specializations,
+                                    notes=notes,
+                                    answers=tuple(answers),
+                                    execution_events=tuple(execution_events),
+                                    artifacts=tuple(artifacts),
+                                    recruiter_interactions=tuple(recruiter_interactions),
+                                    submitted_at=submitted_at,
+                                    cv_version=submission_cv_version,
+                                    cover_letter_version=None,
+                                )
                         notes = str(exc) or "Browser agent could not progress the Easy Apply flow."
                         artifacts.extend(
                             await self._capture_debug_bundle(
@@ -1151,6 +1219,19 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                 label="post_submit",
                             ),
                         )
+                        if not success and await self._submit_transition_requires_job_page_recheck(
+                            page
+                        ):
+                            success, recheck_notes = await self._confirm_submission_via_job_page(
+                                page,
+                                posting=posting,
+                                settings=settings,
+                                execution_id=execution_id,
+                                submission_id=submission_id,
+                                execution_events=execution_events,
+                            )
+                            if success and recheck_notes:
+                                outcome_notes = recheck_notes
                         if success:
                             update_progress_snapshot(
                                 {
@@ -1464,6 +1545,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         execution_events: list[ExecutionEvent],
         uploaded_cv_paths: set[str],
         submission_cv_path: Path | None,
+        force_resume_reselection: bool = False,
     ) -> tuple[list[ApplicationAnswer], list[ArtifactSnapshot]]:
         root = await self._easy_apply_root(page)
         answers: list[ApplicationAnswer] = []
@@ -1549,10 +1631,13 @@ class PlaywrightLinkedInEasyApplyExecutor:
             force_resume_refresh = (
                 field.question_type is QuestionType.RESUME_UPLOAD
                 and submission_cv_path is not None
-                and not _resume_field_matches_requested_cv(
-                    field,
-                    submission_cv_path=submission_cv_path,
-                    fallback_filename=settings.profile.cv_filename,
+                and (
+                    force_resume_reselection
+                    or not _resume_field_matches_requested_cv(
+                        field,
+                        submission_cv_path=submission_cv_path,
+                        fallback_filename=settings.profile.cv_filename,
+                    )
                 )
             )
             resolution: ResolvedFieldValue | None
@@ -1641,6 +1726,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 resolution,
                 settings,
                 submission_cv_path=submission_cv_path,
+                force_resume_reassert=force_resume_refresh,
             )
             if (
                 applied_value is None
@@ -1667,6 +1753,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         resolution,
                         settings,
                         submission_cv_path=submission_cv_path,
+                        force_resume_reassert=force_resume_refresh,
                     )
             if applied_value is None:
                 self._record_event(
@@ -1790,6 +1877,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         settings: UserAgentSettings,
         *,
         submission_cv_path: Path | None,
+        force_resume_reassert: bool = False,
     ) -> str | None:
         match field.control_kind:
             case "text" | "textarea":
@@ -1826,6 +1914,25 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     locator=locator,
                     initial_state=state,
                 )
+                if committed_state.invalid and field.question_type is QuestionType.CITY:
+                    try:
+                        return await asyncio.wait_for(
+                            self._complete_text_field_interaction(
+                                page=page,
+                                field=field,
+                                target_value=resolution.value,
+                                settings=settings,
+                            ),
+                            timeout=(
+                                self._runtime_settings.linkedin_field_interaction_timeout_seconds
+                            ),
+                        )
+                    except TimeoutError as exc:
+                        msg = (
+                            "Timed out while the browser agent was trying to finalize an "
+                            "interactive LinkedIn Easy Apply city field."
+                        )
+                        raise LinkedInEasyApplyError(msg) from exc
                 return committed_state.current_value or resolution.value
             case "select":
                 if field.question_type is QuestionType.RESUME_UPLOAD:
@@ -1835,6 +1942,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         field=field,
                         settings=settings,
                         submission_cv_path=submission_cv_path,
+                        force_reassert=force_resume_reassert,
                     )
                 locator = await self._find_control_locator(root, field)
                 if locator is None:
@@ -1859,6 +1967,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         field=field,
                         settings=settings,
                         submission_cv_path=submission_cv_path,
+                        force_reassert=force_resume_reassert,
                     )
                 locator = await self._find_control_locator(root, field)
                 if locator is None:
@@ -1899,6 +2008,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         field=field,
                         settings=settings,
                         submission_cv_path=submission_cv_path,
+                        force_reassert=force_resume_reassert,
                     )
                 option_index = _pick_option_index(field.options, preferred=resolution.value)
                 if option_index is None:
@@ -2573,6 +2683,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         field: EasyApplyField,
         settings: UserAgentSettings,
         submission_cv_path: Path | None,
+        force_reassert: bool = False,
     ) -> str | None:
         target_cv_name = (
             submission_cv_path.name
@@ -2581,6 +2692,19 @@ class PlaywrightLinkedInEasyApplyExecutor:
         )
         if target_cv_name is None:
             return None
+        if force_reassert and submission_cv_path is not None:
+            if await self._upload_resume_from_choice_step(
+                page=page,
+                root=root,
+                submission_cv_path=submission_cv_path,
+            ):
+                await page.wait_for_timeout(900)
+                refreshed_root = await self._easy_apply_root(page)
+                if await self._resume_picker_selection_matches_requested_cv(
+                    refreshed_root,
+                    target_cv_name=target_cv_name,
+                ):
+                    return target_cv_name
         option_index = _pick_resume_option_index(field.options, target_cv_name)
         if option_index is None:
             if submission_cv_path is not None and await self._upload_resume_from_choice_step(
@@ -2588,7 +2712,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 root=root,
                 submission_cv_path=submission_cv_path,
             ):
-                return target_cv_name
+                await page.wait_for_timeout(900)
+                refreshed_root = await self._easy_apply_root(page)
+                if await self._resume_picker_selection_matches_requested_cv(
+                    refreshed_root,
+                    target_cv_name=target_cv_name,
+                ):
+                    return target_cv_name
+                return None
             if submission_cv_path is not None:
                 msg = (
                     "LinkedIn Easy Apply did not expose the requested dynamic resume in the "
@@ -2599,8 +2730,33 @@ class PlaywrightLinkedInEasyApplyExecutor:
 
         match field.control_kind:
             case "radio":
-                if await self._check_radio_option_by_index(root, field, option_index=option_index):
-                    return target_cv_name
+                if force_reassert:
+                    alternate_option_index = _pick_alternate_resume_option_index(
+                        field.options,
+                        target_cv_name,
+                    )
+                    if alternate_option_index is not None:
+                        await self._check_radio_option_by_index(
+                            root,
+                            field,
+                            option_index=alternate_option_index,
+                            force_activate=True,
+                        )
+                        await page.wait_for_timeout(250)
+                if await self._check_radio_option_by_index(
+                    root,
+                    field,
+                    option_index=option_index,
+                    force_activate=force_reassert,
+                ):
+                    if force_reassert:
+                        await page.wait_for_timeout(450)
+                    refreshed_root = await self._easy_apply_root(page)
+                    if await self._resume_picker_selection_matches_requested_cv(
+                        refreshed_root,
+                        target_cv_name=target_cv_name,
+                    ):
+                        return target_cv_name
                 if await self._complete_radio_interaction(
                     page=page,
                     field=field,
@@ -2608,7 +2764,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     option_label=target_cv_name,
                     settings=settings,
                 ):
-                    return target_cv_name
+                    refreshed_root = await self._easy_apply_root(page)
+                    if await self._resume_picker_selection_matches_requested_cv(
+                        refreshed_root,
+                        target_cv_name=target_cv_name,
+                    ):
+                        return target_cv_name
             case "checkbox":
                 locator = await self._find_control_locator(root, field)
                 if locator is not None and await self._set_checkbox_state(
@@ -2618,19 +2779,291 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     locator=locator,
                     desired_checked=True,
                 ):
-                    return target_cv_name
+                    refreshed_root = await self._easy_apply_root(page)
+                    if await self._resume_picker_selection_matches_requested_cv(
+                        refreshed_root,
+                        target_cv_name=target_cv_name,
+                    ):
+                        return target_cv_name
                 if await self._complete_checkbox_interaction(
                     page=page,
                     field=field,
                     settings=settings,
                     desired_checked=True,
                 ):
-                    return target_cv_name
+                    refreshed_root = await self._easy_apply_root(page)
+                    if await self._resume_picker_selection_matches_requested_cv(
+                        refreshed_root,
+                        target_cv_name=target_cv_name,
+                    ):
+                        return target_cv_name
             case "select":
                 locator = await self._find_control_locator(root, field)
                 if locator is not None:
                     await self._select_field_option(locator, field, option_index=option_index)
-                    return target_cv_name
+                    refreshed_root = await self._easy_apply_root(page)
+                    if await self._resume_picker_selection_matches_requested_cv(
+                        refreshed_root,
+                        target_cv_name=target_cv_name,
+                    ):
+                        return target_cv_name
+        return None
+
+    async def _resume_picker_selection_matches_requested_cv(
+        self,
+        root: Locator,
+        *,
+        target_cv_name: str,
+    ) -> bool:
+        try:
+            payload = await root.evaluate(
+                """
+                (node, { targetCvName }) => {
+                  const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                  const normalize = (value) => collapse(value).toLowerCase();
+                  const target = normalize(targetCvName);
+                  if (!target) {
+                    return false;
+                  }
+                  const isVisible = (element) => {
+                    if (!(element instanceof Element)) {
+                      return false;
+                    }
+                    const style = window.getComputedStyle(element);
+                    if (
+                      style.display === "none"
+                      || style.visibility === "hidden"
+                      || style.opacity === "0"
+                    ) {
+                      return false;
+                    }
+                    const rect = element.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  };
+                  const matchesTarget = (text) => {
+                    const normalizedText = normalize(text);
+                    return Boolean(normalizedText && normalizedText.includes(target));
+                  };
+
+                  const radios = Array.from(node.querySelectorAll('input[type="radio"]'));
+                  for (const radio of radios) {
+                    if (!(radio instanceof HTMLInputElement) || !radio.checked) {
+                      continue;
+                    }
+                    const card = radio.closest('[role="button"], label, fieldset, div');
+                    const cardText = collapse(card?.innerText || card?.textContent || "");
+                    if (matchesTarget(cardText)) {
+                      return true;
+                    }
+                  }
+
+                  for (const roleRadio of node.querySelectorAll(
+                    '[role="radio"][aria-checked="true"]'
+                  )) {
+                    if (!isVisible(roleRadio)) {
+                      continue;
+                    }
+                    const text = collapse(roleRadio.innerText || roleRadio.textContent || "");
+                    if (matchesTarget(text)) {
+                      return true;
+                    }
+                  }
+
+                  return matchesTarget(node.innerText || node.textContent || "");
+                }
+                """,
+                {"targetCvName": target_cv_name},
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(payload)
+
+    async def _extract_easy_apply_review_sections(
+        self,
+        page: Page,
+    ) -> dict[str, dict[str, str]]:
+        root = await self._easy_apply_root(page)
+        try:
+            payload = await root.evaluate(
+                """
+                (node) => {
+                  const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                  const normalize = (value) => collapse(value).toLowerCase();
+                  const isVisible = (element) => {
+                    if (!(element instanceof Element)) {
+                      return false;
+                    }
+                    const style = window.getComputedStyle(element);
+                    if (
+                      style.display === "none"
+                      || style.visibility === "hidden"
+                      || style.opacity === "0"
+                    ) {
+                      return false;
+                    }
+                    const rect = element.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  };
+                  let refCounter = 1;
+                  const ensureRef = (element, attributeName) => {
+                    const existing = collapse(element.getAttribute(attributeName));
+                    if (existing) {
+                      return existing;
+                    }
+                    const ref = `job-applier-review-${refCounter}`;
+                    refCounter += 1;
+                    element.setAttribute(attributeName, ref);
+                    return ref;
+                  };
+
+                  const sections = [];
+                  const buttons = Array.from(node.querySelectorAll('button, [role="button"]'));
+                  for (const button of buttons) {
+                    if (!isVisible(button)) {
+                      continue;
+                    }
+                    const buttonLabel = collapse(
+                      button.innerText
+                      || button.textContent
+                      || button.getAttribute('aria-label')
+                      || ''
+                    );
+                    if (normalize(buttonLabel) !== 'edit') {
+                      continue;
+                    }
+                    let header = button.parentElement;
+                    while (header && header !== node) {
+                      const texts = Array.from(header.querySelectorAll('p, h1, h2, h3, span'))
+                        .map((candidate) =>
+                          collapse(candidate.innerText || candidate.textContent || '')
+                        )
+                        .filter(Boolean)
+                        .filter((text) => normalize(text) !== 'edit');
+                      if (texts.length) {
+                        const title = texts[0];
+                        const content = header.nextElementSibling;
+                        sections.push({
+                          title,
+                          body_text: collapse(content?.innerText || content?.textContent || ''),
+                          edit_ref: ensureRef(button, 'data-job-applier-review-edit-ref'),
+                        });
+                        break;
+                      }
+                      header = header.parentElement;
+                    }
+                  }
+                  return sections;
+                }
+                """,
+            )
+        except Exception:  # noqa: BLE001
+            return {}
+
+        sections: dict[str, dict[str, str]] = {}
+        for item in payload if isinstance(payload, list) else ():
+            if not isinstance(item, dict):
+                continue
+            title = normalize_text(str(item.get("title") or ""))
+            if not title:
+                continue
+            sections[title] = {
+                "edit_ref": normalize_text(str(item.get("edit_ref") or "")),
+                "body_text": normalize_text(str(item.get("body_text") or "")),
+            }
+        return sections
+
+    async def _click_easy_apply_review_edit(
+        self,
+        page: Page,
+        *,
+        edit_ref: str,
+    ) -> bool:
+        if not edit_ref:
+            return False
+        root = await self._easy_apply_root(page)
+        button = root.locator(_attribute_selector("data-job-applier-review-edit-ref", edit_ref))
+        if not await button.count():
+            return False
+        try:
+            await button.first.scroll_into_view_if_needed(timeout=2_000)
+            await button.first.click(timeout=3_000)
+            await self._wait_for_easy_apply_surface(page)
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    async def _maybe_repair_easy_apply_review(
+        self,
+        page: Page,
+        *,
+        step: EasyApplyStep,
+        settings: UserAgentSettings,
+        execution_id: UUID,
+        submission_id: UUID,
+        execution_events: list[ExecutionEvent],
+        submission_cv_path: Path | None,
+    ) -> str | None:
+        if "review your application" not in normalize_text(step.surface_text):
+            return None
+
+        sections = await self._extract_easy_apply_review_sections(page)
+        if not sections:
+            return None
+
+        target_cv_name = (
+            submission_cv_path.name
+            if submission_cv_path is not None
+            else settings.profile.cv_filename
+        )
+        resume_section = sections.get("resume")
+        if (
+            target_cv_name
+            and resume_section is not None
+            and not _resume_text_matches_requested_cv(
+                resume_section.get("body_text", ""),
+                target_cv_name,
+            )
+        ):
+            if await self._click_easy_apply_review_edit(
+                page,
+                edit_ref=resume_section.get("edit_ref", ""),
+            ):
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.STEP_REACHED,
+                    payload={
+                        "stage": "easy_apply_review_repair",
+                        "step_index": step.step_index,
+                        "reason": "resume_mismatch",
+                        "target_cv_name": target_cv_name,
+                        "review_text": resume_section.get("body_text", ""),
+                    },
+                )
+                return "resume_mismatch"
+
+        contact_section = sections.get("contact info")
+        if contact_section is not None and "urn:li:geo:" in normalize_text(
+            contact_section.get("body_text", "")
+        ):
+            if await self._click_easy_apply_review_edit(
+                page,
+                edit_ref=contact_section.get("edit_ref", ""),
+            ):
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.STEP_REACHED,
+                    payload={
+                        "stage": "easy_apply_review_repair",
+                        "step_index": step.step_index,
+                        "reason": "invalid_city_review_value",
+                        "review_text": contact_section.get("body_text", ""),
+                    },
+                )
+                return "invalid_city_review_value"
         return None
 
     async def _upload_resume_from_choice_step(
@@ -2719,6 +3152,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         field: EasyApplyField,
         *,
         option_index: int,
+        force_activate: bool = False,
     ) -> bool:
         option_label = field.options[option_index] if len(field.options) > option_index else None
         option_locator = await self._resolve_radio_option_locator(
@@ -2731,7 +3165,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 await option_locator.scroll_into_view_if_needed(timeout=2_000)
             except Exception:  # noqa: BLE001
                 pass
-            if await self._radio_option_is_selected(
+            if not force_activate and await self._radio_option_is_selected(
                 root,
                 field,
                 option_index=option_index,
@@ -4743,6 +5177,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
         *,
         settings: UserAgentSettings,
     ) -> str | None:
+        local_detection = await self._detect_existing_application_on_job_page_locally(page)
+        if local_detection is not None:
+            return local_detection
         assessment = await self._assess_job_page_apply_blocker_with_agent(
             page,
             settings=settings,
@@ -4750,6 +5187,81 @@ class PlaywrightLinkedInEasyApplyExecutor:
         if assessment is None or assessment.status != "complete":
             return None
         return assessment.summary or "LinkedIn indicates this job was already applied to."
+
+    async def _detect_existing_application_on_job_page_locally(
+        self,
+        page: Page,
+    ) -> str | None:
+        try:
+            payload = await page.evaluate(
+                """
+                () => {
+                  const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                  const normalize = (value) => collapse(value).toLowerCase();
+                  const isVisible = (element) => {
+                    if (!(element instanceof Element)) {
+                      return false;
+                    }
+                    const style = window.getComputedStyle(element);
+                    if (
+                      style.display === "none"
+                      || style.visibility === "hidden"
+                      || style.opacity === "0"
+                    ) {
+                      return false;
+                    }
+                    const rect = element.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  };
+
+                  const visibleTexts = Array.from(
+                    document.querySelectorAll("h1, h2, h3, p, span, div, button, a")
+                  )
+                    .filter(isVisible)
+                    .map((element) =>
+                      collapse(
+                        element.innerText
+                        || element.textContent
+                        || element.getAttribute("aria-label")
+                        || ""
+                      )
+                    )
+                    .filter(Boolean);
+
+                  return {
+                    page_text: normalize(visibleTexts.join(" ")),
+                    sample_texts: visibleTexts.slice(0, 40),
+                  };
+                }
+                """,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+        page_text = normalize_text(str(payload.get("page_text") or ""))
+        if not page_text:
+            return None
+
+        success_markers = (
+            "application submitted now",
+            "application submitted",
+            "application sent",
+            "your application was sent",
+            "application status",
+            "already applied",
+            "you applied",
+            "candidatura enviada",
+            "inscricao enviada",
+            "inscrição enviada",
+            "aplicacao enviada",
+            "aplicação enviada",
+            "status da candidatura",
+        )
+        if any(marker in page_text for marker in success_markers):
+            return "LinkedIn indicates this job was already applied to."
+        return None
 
     async def _assess_job_page_apply_blocker_with_agent(
         self,
@@ -5111,9 +5623,10 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             or _step_surface_changed(step, current_step)
                         )
                     elif self._action_indicates_submission(footer_action):
-                        action_succeeded = await self._submission_confirmation_visible(page)
-                        if not action_succeeded:
-                            action_succeeded = not await self._easy_apply_modal_visible(page)
+                        # The final submit CTA can trigger a slow transition before LinkedIn
+                        # shows confirmation or closes the modal. Return the submit action
+                        # immediately and let _await_submission_outcome own that state check.
+                        action_succeeded = True
 
                     if action_succeeded:
                         if footer_snapshot is not None:
@@ -5563,6 +6076,68 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 return False, assessment.summary or "LinkedIn blocked the application flow."
             await page.wait_for_timeout(750)
         return False, "LinkedIn did not confirm the application result in time."
+
+    async def _submit_transition_requires_job_page_recheck(self, page: Page) -> bool:
+        try:
+            current_url = page.url
+        except Exception:  # noqa: BLE001
+            current_url = ""
+        normalized_url = normalize_text(current_url or "")
+        if normalized_url == "about:blank":
+            return True
+        if await self._easy_apply_modal_visible(page):
+            return False
+        try:
+            visible_text = await page.evaluate(
+                """
+                () => (document.body?.innerText || '').replace(/\\s+/g, ' ').trim()
+                """,
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        return not bool(normalize_text(str(visible_text or "")))
+
+    async def _confirm_submission_via_job_page(
+        self,
+        page: Page,
+        *,
+        posting: JobPosting,
+        settings: UserAgentSettings,
+        execution_id: UUID,
+        submission_id: UUID,
+        execution_events: list[ExecutionEvent],
+    ) -> tuple[bool, str | None]:
+        self._record_event(
+            execution_events,
+            execution_id=execution_id,
+            submission_id=submission_id,
+            event_type=ExecutionEventType.STEP_REACHED,
+            payload={
+                "stage": "easy_apply_post_submit_recheck",
+                "job_posting_id": str(posting.id),
+                "url_before_recheck": page.url,
+            },
+        )
+        try:
+            await self._open_job_detail_page(page, posting=posting)
+        except LinkedInEasyApplyError as exc:
+            return False, str(exc)
+        await page.wait_for_timeout(750)
+        notes = await self._detect_existing_application_on_job_page(page, settings=settings)
+        if notes is None:
+            return False, None
+        self._record_event(
+            execution_events,
+            execution_id=execution_id,
+            submission_id=submission_id,
+            event_type=ExecutionEventType.STEP_REACHED,
+            payload={
+                "stage": "easy_apply_post_submit_recheck_confirmed",
+                "job_posting_id": str(posting.id),
+                "notes": notes,
+            },
+        )
+        return True, notes
 
     async def _submission_confirmation_visible(self, page: Page) -> bool:
         try:
@@ -7650,6 +8225,15 @@ def _pick_resume_option_index(options: tuple[str, ...], filename: str) -> int | 
         return None
     for index, option in enumerate(options):
         if _resume_text_matches_requested_cv(option, filename):
+            return index
+    return None
+
+
+def _pick_alternate_resume_option_index(options: tuple[str, ...], filename: str) -> int | None:
+    if len(options) < 2:
+        return None
+    for index, option in enumerate(options):
+        if not _resume_text_matches_requested_cv(option, filename):
             return index
     return None
 

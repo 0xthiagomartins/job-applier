@@ -37,6 +37,7 @@ The project is functional for internal beta usage, including real successful sub
 - English and Portuguese dynamic resume flows both work in real runs
 - adaptive local apply memory now exists and replays successfully in production-like validation
 - the base CV now has a persisted canonical source snapshot reused across dynamic resume generation
+- repeated production validations can now reuse a 1-hour `search + score` cache for the same target inputs
 - multilingual dynamic resume generation exists
 - the main operational concern now is cost and latency, not a known resume-quality blocker
 - LinkedIn surface changes remain a normal operational risk

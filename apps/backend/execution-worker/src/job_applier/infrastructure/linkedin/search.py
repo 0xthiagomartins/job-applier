@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from playwright.async_api import BrowserContext, Locator, Page, async_playwright
@@ -47,6 +47,9 @@ from job_applier.observability import (
     update_summary_snapshot,
 )
 from job_applier.settings import RuntimeSettings
+
+if TYPE_CHECKING:
+    from job_applier.infrastructure.linkedin.search_score_cache import LinkedInSearchScoreCache
 
 logger = logging.getLogger(__name__)
 
@@ -846,11 +849,13 @@ class LinkedInJobFetcher(JobFetcher):
         client: LinkedInJobsClient,
         runtime_settings: RuntimeSettings,
         job_repository: JobPostingRepository,
+        search_score_cache: LinkedInSearchScoreCache | None = None,
         parser: LinkedInJobParser | None = None,
     ) -> None:
         self._client = client
         self._runtime_settings = runtime_settings
         self._job_repository = job_repository
+        self._search_score_cache = search_score_cache
         self._parser = parser or LinkedInJobParser()
 
     async def fetch(self, settings: UserAgentSettings) -> list[JobPosting]:
@@ -879,6 +884,12 @@ class LinkedInJobFetcher(JobFetcher):
         )
 
         for campaign_index, criteria in enumerate(criteria_set, start=1):
+            search_score_cache = self._search_score_cache
+            use_campaign_cache = (
+                search_score_cache is not None
+                and stage is DebugExecutionStage.FULL
+                and criteria.debug_target_job_url is None
+            )
             logger.info(
                 "linkedin_search_campaign_started",
                 extra={
@@ -887,7 +898,60 @@ class LinkedInJobFetcher(JobFetcher):
                     "campaign_count": len(criteria_set),
                 },
             )
+            if use_campaign_cache and search_score_cache is not None:
+                cached_postings = search_score_cache.load_campaign(
+                    criteria=criteria,
+                    stage=stage,
+                )
+                if cached_postings is not None:
+                    logger.info(
+                        "linkedin_search_campaign_cache_hit",
+                        extra={
+                            **criteria.to_log_payload(),
+                            "campaign_index": campaign_index,
+                            "campaign_count": len(criteria_set),
+                            "cached_jobs": len(cached_postings),
+                        },
+                    )
+                    append_timeline_event(
+                        "linkedin_search_campaign_cache_hit",
+                        {
+                            "campaign_index": campaign_index,
+                            "campaign_count": len(criteria_set),
+                            "active_role_target": criteria.active_role_target,
+                            "active_search_query": criteria.keywords_text,
+                            "cached_jobs": len(cached_postings),
+                        },
+                    )
+                    for saved_posting in cached_postings:
+                        dedupe_key = saved_posting.external_job_id or saved_posting.url
+                        if dedupe_key in seen_keys:
+                            continue
+                        seen_keys.add(dedupe_key)
+                        persisted_jobs.append(saved_posting)
+                    logger.info(
+                        "linkedin_search_campaign_completed",
+                        extra={
+                            **criteria.to_log_payload(),
+                            "campaign_index": campaign_index,
+                            "campaign_count": len(criteria_set),
+                            "persisted_jobs": len(persisted_jobs),
+                            "used_cache": True,
+                        },
+                    )
+                    continue
+                append_timeline_event(
+                    "linkedin_search_campaign_cache_miss",
+                    {
+                        "campaign_index": campaign_index,
+                        "campaign_count": len(criteria_set),
+                        "active_role_target": criteria.active_role_target,
+                        "active_search_query": criteria.keywords_text,
+                    },
+                )
+
             collected_jobs = await self._client.fetch_jobs(criteria)
+            campaign_postings: list[JobPosting] = []
             for collected_job in collected_jobs:
                 try:
                     posting = self._parser.parse(collected_job)
@@ -916,6 +980,7 @@ class LinkedInJobFetcher(JobFetcher):
                     posting = replace(posting, id=existing.id)
 
                 saved_posting = self._job_repository.save(posting)
+                campaign_postings.append(saved_posting)
                 persisted_jobs.append(saved_posting)
                 logger.info(
                     "linkedin_job_captured",
@@ -930,6 +995,12 @@ class LinkedInJobFetcher(JobFetcher):
                         "detail_quality_source": saved_posting.detail_quality_source,
                         "active_role_target": criteria.active_role_target,
                     },
+                )
+            if use_campaign_cache and search_score_cache is not None and campaign_postings:
+                search_score_cache.save_campaign(
+                    criteria=criteria,
+                    stage=stage,
+                    postings=campaign_postings,
                 )
             logger.info(
                 "linkedin_search_campaign_completed",
@@ -1002,6 +1073,12 @@ class LinkedInJobFetcher(JobFetcher):
         for campaign_index, criteria in enumerate(criteria_set, start=1):
             active_role_target = criteria.active_role_target
             campaign_persisted_count = 0
+            search_score_cache = self._search_score_cache
+            use_campaign_cache = (
+                search_score_cache is not None
+                and stage is DebugExecutionStage.FULL
+                and criteria.debug_target_job_url is None
+            )
             logger.info(
                 "linkedin_search_campaign_started",
                 extra={
@@ -1011,10 +1088,92 @@ class LinkedInJobFetcher(JobFetcher):
                     "incremental": True,
                 },
             )
+            if use_campaign_cache and search_score_cache is not None:
+                cached_postings = search_score_cache.load_campaign(
+                    criteria=criteria,
+                    stage=stage,
+                )
+                if cached_postings is not None:
+                    logger.info(
+                        "linkedin_search_campaign_cache_hit",
+                        extra={
+                            **criteria.to_log_payload(),
+                            "campaign_index": campaign_index,
+                            "campaign_count": len(criteria_set),
+                            "cached_jobs": len(cached_postings),
+                            "incremental": True,
+                        },
+                    )
+                    append_timeline_event(
+                        "linkedin_search_campaign_cache_hit",
+                        {
+                            "campaign_index": campaign_index,
+                            "campaign_count": len(criteria_set),
+                            "active_role_target": criteria.active_role_target,
+                            "active_search_query": criteria.keywords_text,
+                            "cached_jobs": len(cached_postings),
+                            "incremental": True,
+                        },
+                    )
+                    for saved_posting in cached_postings:
+                        dedupe_key = saved_posting.external_job_id or saved_posting.url
+                        if dedupe_key in seen_keys:
+                            continue
+                        seen_keys.add(dedupe_key)
+                        persisted_count += 1
+                        campaign_persisted_count += 1
+                        logger.info(
+                            "linkedin_job_captured",
+                            extra={
+                                "job_posting_id": str(saved_posting.id),
+                                "external_job_id": saved_posting.external_job_id,
+                                "company_name": saved_posting.company_name,
+                                "title": saved_posting.title,
+                                "easy_apply": saved_posting.easy_apply,
+                                "detail_quality_score": saved_posting.detail_quality_score,
+                                "detail_description_score": saved_posting.detail_description_score,
+                                "detail_quality_source": saved_posting.detail_quality_source,
+                                "incremental": True,
+                                "active_role_target": active_role_target,
+                                "used_cache": True,
+                            },
+                        )
+                        should_continue = await on_job(saved_posting)
+                        if not should_continue:
+                            global_stop_requested = True
+                            break
+                    logger.info(
+                        "linkedin_search_campaign_completed",
+                        extra={
+                            **criteria.to_log_payload(),
+                            "campaign_index": campaign_index,
+                            "campaign_count": len(criteria_set),
+                            "persisted_jobs": persisted_count,
+                            "campaign_persisted_jobs": campaign_persisted_count,
+                            "incremental": True,
+                            "used_cache": True,
+                        },
+                    )
+                    if global_stop_requested:
+                        break
+                    continue
+                append_timeline_event(
+                    "linkedin_search_campaign_cache_miss",
+                    {
+                        "campaign_index": campaign_index,
+                        "campaign_count": len(criteria_set),
+                        "active_role_target": criteria.active_role_target,
+                        "active_search_query": criteria.keywords_text,
+                        "incremental": True,
+                    },
+                )
+
+            campaign_postings: list[JobPosting] = []
 
             async def persist_and_forward(
                 collected_job: LinkedInCollectedJob,
                 active_role_target: str | None = active_role_target,
+                campaign_postings_sink: list[JobPosting] = campaign_postings,
             ) -> bool:
                 nonlocal campaign_persisted_count, global_stop_requested, persisted_count
 
@@ -1046,6 +1205,7 @@ class LinkedInJobFetcher(JobFetcher):
                     posting = replace(posting, id=existing.id)
 
                 saved_posting = self._job_repository.save(posting)
+                campaign_postings_sink.append(saved_posting)
                 persisted_count += 1
                 campaign_persisted_count += 1
                 logger.info(
@@ -1075,6 +1235,17 @@ class LinkedInJobFetcher(JobFetcher):
                 return True
 
             await self._client.stream_jobs(criteria, persist_and_forward)
+            if (
+                use_campaign_cache
+                and search_score_cache is not None
+                and not global_stop_requested
+                and campaign_postings
+            ):
+                search_score_cache.save_campaign(
+                    criteria=criteria,
+                    stage=stage,
+                    postings=campaign_postings,
+                )
             logger.info(
                 "linkedin_search_campaign_completed",
                 extra={

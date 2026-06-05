@@ -18,6 +18,7 @@ from job_applier.infrastructure.linkedin import (
     PlaywrightLinkedInEasyApplyExecutor,
     PlaywrightLinkedInJobsClient,
 )
+from job_applier.infrastructure.linkedin.search_score_cache import LinkedInSearchScoreCache
 from job_applier.infrastructure.sqlite import (
     SqliteAnswerRepository,
     SqliteArtifactSnapshotRepository,
@@ -136,6 +137,18 @@ def get_apply_action_memory_repository() -> DiskCacheApplyActionMemoryRepository
 
 
 @lru_cache(maxsize=1)
+def get_linkedin_search_score_cache() -> LinkedInSearchScoreCache:
+    """Return the disk-backed LinkedIn search+score cache service."""
+
+    settings = get_runtime_settings()
+    return LinkedInSearchScoreCache(
+        cache_dir=settings.resolved_search_score_cache_dir,
+        job_repository=get_job_posting_repository(),
+        ttl_seconds=settings.resolved_search_score_cache_ttl_seconds,
+    )
+
+
+@lru_cache(maxsize=1)
 def get_linkedin_jobs_client() -> PlaywrightLinkedInJobsClient:
     """Return the Playwright LinkedIn search client."""
 
@@ -162,6 +175,7 @@ def get_job_fetcher() -> LinkedInJobFetcher:
         client=get_linkedin_jobs_client(),
         runtime_settings=get_runtime_settings(),
         job_repository=get_job_posting_repository(),
+        search_score_cache=get_linkedin_search_score_cache(),
     )
 
 
@@ -208,6 +222,7 @@ def get_agent_orchestrator() -> AgentExecutionOrchestrator:
         job_scorer=get_job_scorer(),
         job_submitter=get_job_submitter(),
         output_dir=settings.output_dir,
+        search_score_cache=get_linkedin_search_score_cache(),
         max_selected_jobs_per_run=settings.resolved_agent_max_selected_jobs_per_run,
         test_minimum_score_threshold=settings.resolved_agent_test_minimum_score_threshold,
         failed_submission_retry_limit=settings.resolved_agent_failed_submission_retry_limit,

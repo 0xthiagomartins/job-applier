@@ -24,6 +24,8 @@ class RuntimeSettings(BaseSettings):
     panel_storage_dir: Path | None = None
     database_url: str | None = None
     apply_action_memory_cache_dir: Path | None = None
+    search_score_cache_dir: Path | None = None
+    search_score_cache_ttl_seconds: int = 3_600
     local_owner_key: str = "local-default"
     backend_host: str = "0.0.0.0"
     backend_port: int = 8000
@@ -116,6 +118,18 @@ class RuntimeSettings(BaseSettings):
         """Return the cache directory used by adaptive Easy Apply memory."""
 
         return self.apply_action_memory_cache_dir or self.data_dir / "cache" / "apply-action-memory"
+
+    @property
+    def resolved_search_score_cache_dir(self) -> Path:
+        """Return the cache directory used by LinkedIn search+score reuse."""
+
+        return self.search_score_cache_dir or self.data_dir / "cache" / "search-score"
+
+    @property
+    def resolved_search_score_cache_ttl_seconds(self) -> int:
+        """Return the effective TTL used by the LinkedIn search+score cache."""
+
+        return max(60, self.search_score_cache_ttl_seconds)
 
     @property
     def resolved_playwright_mcp_url(self) -> str:
@@ -284,6 +298,7 @@ def initialize_runtime_environment(settings: RuntimeSettings) -> None:
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     settings.resolved_panel_storage_dir.mkdir(parents=True, exist_ok=True)
     settings.resolved_apply_action_memory_cache_dir.mkdir(parents=True, exist_ok=True)
+    settings.resolved_search_score_cache_dir.mkdir(parents=True, exist_ok=True)
     settings.resolved_linkedin_storage_state_path.parent.mkdir(parents=True, exist_ok=True)
     settings.resolved_linkedin_artifacts_dir.mkdir(parents=True, exist_ok=True)
     settings.resolved_stagehand_cache_dir.mkdir(parents=True, exist_ok=True)
