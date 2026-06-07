@@ -143,6 +143,28 @@ class LinkedInEasyApplyError(RuntimeError):
     """Raised when the Easy Apply execution cannot continue."""
 
 
+class MissingRequiredProfileDataError(LinkedInEasyApplyError):
+    """Raised when a required apply field lacks safe factual data from the profile."""
+
+    def __init__(
+        self,
+        *,
+        normalized_key: str,
+        question_type: QuestionType,
+        control_kind: str,
+    ) -> None:
+        self.normalized_key = normalized_key
+        self.question_type = question_type
+        self.control_kind = control_kind
+        super().__init__(
+            "Required LinkedIn Easy Apply field could not be resolved safely because the "
+            "profile does not provide the factual data needed: "
+            f"normalized_key={normalized_key}, "
+            f"question_type={question_type.value}, "
+            f"control_kind={control_kind}."
+        )
+
+
 def _field_has_explicit_invalid_feedback(field: EasyApplyField) -> bool:
     feedback = normalize_text(f"{field.helper_text or ''} {field.field_context}")
     if not feedback:
@@ -1037,18 +1059,73 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             label=f"step_{step.step_index + 1:02d}",
                         ),
                     )
-                    step_answers, step_artifacts = await self._fill_step_fields(
-                        page,
-                        step,
-                        settings,
-                        posting=posting,
-                        execution_id=execution_id,
-                        submission_id=submission_id,
-                        execution_events=execution_events,
-                        uploaded_cv_paths=uploaded_cv_paths,
-                        submission_cv_path=submission_cv_path,
-                        force_resume_reselection=force_resume_reselection,
-                    )
+                    try:
+                        step_answers, step_artifacts = await self._fill_step_fields(
+                            page,
+                            step,
+                            settings,
+                            posting=posting,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            execution_events=execution_events,
+                            uploaded_cv_paths=uploaded_cv_paths,
+                            submission_cv_path=submission_cv_path,
+                            force_resume_reselection=force_resume_reselection,
+                        )
+                    except MissingRequiredProfileDataError as exc:
+                        notes = str(exc)
+                        update_progress_snapshot(
+                            {
+                                "current_stage": "submit_skipped",
+                                "current_job": self._build_progress_job(
+                                    posting,
+                                    submission_id,
+                                    status=SubmissionStatus.SKIPPED.value,
+                                    skip_reason="missing_required_profile_data",
+                                ),
+                                "current_step": step.step_index + 1,
+                                "last_error": notes,
+                            },
+                        )
+                        artifacts.extend(
+                            await self._capture_debug_bundle(
+                                page,
+                                run_dir=run_dir,
+                                submission_id=submission_id,
+                                label="skip_missing_profile_data",
+                            ),
+                        )
+                        self._record_event(
+                            execution_events,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            event_type=ExecutionEventType.JOB_PROCESSED,
+                            payload={
+                                "job_posting_id": str(posting.id),
+                                "origin": origin.value,
+                                "reason": "missing_required_profile_data",
+                                "status": SubmissionStatus.SKIPPED.value,
+                                "notes": notes,
+                                "normalized_key": exc.normalized_key,
+                                "question_type": exc.question_type.value,
+                                "control_kind": exc.control_kind,
+                            },
+                        )
+                        return EasyApplyExecutionResult(
+                            submission_id=submission_id,
+                            started_at=started_at,
+                            status=SubmissionStatus.SKIPPED,
+                            resume_mode=resume_mode,
+                            target_language=target_language,
+                            matched_role_target=matched_role_target,
+                            matched_specializations=matched_specializations,
+                            notes=notes,
+                            answers=tuple(answers),
+                            execution_events=tuple(execution_events),
+                            artifacts=tuple(artifacts),
+                            recruiter_interactions=tuple(recruiter_interactions),
+                            cv_version=submission_cv_version,
+                        )
                     if force_resume_reselection and any(
                         field.question_type is QuestionType.RESUME_UPLOAD for field in step.fields
                     ):
@@ -1563,7 +1640,17 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 notes=str(exc),
             )
         finally:
-            await page.close()
+            if not page.is_closed():
+                try:
+                    await page.close()
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "linkedin_easy_apply_page_close_failed",
+                        extra={
+                            "job_posting_id": str(posting.id),
+                            "submission_id": str(submission_id),
+                        },
+                    )
 
     async def _fill_step_fields(
         self,
@@ -1750,6 +1837,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "options_preview": list(field.options[:6]),
                     },
                 )
+                if field.required and not (
+                    field.prefilled and field_has_meaningful_current_value(field)
+                ):
+                    raise MissingRequiredProfileDataError(
+                        normalized_key=field.normalized_key,
+                        question_type=field.question_type,
+                        control_kind=field.control_kind,
+                    )
                 continue
 
             applied_value = await self._apply_field_value(
@@ -7998,6 +8093,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         submission_id: UUID,
         *,
         status: str | None = None,
+        skip_reason: str | None = None,
     ) -> dict[str, str]:
         payload = {
             "job_posting_id": str(posting.id),
@@ -8009,6 +8105,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
         }
         if status is not None:
             payload["status"] = status
+        if skip_reason is not None:
+            payload["skip_reason"] = skip_reason
         return payload
 
     def _record_event(

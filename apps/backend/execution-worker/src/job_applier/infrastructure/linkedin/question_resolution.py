@@ -262,6 +262,60 @@ def _looks_like_salary_expectation_text(normalized: str) -> bool:
     )
 
 
+def _looks_like_current_salary_question(normalized: str) -> bool:
+    return any(
+        term in normalized
+        for term in (
+            "current salary",
+            "last salary",
+            "current compensation",
+            "last compensation",
+            "current pay",
+            "last pay",
+            "salario atual",
+            "salario atual/ultimo",
+            "salario atual ultimo",
+            "ultimo salario",
+            "salario anterior",
+            "remuneracao atual",
+            "remuneracao ultima",
+            "informe seu salario atual",
+            "informe seu salario atual/ultimo",
+        )
+    )
+
+
+def _looks_like_current_benefits_question(normalized: str) -> bool:
+    return any(
+        term in normalized
+        for term in (
+            "current benefits",
+            "last benefits",
+            "beneficios atuais",
+            "beneficios atuais/ultimos",
+            "beneficios atuais ultimos",
+            "ultimos beneficios",
+            "beneficios anteriores",
+            "informe seus beneficios atuais",
+            "informe seus beneficios atuais/ultimos",
+        )
+    )
+
+
+def _looks_like_brazilian_tax_id_question(normalized: str) -> bool:
+    return any(
+        term in normalized
+        for term in (
+            "cpf",
+            "cadastro de pessoas fisicas",
+            "tax id",
+            "tax identifier",
+            "social security number",
+            "ssn",
+        )
+    )
+
+
 def field_reference(field: EasyApplyField) -> str:
     """Return the most stable reference we have for one extracted field."""
 
@@ -558,6 +612,27 @@ class LinkedInQuestionClassifier:
                 confidence=0.95,
                 matched_rule="salary_expectation",
             )
+        if self._looks_like_current_salary_question(normalized):
+            return QuestionClassification(
+                question_type=QuestionType.FREE_TEXT_GENERIC,
+                normalized_key="current_salary",
+                confidence=0.9,
+                matched_rule="current_salary",
+            )
+        if self._looks_like_current_benefits_question(normalized):
+            return QuestionClassification(
+                question_type=QuestionType.FREE_TEXT_GENERIC,
+                normalized_key="current_benefits",
+                confidence=0.88,
+                matched_rule="current_benefits",
+            )
+        if self._looks_like_brazilian_tax_id_question(normalized):
+            return QuestionClassification(
+                question_type=QuestionType.FREE_TEXT_GENERIC,
+                normalized_key="cpf",
+                confidence=0.98,
+                matched_rule="cpf",
+            )
         if self._looks_like_referral_source_question(normalized):
             return QuestionClassification(
                 question_type=QuestionType.FREE_TEXT_GENERIC,
@@ -803,12 +878,24 @@ class LinkedInQuestionClassifier:
             "current employer",
             "company where you work",
             "company you work for",
+            "currently work at",
+            "work currently at",
             "empresa onde voce trabalha",
             "empresa onde vc trabalha",
             "empresa em que voce trabalha",
             "empresa atual",
             "empregador atual",
+            "trabalha atualmente",
         )
+
+    def _looks_like_current_salary_question(self, normalized_question: str) -> bool:
+        return _looks_like_current_salary_question(normalized_question)
+
+    def _looks_like_current_benefits_question(self, normalized_question: str) -> bool:
+        return _looks_like_current_benefits_question(normalized_question)
+
+    def _looks_like_brazilian_tax_id_question(self, normalized_question: str) -> bool:
+        return _looks_like_brazilian_tax_id_question(normalized_question)
 
     def _looks_like_workplace_availability_question(self, normalized_question: str) -> bool:
         return self._contains_any(
@@ -1837,28 +1924,33 @@ class LinkedInAnswerResolver:
         if not settings.ruleset.allow_best_effort_autofill:
             return None
 
-        ai_answer = await self._generate_ai_answer(field=field, settings=settings, posting=posting)
-        if ai_answer is not None:
-            if _answer_uses_target_employer_for_candidate_field(
+        if _field_allows_ambiguous_autofill(field):
+            ai_answer = await self._generate_ai_answer(
                 field=field,
-                answer=ai_answer.value,
+                settings=settings,
                 posting=posting,
-            ):
-                ai_answer = None
-            elif _answer_matches_unreliable_negative_option_label(
-                field=field,
-                answer=ai_answer.value,
-            ):
-                ai_answer = None
-            else:
-                return ResolvedFieldValue(
-                    value=ai_answer.value,
-                    answer_source=AnswerSource.AI,
-                    fill_strategy=FillStrategy.AUTOFILL_AI,
-                    ambiguity_flag=True,
-                    confidence=ai_answer.confidence,
-                    reasoning=ai_answer.reasoning,
-                )
+            )
+            if ai_answer is not None:
+                if _answer_uses_target_employer_for_candidate_field(
+                    field=field,
+                    answer=ai_answer.value,
+                    posting=posting,
+                ):
+                    ai_answer = None
+                elif _answer_matches_unreliable_negative_option_label(
+                    field=field,
+                    answer=ai_answer.value,
+                ):
+                    ai_answer = None
+                else:
+                    return ResolvedFieldValue(
+                        value=ai_answer.value,
+                        answer_source=AnswerSource.AI,
+                        fill_strategy=FillStrategy.AUTOFILL_AI,
+                        ambiguity_flag=True,
+                        confidence=ai_answer.confidence,
+                        reasoning=ai_answer.reasoning,
+                    )
 
         guardrail_answer = self._resolve_guardrail_fallback(field, settings)
         if guardrail_answer is None:
@@ -1907,6 +1999,7 @@ class LinkedInAnswerResolver:
 
         if (
             settings.ruleset.allow_best_effort_autofill
+            and _field_allows_ambiguous_autofill(adapted_field)
             and not _looks_like_sensitive_demographic_question(adapted_field)
         ):
             feedback_ai_answer = await self._generate_ai_answer(
@@ -2356,6 +2449,16 @@ class LinkedInAnswerResolver:
     ) -> GuardrailAnswer | None:
         profile = settings.profile
         normalized_question = normalize_text(field.question_raw)
+        normalized_key = normalize_key(field.normalized_key)
+
+        if normalized_key in {"current_employer", "current_salary", "current_benefits", "cpf"}:
+            return None
+        if _looks_like_current_salary_question(normalized_question):
+            return None
+        if _looks_like_current_benefits_question(normalized_question):
+            return None
+        if _looks_like_brazilian_tax_id_question(normalized_question):
+            return None
 
         if field.question_type is QuestionType.RESUME_UPLOAD:
             cv_path = _non_empty_value(profile.cv_path)
@@ -2383,7 +2486,6 @@ class LinkedInAnswerResolver:
                 confidence=0.58,
                 reasoning="competitive_capability_inference",
             )
-        normalized_key = normalize_key(field.normalized_key)
         if normalized_key in {"first_name", "given_name", "forename"}:
             first_name = _non_empty_value(_profile_first_name(profile.name))
             if first_name is None:
@@ -2419,12 +2521,6 @@ class LinkedInAnswerResolver:
                 value=phone_country_code,
                 confidence=0.7,
                 reasoning="guardrail_phone_country_code",
-            )
-        if _looks_like_current_employer_question(field):
-            return GuardrailAnswer(
-                value="Freelancer",
-                confidence=0.24,
-                reasoning="guardrail_unknown_current_employer",
             )
         if field.options and _looks_like_language_proficiency_question(field):
             proficiency_option = _pick_conservative_language_proficiency_option(field.options)
@@ -2694,6 +2790,23 @@ def _field_response_contract(field: EasyApplyField) -> dict[str, bool]:
 
 
 def _field_allows_ambiguous_autofill(field: EasyApplyField) -> bool:
+    normalized_key = normalize_key(field.normalized_key)
+    if (
+        normalized_key == "salary_expectation"
+        or field.question_type is QuestionType.SALARY_EXPECTATION
+    ):
+        return False
+    if normalized_key == "current_employer" or _looks_like_current_employer_question(field):
+        return False
+    normalized_question = normalize_text(f"{field.question_raw} {field.normalized_key}")
+    if normalized_key in {"current_salary", "current_benefits", "cpf"}:
+        return False
+    if _looks_like_current_salary_question(normalized_question):
+        return False
+    if _looks_like_current_benefits_question(normalized_question):
+        return False
+    if _looks_like_brazilian_tax_id_question(normalized_question):
+        return False
     if field.question_type in {QuestionType.FREE_TEXT_GENERIC, QuestionType.UNKNOWN}:
         if field.control_kind in {"radio", "select", "checkbox"}:
             return bool(field.options)
@@ -3132,11 +3245,14 @@ def _looks_like_current_employer_question(field: EasyApplyField) -> bool:
             "current employer",
             "company where you work",
             "company you work for",
+            "currently work at",
+            "work currently at",
             "empresa onde voce trabalha",
             "empresa onde vc trabalha",
             "empresa em que voce trabalha",
             "empresa atual",
             "empregador atual",
+            "trabalha atualmente",
         )
     )
 

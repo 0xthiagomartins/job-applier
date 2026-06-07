@@ -60,6 +60,54 @@ class LinkedInQuestionClassifierTests(unittest.TestCase):
         self.assertEqual(classification.normalized_key, "current_employer")
         self.assertEqual(classification.matched_rule, "current_employer")
 
+    def test_classifies_current_employer_yes_no_question(self) -> None:
+        classification = self.classifier.classify(
+            question_raw="Você trabalha atualmente no Inter?",
+            control_kind="select",
+            input_type="select",
+            options=("Sim", "Não"),
+        )
+
+        self.assertEqual(classification.question_type, QuestionType.FREE_TEXT_GENERIC)
+        self.assertEqual(classification.normalized_key, "current_employer")
+        self.assertEqual(classification.matched_rule, "current_employer")
+
+    def test_classifies_current_salary_question(self) -> None:
+        classification = self.classifier.classify(
+            question_raw="Informe seu salário atual/último:",
+            control_kind="text",
+            input_type="text",
+            options=(),
+        )
+
+        self.assertEqual(classification.question_type, QuestionType.FREE_TEXT_GENERIC)
+        self.assertEqual(classification.normalized_key, "current_salary")
+        self.assertEqual(classification.matched_rule, "current_salary")
+
+    def test_classifies_current_benefits_question(self) -> None:
+        classification = self.classifier.classify(
+            question_raw="Informe seus Benefícios atuais/últimos:",
+            control_kind="text",
+            input_type="text",
+            options=(),
+        )
+
+        self.assertEqual(classification.question_type, QuestionType.FREE_TEXT_GENERIC)
+        self.assertEqual(classification.normalized_key, "current_benefits")
+        self.assertEqual(classification.matched_rule, "current_benefits")
+
+    def test_classifies_cpf_question(self) -> None:
+        classification = self.classifier.classify(
+            question_raw="CPF",
+            control_kind="text",
+            input_type="text",
+            options=(),
+        )
+
+        self.assertEqual(classification.question_type, QuestionType.FREE_TEXT_GENERIC)
+        self.assertEqual(classification.normalized_key, "cpf")
+        self.assertEqual(classification.matched_rule, "cpf")
+
     def test_does_not_misclassify_workplace_availability_as_start_date(self) -> None:
         classification = self.classifier.classify(
             question_raw=(
@@ -318,7 +366,20 @@ class LinkedInAnswerResolverRateLimitTests(unittest.IsolatedAsyncioTestCase):
         )
         posting = _build_posting()
         field = EasyApplyField(
-            question_raw="What is your current company?",
+            question_raw="How many years of Python experience do you have?",
+            normalized_key="python_years_experience",
+            question_type=QuestionType.YEARS_EXPERIENCE,
+            control_kind="text",
+            input_type="number",
+            required=True,
+        )
+
+        with self.assertRaises(OpenAIResponsesRateLimitError):
+            await resolver.resolve(field, settings, posting=posting)
+
+    async def test_required_current_employer_without_profile_fact_stays_unresolved(self) -> None:
+        field = EasyApplyField(
+            question_raw="Confirm the name of the company where you work",
             normalized_key="current_employer",
             question_type=QuestionType.FREE_TEXT_GENERIC,
             control_kind="text",
@@ -326,8 +387,90 @@ class LinkedInAnswerResolverRateLimitTests(unittest.IsolatedAsyncioTestCase):
             required=True,
         )
 
-        with self.assertRaises(OpenAIResponsesRateLimitError):
-            await resolver.resolve(field, settings, posting=posting)
+        resolved = await self.resolver.resolve(
+            field,
+            self.settings,
+            posting=self.posting,
+        )
+
+        self.assertIsNone(resolved)
+        self.assertEqual(self.generator.calls, 0)
+
+    async def test_required_salary_expectation_without_profile_fact_stays_unresolved(self) -> None:
+        field = EasyApplyField(
+            question_raw="What is your salary expectation?",
+            normalized_key="salary_expectation",
+            question_type=QuestionType.SALARY_EXPECTATION,
+            control_kind="text",
+            input_type="text",
+            required=True,
+        )
+
+        resolved = await self.resolver.resolve(
+            field,
+            self.settings,
+            posting=self.posting,
+        )
+
+        self.assertIsNone(resolved)
+        self.assertEqual(self.generator.calls, 0)
+
+    async def test_required_current_salary_without_profile_fact_stays_unresolved(self) -> None:
+        field = EasyApplyField(
+            question_raw="Informe seu salário atual/último:",
+            normalized_key="current_salary",
+            question_type=QuestionType.FREE_TEXT_GENERIC,
+            control_kind="text",
+            input_type="text",
+            required=True,
+        )
+
+        resolved = await self.resolver.resolve(
+            field,
+            self.settings,
+            posting=self.posting,
+        )
+
+        self.assertIsNone(resolved)
+        self.assertEqual(self.generator.calls, 0)
+
+    async def test_optional_current_benefits_without_profile_fact_stays_unresolved(self) -> None:
+        field = EasyApplyField(
+            question_raw="Informe seus Benefícios atuais/últimos:",
+            normalized_key="current_benefits",
+            question_type=QuestionType.FREE_TEXT_GENERIC,
+            control_kind="text",
+            input_type="text",
+            required=False,
+        )
+
+        resolved = await self.resolver.resolve(
+            field,
+            self.settings,
+            posting=self.posting,
+        )
+
+        self.assertIsNone(resolved)
+        self.assertEqual(self.generator.calls, 0)
+
+    async def test_required_cpf_without_profile_fact_stays_unresolved(self) -> None:
+        field = EasyApplyField(
+            question_raw="CPF",
+            normalized_key="cpf",
+            question_type=QuestionType.FREE_TEXT_GENERIC,
+            control_kind="text",
+            input_type="text",
+            required=True,
+        )
+
+        resolved = await self.resolver.resolve(
+            field,
+            self.settings,
+            posting=self.posting,
+        )
+
+        self.assertIsNone(resolved)
+        self.assertEqual(self.generator.calls, 0)
 
     async def test_optional_disability_type_question_stays_blank_without_opt_out(self) -> None:
         field = EasyApplyField(
