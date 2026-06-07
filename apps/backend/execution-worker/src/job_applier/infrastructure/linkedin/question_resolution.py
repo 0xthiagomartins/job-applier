@@ -12,6 +12,10 @@ from typing import Literal, Protocol, cast
 from urllib import error, request
 
 from job_applier.application.config import UserAgentSettings
+from job_applier.application.panel import (
+    PRIVATE_METADATA_DISPLAY_LABELS,
+    normalize_private_metadata_key,
+)
 from job_applier.domain.entities import JobPosting
 from job_applier.domain.enums import AnswerSource, FillStrategy, QuestionType
 from job_applier.infrastructure.candidate_capabilities import (
@@ -91,6 +95,19 @@ _NUMERIC_VALIDATION_TOKENS = frozenset(
         "numerico",
         "inteiro",
     }
+)
+_PRIVATE_METADATA_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("cpf", ("cpf", "tax id", "taxid", "cadastro de pessoas fisicas")),
+    ("rg", (" rg ", "documento de identidade", "identity document", "registro geral")),
+    ("father_name", ("nome do pai", " father ", "pai")),
+    ("mother_name", ("nome da mae", "nome da mãe", " mother ", "mae", "mãe")),
+    ("birth_date", ("data de nascimento", "date of birth", "birth date", "dob", "nascimento")),
+    ("current_employer", ("current employer", "empresa atual", "empregador atual")),
+    ("current_salary", ("current salary", "salario atual", "salário atual", "ultimo salario")),
+    (
+        "current_benefits",
+        ("current benefits", "beneficios atuais", "benefícios atuais", "ultimos beneficios"),
+    ),
 )
 
 STRUCTURED_OUTPUT_SCHEMA = {
@@ -1123,6 +1140,110 @@ def _build_candidate_profile_payload(settings: UserAgentSettings) -> dict[str, o
     }
 
 
+def _select_relevant_private_metadata(
+    *,
+    field: EasyApplyField,
+    settings: UserAgentSettings,
+) -> dict[str, str]:
+    if not settings.private_metadata.consent_to_ai_usage:
+        return {}
+    if not settings.private_metadata.entries:
+        return {}
+
+    matched_keys: set[str] = set()
+    normalized_field_key = normalize_private_metadata_key(field.normalized_key)
+    if normalized_field_key in settings.private_metadata.entries:
+        matched_keys.add(normalized_field_key)
+
+    normalized_question = f" {normalize_text(field.question_raw)} "
+    normalized_context = f" {normalize_text(field.field_context)} "
+    normalized_helper = f" {normalize_text(field.helper_text or '')} "
+    combined = " ".join((normalized_question, normalized_context, normalized_helper))
+    for canonical_key, hints in _PRIVATE_METADATA_HINTS:
+        if canonical_key in settings.private_metadata.entries and any(
+            hint in combined for hint in hints
+        ):
+            matched_keys.add(canonical_key)
+
+    return {
+        key: value
+        for key, value in sorted(settings.private_metadata.entries.items())
+        if key in matched_keys and value.strip()
+    }
+
+
+def _private_metadata_summary_for_prompt(
+    private_metadata: dict[str, str],
+) -> dict[str, object] | None:
+    if not private_metadata:
+        return None
+    return {
+        "values": private_metadata,
+        "labels": {
+            key: PRIVATE_METADATA_DISPLAY_LABELS.get(key, key.replace("_", " ").title())
+            for key in private_metadata
+        },
+        "usage_policy": [
+            "These values were explicitly provided by the user outside the base resume.",
+            "Use only the fields directly relevant to the current application question.",
+            "Do not mention unrelated private metadata in the answer.",
+        ],
+    }
+
+
+def _redact_private_metadata_prompt_payload(payload: dict[str, object]) -> dict[str, object]:
+    sanitized = cast(dict[str, object], json.loads(json.dumps(payload, ensure_ascii=True)))
+    private_context = sanitized.get("private_metadata_context")
+    if isinstance(private_context, dict):
+        values = private_context.get("values")
+        if isinstance(values, dict):
+            private_context["values"] = {key: "[REDACTED]" for key in values}
+    private_context_by_field = sanitized.get("private_metadata_context_by_field")
+    if isinstance(private_context_by_field, dict):
+        redacted_context: dict[str, object] = {}
+        for field_ref, context in private_context_by_field.items():
+            if not isinstance(context, dict):
+                redacted_context[str(field_ref)] = context
+                continue
+            values = context.get("values")
+            redacted_context[str(field_ref)] = {
+                **context,
+                "values": (
+                    {key: "[REDACTED]" for key in values} if isinstance(values, dict) else values
+                ),
+            }
+        sanitized["private_metadata_context_by_field"] = redacted_context
+    return sanitized
+
+
+def _redact_private_metadata_response_text(
+    response_text: str,
+    *,
+    field_ref_allowlist: set[str] | None = None,
+) -> str:
+    if not response_text.strip():
+        return response_text
+    try:
+        payload = json.loads(response_text)
+    except json.JSONDecodeError:
+        return "[REDACTED_PRIVATE_METADATA_RESPONSE]"
+
+    if isinstance(payload, dict):
+        if "answer" in payload:
+            payload["answer"] = "[REDACTED]"
+        field_plans = payload.get("field_plans")
+        if isinstance(field_plans, list):
+            for item in field_plans:
+                if not isinstance(item, dict):
+                    continue
+                field_ref = str(item.get("field_ref") or "")
+                if field_ref_allowlist is None or field_ref in field_ref_allowlist:
+                    if "answer" in item:
+                        item["answer"] = "[REDACTED]"
+        return json.dumps(payload, ensure_ascii=True)
+    return "[REDACTED_PRIVATE_METADATA_RESPONSE]"
+
+
 def _extract_openai_output_text(response_data: dict[str, object]) -> str:
     direct_output = response_data.get("output_text")
     if isinstance(direct_output, str):
@@ -1205,7 +1326,7 @@ class OpenAISemanticStepPlanner:
                 "total_steps": total_steps,
                 "candidate_field_refs": [field_reference(field) for field in candidate_fields],
                 "model": settings.ai.model,
-                "prompt_payload": prompt_payload,
+                "prompt_payload": _redact_private_metadata_prompt_payload(prompt_payload),
             },
         )
 
@@ -1226,13 +1347,27 @@ class OpenAISemanticStepPlanner:
             return None
 
         raw_output = _extract_openai_output_text(response_data)
+        private_metadata_context_by_field = prompt_payload.get("private_metadata_context_by_field")
+        field_ref_allowlist = (
+            set(private_metadata_context_by_field)
+            if isinstance(private_metadata_context_by_field, dict)
+            and private_metadata_context_by_field
+            else None
+        )
         logger.info(
             "linkedin_easy_apply_semantic_step_response",
             extra={
                 "step_index": step_index,
                 "total_steps": total_steps,
                 "model": settings.ai.model,
-                "response_text": raw_output,
+                "response_text": (
+                    _redact_private_metadata_response_text(
+                        raw_output,
+                        field_ref_allowlist=field_ref_allowlist,
+                    )
+                    if field_ref_allowlist
+                    else raw_output
+                ),
             },
         )
         if not raw_output:
@@ -1243,7 +1378,17 @@ class OpenAISemanticStepPlanner:
         except json.JSONDecodeError:
             logger.warning(
                 "linkedin_easy_apply_semantic_step_invalid_json",
-                extra={"step_index": step_index, "response_text": raw_output},
+                extra={
+                    "step_index": step_index,
+                    "response_text": (
+                        _redact_private_metadata_response_text(
+                            raw_output,
+                            field_ref_allowlist=field_ref_allowlist,
+                        )
+                        if field_ref_allowlist
+                        else raw_output
+                    ),
+                },
             )
             return None
 
@@ -1319,7 +1464,10 @@ class OpenAISemanticStepPlanner:
                                 "conservative plausible answer only for low-risk application "
                                 "questions, and leave answer null for legal, certification, visa, "
                                 "or compliance facts you cannot support. Never invent personal "
-                                "facts that contradict the visible candidate profile. When a "
+                                "facts that contradict the visible candidate profile. When the "
+                                "prompt includes private_metadata_context_by_field, treat those "
+                                "values as explicitly user-provided facts for the matching field "
+                                "only. When a "
                                 "required free-text field is just a conditional follow-up like "
                                 "'if yes, provide details' and the conservative gate answer is "
                                 "negative or not applicable, use a short neutral placeholder "
@@ -1389,8 +1537,12 @@ class OpenAISemanticStepPlanner:
         posting: JobPosting,
     ) -> dict[str, object]:
         candidate_refs = {field_reference(field) for field in candidate_fields}
+        private_metadata_context_by_field: dict[str, object] = {}
         serialized_fields: list[dict[str, object]] = []
         for field in fields:
+            relevant_private_metadata = _private_metadata_summary_for_prompt(
+                _select_relevant_private_metadata(field=field, settings=settings)
+            )
             serialized_fields.append(
                 {
                     "field_ref": field_reference(field),
@@ -1419,6 +1571,10 @@ class OpenAISemanticStepPlanner:
                     ),
                 }
             )
+            if relevant_private_metadata is not None:
+                private_metadata_context_by_field[field_reference(field)] = (
+                    relevant_private_metadata
+                )
         job_language = detect_job_posting_language(
             posting,
             default_language=settings.profile.preferred_language,
@@ -1438,7 +1594,7 @@ class OpenAISemanticStepPlanner:
             default_language=settings.profile.preferred_language,
             source="easy_apply_step",
         )
-        return {
+        prompt_payload: dict[str, object] = {
             "step_index": step_index + 1,
             "total_steps": total_steps,
             "surface_text": _truncate_prompt_text(surface_text, limit=1600),
@@ -1475,6 +1631,9 @@ class OpenAISemanticStepPlanner:
                 "Avoid null answers only when a reasonable low-risk answer is clearly supported.",
             ],
         }
+        if private_metadata_context_by_field:
+            prompt_payload["private_metadata_context_by_field"] = private_metadata_context_by_field
+        return prompt_payload
 
 
 class OpenAIResponsesAnswerGenerator:
@@ -1494,7 +1653,7 @@ class OpenAIResponsesAnswerGenerator:
 
         if settings.ai.api_key is None:
             return None
-        if not _field_allows_ambiguous_autofill(field):
+        if not _field_allows_ambiguous_autofill(field, settings=settings):
             return None
 
         prompt_payload = self._build_prompt_payload(
@@ -1509,7 +1668,7 @@ class OpenAIResponsesAnswerGenerator:
                 "normalized_key": field.normalized_key,
                 "question_type": field.question_type.value,
                 "model": settings.ai.model,
-                "prompt_payload": prompt_payload,
+                "prompt_payload": _redact_private_metadata_prompt_payload(prompt_payload),
             },
         )
 
@@ -1534,13 +1693,18 @@ class OpenAIResponsesAnswerGenerator:
             return None
 
         raw_output = _extract_openai_output_text(response_data)
+        private_metadata_context = prompt_payload.get("private_metadata_context")
         logger.info(
             "linkedin_ai_autofill_response",
             extra={
                 "normalized_key": field.normalized_key,
                 "question_type": field.question_type.value,
                 "model": settings.ai.model,
-                "response_text": raw_output,
+                "response_text": (
+                    _redact_private_metadata_response_text(raw_output)
+                    if isinstance(private_metadata_context, dict) and private_metadata_context
+                    else raw_output
+                ),
             },
         )
 
@@ -1551,7 +1715,14 @@ class OpenAIResponsesAnswerGenerator:
         except json.JSONDecodeError:
             logger.warning(
                 "linkedin_ai_autofill_invalid_json",
-                extra={"normalized_key": field.normalized_key, "response_text": raw_output},
+                extra={
+                    "normalized_key": field.normalized_key,
+                    "response_text": (
+                        _redact_private_metadata_response_text(raw_output)
+                        if isinstance(private_metadata_context, dict) and private_metadata_context
+                        else raw_output
+                    ),
+                },
             )
             return None
 
@@ -1619,6 +1790,8 @@ class OpenAIResponsesAnswerGenerator:
                                 "For language proficiency ladders, prefer conservative middle "
                                 "options such as intermediate when exact data is missing. "
                                 "Do not invent legal, visa, or certification facts. "
+                                "When the prompt includes private_metadata_context, treat those "
+                                "values as explicitly user-provided facts only for this field. "
                                 "Keep free-text answers concise, professional, and believable. "
                                 "When a required free-text field is only asking for details in "
                                 "the 'if yes' case and that condition does not apply, answer "
@@ -1772,6 +1945,11 @@ class OpenAIResponsesAnswerGenerator:
             },
             "candidate_profile": _build_candidate_profile_payload(settings),
         }
+        relevant_private_metadata = _private_metadata_summary_for_prompt(
+            _select_relevant_private_metadata(field=field, settings=settings)
+        )
+        if relevant_private_metadata is not None:
+            prompt_payload["private_metadata_context"] = relevant_private_metadata
         if validation_context is not None and any(
             (
                 _non_empty_value(validation_context.validation_message),
@@ -1924,7 +2102,7 @@ class LinkedInAnswerResolver:
         if not settings.ruleset.allow_best_effort_autofill:
             return None
 
-        if _field_allows_ambiguous_autofill(field):
+        if _field_allows_ambiguous_autofill(field, settings=settings):
             ai_answer = await self._generate_ai_answer(
                 field=field,
                 settings=settings,
@@ -1999,7 +2177,7 @@ class LinkedInAnswerResolver:
 
         if (
             settings.ruleset.allow_best_effort_autofill
-            and _field_allows_ambiguous_autofill(adapted_field)
+            and _field_allows_ambiguous_autofill(adapted_field, settings=settings)
             and not _looks_like_sensitive_demographic_question(adapted_field)
         ):
             feedback_ai_answer = await self._generate_ai_answer(
@@ -2091,7 +2269,7 @@ class LinkedInAnswerResolver:
     ) -> ResolvedFieldValue | None:
         if semantic_plan is None:
             return None
-        if not _field_allows_ambiguous_autofill(field):
+        if not _field_allows_ambiguous_autofill(field, settings=settings):
             return None
 
         planned_value = semantic_plan.answer
@@ -2789,23 +2967,37 @@ def _field_response_contract(field: EasyApplyField) -> dict[str, bool]:
     }
 
 
-def _field_allows_ambiguous_autofill(field: EasyApplyField) -> bool:
+def _field_allows_ambiguous_autofill(
+    field: EasyApplyField,
+    *,
+    settings: UserAgentSettings | None = None,
+) -> bool:
     normalized_key = normalize_key(field.normalized_key)
+    relevant_private_metadata = (
+        _select_relevant_private_metadata(field=field, settings=settings)
+        if settings is not None
+        else {}
+    )
     if (
         normalized_key == "salary_expectation"
         or field.question_type is QuestionType.SALARY_EXPECTATION
     ):
         return False
-    if normalized_key == "current_employer" or _looks_like_current_employer_question(field):
+    if (
+        normalized_key == "current_employer" or _looks_like_current_employer_question(field)
+    ) and not relevant_private_metadata:
         return False
     normalized_question = normalize_text(f"{field.question_raw} {field.normalized_key}")
-    if normalized_key in {"current_salary", "current_benefits", "cpf"}:
+    if (
+        normalized_key in {"current_salary", "current_benefits", "cpf"}
+        and not relevant_private_metadata
+    ):
         return False
-    if _looks_like_current_salary_question(normalized_question):
+    if _looks_like_current_salary_question(normalized_question) and not relevant_private_metadata:
         return False
-    if _looks_like_current_benefits_question(normalized_question):
+    if _looks_like_current_benefits_question(normalized_question) and not relevant_private_metadata:
         return False
-    if _looks_like_brazilian_tax_id_question(normalized_question):
+    if _looks_like_brazilian_tax_id_question(normalized_question) and not relevant_private_metadata:
         return False
     if field.question_type in {QuestionType.FREE_TEXT_GENERIC, QuestionType.UNKNOWN}:
         if field.control_kind in {"radio", "select", "checkbox"}:

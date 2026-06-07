@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
+from collections import Counter
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -38,6 +41,64 @@ TIMEZONE_OPTIONS = (
     "America/Los_Angeles",
     "Europe/London",
 )
+
+PRIVATE_METADATA_AI_USAGE_WARNING = (
+    "Sensitive metadata may be used in future Easy Apply runs and may be sent to OpenAI "
+    "when needed to answer unresolved application fields. Review carefully before saving."
+)
+
+PRIVATE_METADATA_DISPLAY_LABELS: dict[str, str] = {
+    "cpf": "CPF",
+    "rg": "RG",
+    "father_name": "Nome do pai",
+    "mother_name": "Nome da mãe",
+    "birth_date": "Data de nascimento",
+    "current_employer": "Empresa atual",
+    "current_salary": "Salário atual/último",
+    "current_benefits": "Benefícios atuais/últimos",
+}
+
+_PRIVATE_METADATA_KEY_ALIASES: dict[str, str] = {
+    "cpf": "cpf",
+    "cadastro_de_pessoas_fisicas": "cpf",
+    "tax_id": "cpf",
+    "taxid": "cpf",
+    "documento_cpf": "cpf",
+    "rg": "rg",
+    "registro_geral": "rg",
+    "identity_document": "rg",
+    "documento_de_identidade": "rg",
+    "pai": "father_name",
+    "nome_do_pai": "father_name",
+    "father": "father_name",
+    "father_name": "father_name",
+    "mae": "mother_name",
+    "mãe": "mother_name",
+    "nome_da_mae": "mother_name",
+    "nome_da_mãe": "mother_name",
+    "mother": "mother_name",
+    "mother_name": "mother_name",
+    "data_de_nascimento": "birth_date",
+    "nascimento": "birth_date",
+    "birth_date": "birth_date",
+    "date_of_birth": "birth_date",
+    "dob": "birth_date",
+    "current_employer": "current_employer",
+    "empresa_atual": "current_employer",
+    "empregador_atual": "current_employer",
+    "current_salary": "current_salary",
+    "salario_atual": "current_salary",
+    "salário_atual": "current_salary",
+    "ultimo_salario": "current_salary",
+    "último_salário": "current_salary",
+    "current_benefits": "current_benefits",
+    "beneficios_atuais": "current_benefits",
+    "benefícios_atuais": "current_benefits",
+    "ultimos_beneficios": "current_benefits",
+    "últimos_benefícios": "current_benefits",
+}
+
+_MISSING_PRIVATE_METADATA_NOTE_PATTERN = re.compile(r"normalized_key=([a-z0-9_]+)")
 
 
 class PanelModel(BaseModel):
@@ -100,6 +161,87 @@ def parse_text_mapping_lines(raw: str) -> dict[str, str]:
     """Parse `key=value` lines whose values remain as text."""
 
     return cast(dict[str, str], parse_mapping_lines(raw, value_type=str))
+
+
+def normalize_private_metadata_key(raw_key: str) -> str:
+    """Normalize one user-provided metadata key into a stable canonical identifier."""
+
+    normalized = unicodedata.normalize("NFKD", raw_key).encode("ascii", "ignore").decode("ascii")
+    normalized = re.sub(r"[^a-z0-9]+", "_", normalized.lower()).strip("_")
+    if not normalized:
+        msg = "Metadata keys must contain at least one alphanumeric character."
+        raise ValueError(msg)
+    return _PRIVATE_METADATA_KEY_ALIASES.get(normalized, normalized)
+
+
+def parse_private_metadata_lines(raw: str) -> dict[str, str]:
+    """Parse raw multiline sensitive metadata into normalized key/value pairs."""
+
+    parsed: dict[str, str] = {}
+    for line in raw.splitlines():
+        candidate = line.strip()
+        if not candidate:
+            continue
+        separator = "=" if "=" in candidate else ":"
+        if separator not in candidate:
+            msg = "Expected one metadata entry per line using `=` or `:`"
+            raise ValueError(msg)
+        key, value = (item.strip() for item in candidate.split(separator, maxsplit=1))
+        if not key or not value:
+            msg = "Each metadata line must include both key and value"
+            raise ValueError(msg)
+        parsed[normalize_private_metadata_key(key)] = value
+    return parsed
+
+
+def build_missing_private_metadata_feedback(notes: Iterable[str | None]) -> dict[str, object]:
+    """Aggregate recent skip notes into a user-facing missing-metadata summary."""
+
+    counts: Counter[str] = Counter()
+    total_skipped = 0
+    for note in notes:
+        if (
+            not note
+            or "Required LinkedIn Easy Apply field could not be resolved safely" not in note
+        ):
+            continue
+        match = _MISSING_PRIVATE_METADATA_NOTE_PATTERN.search(note)
+        if match is None:
+            continue
+        normalized_key = normalize_private_metadata_key(match.group(1))
+        counts[normalized_key] += 1
+        total_skipped += 1
+
+    if total_skipped == 0:
+        return {
+            "has_missing_fields": False,
+            "skipped_submission_count": 0,
+            "missing_fields": [],
+            "message": None,
+        }
+
+    missing_fields = [
+        {
+            "key": key,
+            "label": PRIVATE_METADATA_DISPLAY_LABELS.get(key, key.replace("_", " ").title()),
+            "occurrences": occurrences,
+        }
+        for key, occurrences in counts.most_common()
+    ]
+    example_labels = ", ".join(str(item["label"]) for item in missing_fields[:4])
+    message = (
+        "Nao consegui aplicar em "
+        f"{total_skipped} vaga(s) porque faltaram dados factuais que nao posso inferir com "
+        f"seguranca. Exemplos: {example_labels}. Se quiser que eu tente essas informacoes em "
+        "futuras buscas, preencha o metadata privado com cuidado porque esses dados podem ser "
+        "enviados para a OpenAI quando necessarios para responder formularios."
+    )
+    return {
+        "has_missing_fields": True,
+        "skipped_submission_count": total_skipped,
+        "missing_fields": missing_fields,
+        "message": message,
+    }
 
 
 def parse_capability_override_json(raw: str) -> dict[str, CapabilityRangeInput]:
@@ -264,6 +406,20 @@ class AIFormInput(BaseModel):
         return SecretStr(secret)
 
 
+class StoredPrivateMetadataSection(PanelModel):
+    """Persisted private metadata separate from the CV and its canonical snapshot."""
+
+    raw_text: str = ""
+    consent_to_ai_usage: bool = False
+
+
+class PrivateMetadataFormInput(BaseModel):
+    """Validated sensitive metadata payload coming from the panel."""
+
+    raw_text: str = ""
+    consent_to_ai_usage: bool = False
+
+
 class StoredScheduleSection(PanelModel):
     """Persisted schedule section."""
 
@@ -316,6 +472,9 @@ class PanelSettingsDocument(PanelModel):
     profile: StoredProfileSection = Field(default_factory=StoredProfileSection)
     preferences: StoredPreferencesSection = Field(default_factory=StoredPreferencesSection)
     ai: StoredAISection = Field(default_factory=StoredAISection)
+    private_metadata: StoredPrivateMetadataSection = Field(
+        default_factory=StoredPrivateMetadataSection
+    )
     schedule: StoredScheduleSection = Field(default_factory=StoredScheduleSection)
 
 

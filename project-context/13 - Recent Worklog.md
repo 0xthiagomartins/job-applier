@@ -41,6 +41,9 @@ This file summarizes the most relevant recent changes so a new harness does not 
 - resume-review repair now treats a re-opened resume step with the correct checked PDF as verified instead of forcing a redundant reselection loop
 - post-submit `about:blank` Jobgether/Lever flows now complete via deterministic job-page recheck
 - sensitive-question guardrails no longer false-positive on generic `drug test` yes/no questions because of substring token collisions like `cor` inside `accordance`
+- private metadata now has a separate panel/runtime flow for unresolved factual apply fields
+- panel state now reports aggregated `missing_private_metadata` feedback without exposing raw metadata values
+- the Easy Apply resolver can now use user-consented private metadata agentically through OpenAI with field-scoped context only
 
 ## Recent Real Successes
 
@@ -61,6 +64,7 @@ The main remaining area to keep validating is:
 - how much adaptive apply memory reduces OpenAI calls in repeated flows
 - how much the persisted resume snapshot reduces repeated dynamic-resume setup cost
 - how much the new 1-hour search+score cache reduces repeated full-stage validation cost
+- how often private-metadata-backed fields appear in production and which factual keys are most needed first
 
 There is no single known blocker in dynamic resume quality right now; the higher-value work is cost control and apply robustness.
 

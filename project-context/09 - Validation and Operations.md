@@ -83,6 +83,18 @@ Current recommended low-cost suite:
 2. `4422383527` `CI&T` `Senior Java/Kotlin Backend Developer, Brazil` `PT`
 3. `4420980277` `CI&T` `Senior Java Developer, Brazil` `EN`
 
+## Sensitive Metadata Validation
+
+The backend now supports a separate private-metadata flow for factual or sensitive fields that the agent cannot infer safely.
+
+Validation checklist:
+
+1. with no private metadata configured, unresolved factual fields should skip safely
+2. `GET /api/panel/state` should report aggregated `missing_private_metadata` feedback without exposing raw values
+3. `GET /api/panel/private-metadata` is the only route that may expose the raw user-managed block
+4. when consent is enabled and matching metadata exists, the Easy Apply resolver may use OpenAI with only the relevant metadata subset for the current field
+5. snapshots and panel state summaries must not contain the raw metadata values
+
 ## What “Good” Looks Like
 
 A healthy beta run should:

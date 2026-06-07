@@ -18,13 +18,14 @@ from job_applier.application.config import (
     AgentConfig,
     AIConfig,
     CapabilityRangeConfig,
+    PrivateMetadataConfig,
     RulesetConfig,
     ScheduleConfig,
     SearchConfig,
     UserAgentSettings,
     UserProfileConfig,
 )
-from job_applier.application.panel import PanelSettingsDocument
+from job_applier.application.panel import PanelSettingsDocument, parse_private_metadata_lines
 from job_applier.application.repositories import SubmissionRepository
 from job_applier.application.snapshotting import (
     SuccessfulSubmissionRecord,
@@ -364,6 +365,10 @@ def build_user_agent_settings(document: PanelSettingsDocument) -> UserAgentSetti
                 resume_css=document.profile.resume_css,
                 positive_filters=document.preferences.positive_keywords,
                 blacklist=document.preferences.negative_keywords,
+            ),
+            private_metadata=PrivateMetadataConfig(
+                entries=parse_private_metadata_lines(document.private_metadata.raw_text),
+                consent_to_ai_usage=document.private_metadata.consent_to_ai_usage,
             ),
             search=SearchConfig(
                 keywords=document.preferences.keywords,

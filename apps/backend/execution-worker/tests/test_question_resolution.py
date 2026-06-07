@@ -7,6 +7,7 @@ from pydantic import SecretStr
 from job_applier.application.config import (
     AgentConfig,
     AIConfig,
+    PrivateMetadataConfig,
     RulesetConfig,
     ScheduleConfig,
     SearchConfig,
@@ -27,7 +28,9 @@ from job_applier.infrastructure.linkedin.question_resolution import (
     GeneratedAnswer,
     LinkedInAnswerResolver,
     LinkedInQuestionClassifier,
+    OpenAIResponsesAnswerGenerator,
     OpenAIResponsesRateLimitError,
+    OpenAISemanticStepPlanner,
     SemanticFieldPlan,
 )
 
@@ -472,6 +475,46 @@ class LinkedInAnswerResolverRateLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(resolved)
         self.assertEqual(self.generator.calls, 0)
 
+    async def test_required_cpf_with_private_metadata_uses_agentic_answer(self) -> None:
+        generator = _RecordingAnswerGenerator(
+            GeneratedAnswer(
+                value="507.329.848-90",
+                confidence=0.93,
+                reasoning="user_provided_private_metadata",
+            )
+        )
+        resolver = LinkedInAnswerResolver(ambiguous_answer_generator=generator)
+        settings = _build_settings().model_copy(
+            update={
+                "ai": AIConfig(model="gpt-5", api_key=SecretStr("test-key")),
+                "private_metadata": PrivateMetadataConfig(
+                    entries={"cpf": "507.329.848-90", "mother_name": "Maria Example"},
+                    consent_to_ai_usage=True,
+                ),
+            }
+        )
+        field = EasyApplyField(
+            question_raw="CPF",
+            normalized_key="cpf",
+            question_type=QuestionType.FREE_TEXT_GENERIC,
+            control_kind="text",
+            input_type="text",
+            required=True,
+        )
+
+        resolved = await resolver.resolve(
+            field,
+            settings,
+            posting=self.posting,
+        )
+
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved.value, "507.329.848-90")
+        self.assertEqual(resolved.answer_source, AnswerSource.AI)
+        self.assertEqual(resolved.fill_strategy, FillStrategy.AUTOFILL_AI)
+        self.assertEqual(generator.calls, 1)
+
     async def test_optional_disability_type_question_stays_blank_without_opt_out(self) -> None:
         field = EasyApplyField(
             question_raw="Qual é o tipo de deficiência?",
@@ -566,6 +609,108 @@ class LinkedInAnswerResolverRateLimitTests(unittest.IsolatedAsyncioTestCase):
         assert resolved is not None
         self.assertEqual(resolved.value, "Yes")
         self.assertEqual(resolved.answer_source, AnswerSource.DEFAULT_RESPONSE)
+
+    def test_private_metadata_prompt_payload_is_field_scoped(self) -> None:
+        generator = OpenAIResponsesAnswerGenerator()
+        settings = _build_settings().model_copy(
+            update={
+                "private_metadata": PrivateMetadataConfig(
+                    entries={"cpf": "507.329.848-90", "mother_name": "Maria Example"},
+                    consent_to_ai_usage=True,
+                )
+            }
+        )
+        cpf_field = EasyApplyField(
+            question_raw="CPF",
+            normalized_key="cpf",
+            question_type=QuestionType.FREE_TEXT_GENERIC,
+            control_kind="text",
+            input_type="text",
+            required=True,
+        )
+        email_field = EasyApplyField(
+            question_raw="Email",
+            normalized_key="email",
+            question_type=QuestionType.EMAIL,
+            control_kind="text",
+            input_type="email",
+            required=True,
+        )
+
+        cpf_payload = generator._build_prompt_payload(  # noqa: SLF001
+            field=cpf_field,
+            settings=settings,
+            posting=self.posting,
+        )
+        email_payload = generator._build_prompt_payload(  # noqa: SLF001
+            field=email_field,
+            settings=settings,
+            posting=self.posting,
+        )
+
+        self.assertEqual(
+            cpf_payload["private_metadata_context"]["values"],  # type: ignore[index]
+            {"cpf": "507.329.848-90"},
+        )
+        self.assertNotIn("private_metadata_context", email_payload)
+
+    def test_semantic_step_planner_marks_private_metadata_per_matching_field(self) -> None:
+        planner = OpenAISemanticStepPlanner()
+        settings = _build_settings().model_copy(
+            update={
+                "private_metadata": PrivateMetadataConfig(
+                    entries={"cpf": "507.329.848-90", "mother_name": "Maria Example"},
+                    consent_to_ai_usage=True,
+                )
+            }
+        )
+        cpf_field = EasyApplyField(
+            question_raw="CPF",
+            normalized_key="cpf",
+            question_type=QuestionType.FREE_TEXT_GENERIC,
+            control_kind="text",
+            input_type="text",
+            required=True,
+        )
+        city_field = EasyApplyField(
+            question_raw="Cidade",
+            normalized_key="city",
+            question_type=QuestionType.CITY,
+            control_kind="text",
+            input_type="text",
+            required=True,
+        )
+
+        payload = planner._build_prompt_payload(  # noqa: SLF001
+            fields=(cpf_field, city_field),
+            candidate_fields=(cpf_field, city_field),
+            step_index=0,
+            total_steps=1,
+            surface_text="CPF e cidade",
+            settings=settings,
+            posting=self.posting,
+        )
+
+        self.assertEqual(
+            payload["private_metadata_context_by_field"],
+            {
+                "cpf": {
+                    "values": {"cpf": "507.329.848-90"},
+                    "labels": {"cpf": "CPF"},
+                    "usage_policy": [
+                        (
+                            "These values were explicitly provided by the user outside the "
+                            "base resume."
+                        ),
+                        (
+                            "Use only the fields directly relevant to the current application "
+                            "question."
+                        ),
+                        "Do not mention unrelated private metadata in the answer.",
+                    ],
+                }
+            },
+        )
 
 
 if __name__ == "__main__":

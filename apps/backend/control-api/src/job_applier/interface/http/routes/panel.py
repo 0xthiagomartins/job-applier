@@ -13,20 +13,25 @@ from job_applier.application.agent_execution import (
     build_user_agent_settings,
 )
 from job_applier.application.panel import (
+    PRIVATE_METADATA_AI_USAGE_WARNING,
     SCHEDULE_FREQUENCY_OPTIONS,
     SUPPORTED_LANGUAGE_OPTIONS,
     TIMEZONE_OPTIONS,
     AIFormInput,
     PreferencesFormInput,
+    PrivateMetadataFormInput,
     ProfileFormInput,
     ResumeSourceSnapshotUpdateInput,
     ScheduleFormInput,
+    build_missing_private_metadata_feedback,
     calculate_next_execution_at,
     parse_capability_override_json,
     parse_csv_lines,
     parse_int_mapping_lines,
+    parse_private_metadata_lines,
     parse_text_mapping_lines,
 )
+from job_applier.application.repositories import SubmissionRepository
 from job_applier.domain.enums import (
     ResumeMode,
     ScheduleFrequency,
@@ -46,10 +51,39 @@ from job_applier.infrastructure.resume_dynamic import (
 from job_applier.interface.http.dependencies import (
     get_panel_settings_store,
     get_resume_source_snapshot_repository,
+    get_submission_repository,
 )
 from job_applier.settings import get_runtime_settings
 
 api_router = APIRouter(prefix="/api/panel", tags=["panel-api"])
+
+
+def _private_metadata_response(raw_text: str, consent_to_ai_usage: bool) -> dict[str, object]:
+    parse_error: str | None = None
+    try:
+        entries = parse_private_metadata_lines(raw_text)
+    except ValueError as exc:
+        entries = {}
+        parse_error = str(exc)
+    return {
+        "raw_text": raw_text,
+        "consent_to_ai_usage": consent_to_ai_usage,
+        "has_entries": bool(entries),
+        "stored_keys": sorted(entries),
+        "ai_usage_warning": PRIVATE_METADATA_AI_USAGE_WARNING,
+        "parse_error": parse_error,
+    }
+
+
+def _private_metadata_state_summary(raw_text: str, consent_to_ai_usage: bool) -> dict[str, object]:
+    response = _private_metadata_response(raw_text, consent_to_ai_usage)
+    return {
+        "consent_to_ai_usage": response["consent_to_ai_usage"],
+        "has_entries": response["has_entries"],
+        "stored_keys": response["stored_keys"],
+        "ai_usage_warning": response["ai_usage_warning"],
+        "parse_error": response["parse_error"],
+    }
 
 
 def _resume_source_snapshot_response(
@@ -133,6 +167,47 @@ async def get_profile(
     )
 
 
+@api_router.get("/private-metadata")
+async def get_private_metadata(
+    store: Annotated[LocalPanelSettingsStore, Depends(get_panel_settings_store)],
+) -> JSONResponse:
+    """Return the persisted private metadata section."""
+
+    document = store.load()
+    return JSONResponse(
+        content={
+            "private_metadata": _private_metadata_response(
+                document.private_metadata.raw_text,
+                document.private_metadata.consent_to_ai_usage,
+            )
+        }
+    )
+
+
+@api_router.put("/private-metadata")
+async def save_private_metadata(
+    payload: PrivateMetadataFormInput,
+    store: Annotated[LocalPanelSettingsStore, Depends(get_panel_settings_store)],
+) -> JSONResponse:
+    """Persist user-provided private metadata used by future Easy Apply runs."""
+
+    try:
+        parse_private_metadata_lines(payload.raw_text)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    document = store.save_private_metadata(payload)
+    return JSONResponse(
+        content={
+            "message": "Private metadata saved successfully.",
+            "private_metadata": _private_metadata_response(
+                document.private_metadata.raw_text,
+                document.private_metadata.consent_to_ai_usage,
+            ),
+        }
+    )
+
+
 @api_router.get("/resume-source-snapshot")
 async def get_resume_source_snapshot(
     store: Annotated[LocalPanelSettingsStore, Depends(get_panel_settings_store)],
@@ -189,10 +264,20 @@ async def save_resume_source_snapshot(
 @api_router.get("/state")
 async def get_panel_state(
     store: Annotated[LocalPanelSettingsStore, Depends(get_panel_settings_store)],
+    submission_repository: Annotated[SubmissionRepository, Depends(get_submission_repository)],
 ) -> JSONResponse:
     """Return the safe combined state used by the Next.js panel."""
 
     document = store.load()
+    private_metadata_summary = _private_metadata_state_summary(
+        document.private_metadata.raw_text,
+        document.private_metadata.consent_to_ai_usage,
+    )
+    missing_private_metadata_feedback = build_missing_private_metadata_feedback(
+        submission.notes
+        for submission in submission_repository.list(limit=200)
+        if submission.status.value == "skipped"
+    )
     capability_profile_payload: dict[str, object] | None = None
     try:
         settings = build_user_agent_settings(document)
@@ -210,6 +295,10 @@ async def get_panel_state(
             "computed": {
                 "next_execution_at": calculate_next_execution_at(document.schedule).isoformat(),
                 "capability_profile": capability_profile_payload,
+            },
+            "private_metadata": private_metadata_summary,
+            "feedback": {
+                "missing_private_metadata": missing_private_metadata_feedback,
             },
             "ai": {
                 "model": document.ai.model,

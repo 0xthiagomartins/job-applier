@@ -60,6 +60,13 @@ class UserProfileConfig(FrozenModel):
     blacklist: tuple[str, ...] = ()
 
 
+class PrivateMetadataConfig(FrozenModel):
+    """User-supplied sensitive/private metadata kept separate from the resume snapshot."""
+
+    entries: dict[str, str] = Field(default_factory=dict)
+    consent_to_ai_usage: bool = False
+
+
 class SearchConfig(FrozenModel):
     """Search preferences used by the automation agent."""
 
@@ -146,6 +153,7 @@ class UserAgentSettings(BaseSettings):
 
     config_version: str = "config-v1"
     profile: UserProfileConfig
+    private_metadata: PrivateMetadataConfig = Field(default_factory=PrivateMetadataConfig)
     search: SearchConfig
     agent: AgentConfig
     ai: AIConfig
@@ -161,7 +169,15 @@ class UserAgentSettings(BaseSettings):
     def to_snapshot_payload(self) -> dict[str, Any]:
         """Return the serializable payload stored in immutable snapshots."""
 
-        return self.model_dump(mode="json", exclude={"ai": {"api_key"}})
+        payload = self.model_dump(
+            mode="json",
+            exclude={"ai": {"api_key"}, "private_metadata": {"entries"}},
+        )
+        payload["private_metadata"] = {
+            "consent_to_ai_usage": self.private_metadata.consent_to_ai_usage,
+            "stored_keys": sorted(self.private_metadata.entries),
+        }
+        return payload
 
     @classmethod
     def from_env_file(cls, env_file: str | Path) -> UserAgentSettings:

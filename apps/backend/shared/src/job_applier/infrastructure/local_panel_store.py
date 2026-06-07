@@ -16,10 +16,12 @@ from job_applier.application.panel import (
     AIFormInput,
     PanelSettingsDocument,
     PreferencesFormInput,
+    PrivateMetadataFormInput,
     ProfileFormInput,
     ScheduleFormInput,
     StoredAISection,
     StoredPreferencesSection,
+    StoredPrivateMetadataSection,
     StoredProfileSection,
     StoredScheduleSection,
     ensure_runtime_dir,
@@ -122,6 +124,24 @@ class LocalPanelSettingsStore:
         updated_document = document.model_copy(
             update={
                 "ai": StoredAISection(api_key=api_key, model=ai_input.model),
+            },
+        )
+        self._write(updated_document)
+        return self._apply_runtime_overrides(updated_document)
+
+    def save_private_metadata(
+        self,
+        private_metadata_input: PrivateMetadataFormInput,
+    ) -> PanelSettingsDocument:
+        """Persist sensitive private metadata kept separate from the CV snapshot."""
+
+        document = self._load_persisted_document()
+        updated_document = document.model_copy(
+            update={
+                "private_metadata": StoredPrivateMetadataSection(
+                    raw_text=private_metadata_input.raw_text,
+                    consent_to_ai_usage=private_metadata_input.consent_to_ai_usage,
+                ),
             },
         )
         self._write(updated_document)

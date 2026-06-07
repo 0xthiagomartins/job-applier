@@ -43,6 +43,8 @@ Important boundary:
 - the snapshot is still deterministic-first today
 - AI is not the sole source of truth for the snapshot
 - the snapshot remains grounded in the uploaded base CV
+- sensitive private metadata is not stored inside the resume snapshot
+- sensitive metadata belongs to a separate private-metadata flow used only by Easy Apply
 
 ## Important Rules
 

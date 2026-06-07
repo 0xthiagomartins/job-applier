@@ -40,6 +40,7 @@ There is no active frontend application today; this state is persisted locally a
 - `resume_mode`
 - `preferred_language`
 - `resume_css`
+- private metadata stays separate from this snapshot
 
 ### Search
 
@@ -72,6 +73,32 @@ The backend now exposes snapshot-oriented endpoints:
 - `PUT /api/panel/resume-source-snapshot`
 
 These are the current integration points for inspecting or overriding the canonical snapshot without changing the raw CV file.
+
+## Private Metadata
+
+The backend now supports a separate private-metadata section for user-supplied factual or sensitive fields that are not safe to infer from the CV.
+
+Examples:
+
+- `CPF`
+- `RG`
+- `Nome do pai`
+- `Nome da mãe`
+- `Data de nascimento`
+- `Empresa atual`
+- `Salário atual/último`
+- `Benefícios atuais/últimos`
+
+Current endpoints:
+
+- `GET /api/panel/private-metadata`
+- `PUT /api/panel/private-metadata`
+
+Important behavior:
+
+- this metadata is stored separately from the canonical resume snapshot
+- the user must explicitly consent before this metadata can be sent to OpenAI
+- panel state exposes only a safe summary, not the raw metadata block
 
 ## Important Sharing Warning
 
