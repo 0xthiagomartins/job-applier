@@ -928,6 +928,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 last_known_total_steps = 1
                 step_visit_counts: dict[int, int] = {}
                 force_resume_reselection = False
+                resume_review_repair_attempted = False
+                resume_review_verified_selection = False
                 for _ in range(max_iterations):
                     step = await self._extract_step(
                         page,
@@ -1050,6 +1052,33 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     if force_resume_reselection and any(
                         field.question_type is QuestionType.RESUME_UPLOAD for field in step.fields
                     ):
+                        target_resume_name = (
+                            submission_cv_path.name
+                            if submission_cv_path is not None
+                            else settings.profile.cv_filename
+                        )
+                        resume_review_verified_selection = bool(
+                            target_resume_name
+                            and (
+                                any(
+                                    answer.normalized_key == "resume_upload"
+                                    and normalize_text(answer.answer_raw)
+                                    and _resume_text_matches_requested_cv(
+                                        answer.answer_raw,
+                                        target_resume_name,
+                                    )
+                                    for answer in step_answers
+                                )
+                                or any(
+                                    field.question_type is QuestionType.RESUME_UPLOAD
+                                    and _resume_text_matches_requested_cv(
+                                        field.current_value,
+                                        target_resume_name,
+                                    )
+                                    for field in step.fields
+                                )
+                            )
+                        )
                         force_resume_reselection = False
                     answers.extend(step_answers)
                     artifacts.extend(step_artifacts)
@@ -1073,9 +1102,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         submission_id=submission_id,
                         execution_events=execution_events,
                         submission_cv_path=submission_cv_path,
+                        resume_review_repair_attempted=resume_review_repair_attempted,
+                        resume_review_verified_selection=resume_review_verified_selection,
                     )
                     if review_repair_reason is not None:
                         if review_repair_reason == "resume_mismatch":
+                            resume_review_repair_attempted = True
                             force_resume_reselection = True
                         continue
 
@@ -1628,17 +1660,18 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "classification_confidence": field.classification_confidence,
                     },
                 )
+            resume_field_matches_requested = (
+                field.question_type is QuestionType.RESUME_UPLOAD
+                and _resume_field_matches_requested_cv(
+                    field,
+                    submission_cv_path=submission_cv_path,
+                    fallback_filename=settings.profile.cv_filename,
+                )
+            )
             force_resume_refresh = (
                 field.question_type is QuestionType.RESUME_UPLOAD
                 and submission_cv_path is not None
-                and (
-                    force_resume_reselection
-                    or not _resume_field_matches_requested_cv(
-                        field,
-                        submission_cv_path=submission_cv_path,
-                        fallback_filename=settings.profile.cv_filename,
-                    )
-                )
+                and not resume_field_matches_requested
             )
             resolution: ResolvedFieldValue | None
             resolution_memory_entry: ApplyActionMemory | None = None
@@ -2692,6 +2725,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
         )
         if target_cv_name is None:
             return None
+        if not force_reassert and _resume_text_matches_requested_cv(
+            field.current_value,
+            target_cv_name,
+        ):
+            return target_cv_name
         if force_reassert and submission_cv_path is not None:
             if await self._upload_resume_from_choice_step(
                 page=page,
@@ -2868,8 +2906,21 @@ class PlaywrightLinkedInEasyApplyExecutor:
                       return true;
                     }
                   }
-
-                  return matchesTarget(node.innerText || node.textContent || "");
+                  const selectedCards = Array.from(
+                    node.querySelectorAll(
+                      '[aria-selected="true"], [data-selected="true"], [aria-current="true"]'
+                    )
+                  );
+                  for (const card of selectedCards) {
+                    if (!isVisible(card)) {
+                      continue;
+                    }
+                    const text = collapse(card.innerText || card.textContent || "");
+                    if (matchesTarget(text)) {
+                      return true;
+                    }
+                  }
+                  return false;
                 }
                 """,
                 {"targetCvName": target_cv_name},
@@ -3002,6 +3053,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
         submission_id: UUID,
         execution_events: list[ExecutionEvent],
         submission_cv_path: Path | None,
+        resume_review_repair_attempted: bool = False,
+        resume_review_verified_selection: bool = False,
     ) -> str | None:
         if "review your application" not in normalize_text(step.surface_text):
             return None
@@ -3024,6 +3077,21 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 target_cv_name,
             )
         ):
+            if resume_review_repair_attempted and resume_review_verified_selection:
+                self._record_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    event_type=ExecutionEventType.STEP_REACHED,
+                    payload={
+                        "stage": "easy_apply_review_repair",
+                        "step_index": step.step_index,
+                        "reason": "resume_preview_stale_after_verified_selection",
+                        "target_cv_name": target_cv_name,
+                        "review_text": resume_section.get("body_text", ""),
+                    },
+                )
+                return None
             if await self._click_easy_apply_review_edit(
                 page,
                 edit_ref=resume_section.get("edit_ref", ""),

@@ -13,6 +13,11 @@ Examples:
 - daily apply limits
 - closed or stale job URLs
 
+Recent hardening closed two especially costly variants:
+
+- resume-review stale previews after the correct PDF was already reselected
+- post-submit `about:blank` flows that needed deterministic job-page recheck
+
 ## 2. Sparse Job Detail Quality
 
 Some postings come with poor or noisy detail content.

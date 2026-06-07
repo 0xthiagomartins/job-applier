@@ -3269,7 +3269,7 @@ def _pick_conservative_language_proficiency_option(options: tuple[str, ...]) -> 
 def _looks_like_sensitive_demographic_question(field: EasyApplyField) -> bool:
     normalized = normalize_text(f"{field.question_raw} {field.normalized_key}")
     return any(
-        token in normalized
+        _normalized_text_contains_token(normalized, token)
         for token in (
             "gender",
             "genero",
@@ -3327,21 +3327,20 @@ def _looks_like_accessibility_accommodation_question(field: EasyApplyField) -> b
 def _looks_like_sensitive_demographic_gate_question(field: EasyApplyField) -> bool:
     normalized = normalize_text(f"{field.question_raw} {field.normalized_key}")
     if not any(
-        token in normalized
-        for token in (
-            "opcional",
-            "optional",
-            "afirmativ",
-            "affirmative action",
-            "demographic",
-            "demograf",
-            "self identify",
-            "autoident",
+        _normalized_text_contains_token(normalized, token, allow_prefix=allow_prefix)
+        for token, allow_prefix in (
+            ("opcional", False),
+            ("optional", False),
+            ("afirmativ", True),
+            ("affirmative action", False),
+            ("demograf", True),
+            ("self identify", False),
+            ("autoident", True),
         )
     ):
         return False
     return any(
-        token in normalized
+        _normalized_text_contains_token(normalized, token)
         for token in (
             "comfortable",
             "comfortavel",
@@ -3459,6 +3458,18 @@ def _resolve_sensitive_demographic_guardrail(field: EasyApplyField) -> Guardrail
     if _looks_like_sensitive_demographic_question(field):
         return _resolve_sensitive_opt_out_answer(field)
     return None
+
+
+def _normalized_text_contains_token(
+    normalized_text: str,
+    token: str,
+    *,
+    allow_prefix: bool = False,
+) -> bool:
+    if not normalized_text or not token:
+        return False
+    suffix = "" if allow_prefix else r"(?!\w)"
+    return re.search(rf"(?<!\w){re.escape(token)}{suffix}", normalized_text) is not None
 
 
 def _profile_first_name(full_name: str) -> str:

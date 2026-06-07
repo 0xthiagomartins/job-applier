@@ -270,6 +270,39 @@ class LinkedInAnswerResolverSensitiveGuardrailTests(unittest.IsolatedAsyncioTest
         self.assertEqual(resolved.reasoning, "sensitive_demographic_gate_decline")
         self.assertEqual(self.generator.calls, 0)
 
+    async def test_generic_drug_test_binary_question_is_not_misclassified_as_sensitive(
+        self,
+    ) -> None:
+        resolver = LinkedInAnswerResolver(
+            ambiguous_answer_generator=_RecordingAnswerGenerator(),
+        )
+        field = EasyApplyField(
+            question_raw=(
+                "Are you willing to take a drug test, in accordance with local law/regulations?"
+            ),
+            normalized_key="are_you_willing_to_take_a_drug_test_in_accordance_with_local_law_regulations",
+            question_type=QuestionType.YES_NO_GENERIC,
+            control_kind="radio",
+            required=True,
+            options=("Yes", "No"),
+            field_context=(
+                "Are you willing to take a drug test, in accordance with local law/regulations? "
+                "Yes No"
+            ),
+        )
+
+        resolved = await resolver.resolve(
+            field,
+            self.settings,
+            posting=self.posting,
+        )
+
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved.value, "Yes")
+        self.assertEqual(resolved.answer_source, AnswerSource.BEST_EFFORT_AUTOFILL)
+        self.assertEqual(resolved.fill_strategy, FillStrategy.BEST_EFFORT)
+
 
 class LinkedInAnswerResolverRateLimitTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:

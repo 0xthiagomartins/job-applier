@@ -38,6 +38,9 @@ This file summarizes the most relevant recent changes so a new harness does not 
 - backend routes to inspect, refresh, and override the canonical snapshot
 - 1-hour diskcache-backed search+score reuse for repeated full-stage validations
 - stronger resume reassertion in the apply flow before falling back to picker reselection
+- resume-review repair now treats a re-opened resume step with the correct checked PDF as verified instead of forcing a redundant reselection loop
+- post-submit `about:blank` Jobgether/Lever flows now complete via deterministic job-page recheck
+- sensitive-question guardrails no longer false-positive on generic `drug test` yes/no questions because of substring token collisions like `cor` inside `accordance`
 
 ## Recent Real Successes
 
@@ -47,6 +50,7 @@ This file summarizes the most relevant recent changes so a new harness does not 
 - real successful EN submissions:
   - `4419915012` `Oowlish` `Senior Software Engineer (AI & Cloud Solutions)`
   - `4422836187` `Crossing Hurdles` `Software Engineer`
+  - `4424232275` `Jobgether` `AI Developer Backend Java Sr`
 
 ## Current Hotspot
 
