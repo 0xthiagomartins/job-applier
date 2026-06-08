@@ -270,10 +270,31 @@ def update_progress_snapshot(
     existing_job = existing.get("current_job")
     merged_job = merged.get("current_job")
     if isinstance(existing_job, dict) and isinstance(merged_job, dict):
-        merged["current_job"] = {
-            **existing_job,
-            **merged_job,
-        }
+        existing_job_posting_id = str(existing_job.get("job_posting_id") or "")
+        existing_submission_id = str(existing_job.get("submission_id") or "")
+        merged_job_posting_id = str(merged_job.get("job_posting_id") or "")
+        merged_submission_id = str(merged_job.get("submission_id") or "")
+        same_submission = bool(
+            existing_submission_id
+            and merged_submission_id
+            and existing_submission_id == merged_submission_id
+        )
+        same_job = bool(
+            existing_job_posting_id
+            and merged_job_posting_id
+            and existing_job_posting_id == merged_job_posting_id
+        )
+        if same_submission or same_job:
+            merged["current_job"] = {
+                **existing_job,
+                **merged_job,
+            }
+        else:
+            merged["current_job"] = merged_job
+    current_stage = merged.get("current_stage")
+    previous_stage = existing.get("current_stage")
+    if "last_error" not in payload and current_stage != previous_stage:
+        merged["last_error"] = None
     target.write_text(
         json.dumps(merged, indent=2, ensure_ascii=True, default=_json_default),
         encoding="utf-8",

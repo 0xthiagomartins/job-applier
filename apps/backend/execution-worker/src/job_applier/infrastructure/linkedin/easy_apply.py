@@ -8,6 +8,7 @@ import logging
 import random
 import re
 import traceback
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -211,6 +212,95 @@ def _resume_field_matches_requested_cv(
     return _resume_text_matches_requested_cv(field.current_value, target_filename)
 
 
+def _resume_field_verification_state(
+    field: EasyApplyField,
+    *,
+    target_cv_name: str | None,
+) -> ResumeVerificationState:
+    if target_cv_name is None:
+        return ResumeVerificationState(target_cv_name=None)
+    selected_value = normalize_text(field.current_value)
+    verified = _resume_text_matches_requested_cv(field.current_value, target_cv_name)
+    option_visible = any(
+        _resume_text_matches_requested_cv(option, target_cv_name) for option in field.options
+    )
+    if verified:
+        reason = "verified"
+    elif not option_visible:
+        reason = "picker_missing_target_resume"
+    elif selected_value:
+        reason = "picker_selected_different_resume"
+    else:
+        reason = "picker_exposes_target_resume_unselected"
+    return ResumeVerificationState(
+        target_cv_name=target_cv_name,
+        verified=verified,
+        option_visible=option_visible,
+        selected_value=selected_value,
+        reason=reason,
+    )
+
+
+def _evaluate_resume_verification(
+    step: EasyApplyStep,
+    step_answers: Sequence[ApplicationAnswer],
+    *,
+    target_cv_name: str | None,
+) -> ResumeVerificationState:
+    if target_cv_name is None:
+        return ResumeVerificationState(target_cv_name=None)
+    resume_fields = tuple(
+        field for field in step.fields if field.question_type is QuestionType.RESUME_UPLOAD
+    )
+    if not resume_fields:
+        return ResumeVerificationState(target_cv_name=target_cv_name)
+    if any(
+        answer.normalized_key == "resume_upload"
+        and _resume_text_matches_requested_cv(answer.answer_raw, target_cv_name)
+        for answer in step_answers
+    ):
+        selected_value = next(
+            (
+                normalize_text(answer.answer_raw)
+                for answer in step_answers
+                if answer.normalized_key == "resume_upload" and normalize_text(answer.answer_raw)
+            ),
+            "",
+        )
+        return ResumeVerificationState(
+            target_cv_name=target_cv_name,
+            verified=True,
+            option_visible=True,
+            selected_value=selected_value,
+            reason="verified",
+        )
+    field_states = tuple(
+        _resume_field_verification_state(field, target_cv_name=target_cv_name)
+        for field in resume_fields
+    )
+    for state in field_states:
+        if state.verified:
+            return state
+    option_visible = any(state.option_visible for state in field_states)
+    selected_value = next(
+        (state.selected_value for state in field_states if state.selected_value),
+        "",
+    )
+    if not option_visible:
+        reason = "picker_missing_target_resume"
+    elif selected_value:
+        reason = "picker_selected_different_resume"
+    else:
+        reason = "picker_exposes_target_resume_unselected"
+    return ResumeVerificationState(
+        target_cv_name=target_cv_name,
+        verified=False,
+        option_visible=option_visible,
+        selected_value=selected_value,
+        reason=reason,
+    )
+
+
 def _interactive_field_recovery_directive(
     *,
     assessment: BrowserInteractiveFieldAssessment,
@@ -381,6 +471,17 @@ class PreparedSubmissionCv:
     artifacts: tuple[ArtifactSnapshot, ...] = ()
     used_dynamic_variant: bool = False
     notes: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeVerificationState:
+    """Verification state for the requested resume within Easy Apply."""
+
+    target_cv_name: str | None
+    verified: bool = False
+    option_visible: bool = False
+    selected_value: str = ""
+    reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1082,6 +1183,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 force_semantic_reassert_keys: set[str] = set()
                 resume_review_repair_attempted = False
                 resume_review_verified_selection = False
+                resume_verification_required = False
                 for _ in range(max_iterations):
                     step = await self._extract_step(
                         page,
@@ -1257,36 +1359,41 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             recruiter_interactions=tuple(recruiter_interactions),
                             cv_version=submission_cv_version,
                         )
+                    target_resume_name = (
+                        submission_cv_path.name
+                        if submission_cv_path is not None
+                        else settings.profile.cv_filename
+                    )
+                    resume_verification = _evaluate_resume_verification(
+                        step,
+                        step_answers,
+                        target_cv_name=target_resume_name,
+                    )
+                    if any(
+                        field.question_type is QuestionType.RESUME_UPLOAD for field in step.fields
+                    ):
+                        if resume_verification.verified:
+                            resume_review_verified_selection = True
+                            resume_verification_required = False
+                        else:
+                            resume_verification_required = True
+                            self._record_event(
+                                execution_events,
+                                execution_id=execution_id,
+                                submission_id=submission_id,
+                                event_type=ExecutionEventType.STEP_REACHED,
+                                payload={
+                                    "stage": "easy_apply_resume_verification_deferred",
+                                    "step_index": step.step_index,
+                                    "target_cv_name": target_resume_name,
+                                    "selected_value": resume_verification.selected_value,
+                                    "option_visible": resume_verification.option_visible,
+                                    "reason": resume_verification.reason,
+                                },
+                            )
                     if force_resume_reselection and any(
                         field.question_type is QuestionType.RESUME_UPLOAD for field in step.fields
                     ):
-                        target_resume_name = (
-                            submission_cv_path.name
-                            if submission_cv_path is not None
-                            else settings.profile.cv_filename
-                        )
-                        resume_review_verified_selection = bool(
-                            target_resume_name
-                            and (
-                                any(
-                                    answer.normalized_key == "resume_upload"
-                                    and normalize_text(answer.answer_raw)
-                                    and _resume_text_matches_requested_cv(
-                                        answer.answer_raw,
-                                        target_resume_name,
-                                    )
-                                    for answer in step_answers
-                                )
-                                or any(
-                                    field.question_type is QuestionType.RESUME_UPLOAD
-                                    and _resume_text_matches_requested_cv(
-                                        field.current_value,
-                                        target_resume_name,
-                                    )
-                                    for field in step.fields
-                                )
-                            )
-                        )
                         force_resume_reselection = False
                     answers.extend(step_answers)
                     artifacts.extend(step_artifacts)
@@ -1317,9 +1424,115 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         if review_repair_reason == "resume_mismatch":
                             resume_review_repair_attempted = True
                             force_resume_reselection = True
+                        elif (
+                            review_repair_reason == "resume_preview_stale_after_verified_selection"
+                        ):
+                            notes = (
+                                "LinkedIn Easy Apply kept showing a stale resume in the review "
+                                "step even after the requested tailored resume appeared selected "
+                                "earlier, so the submission was blocked to avoid sending the "
+                                "wrong document."
+                            )
+                            artifacts.extend(
+                                await self._capture_debug_bundle(
+                                    page,
+                                    run_dir=run_dir,
+                                    submission_id=submission_id,
+                                    label="failure_review_resume_stale_after_verification",
+                                ),
+                            )
+                            self._record_event(
+                                execution_events,
+                                execution_id=execution_id,
+                                submission_id=submission_id,
+                                event_type=ExecutionEventType.JOB_PROCESSED,
+                                payload={
+                                    "job_posting_id": str(posting.id),
+                                    "reason": "resume_review_stale_after_verification",
+                                    "status": SubmissionStatus.FAILED.value,
+                                    "notes": notes,
+                                },
+                            )
+                            return EasyApplyExecutionResult(
+                                submission_id=submission_id,
+                                started_at=started_at,
+                                status=SubmissionStatus.FAILED,
+                                resume_mode=resume_mode,
+                                target_language=target_language,
+                                matched_role_target=matched_role_target,
+                                matched_specializations=matched_specializations,
+                                notes=notes,
+                                answers=tuple(answers),
+                                execution_events=tuple(execution_events),
+                                artifacts=tuple(artifacts),
+                                recruiter_interactions=tuple(recruiter_interactions),
+                                cv_version=submission_cv_version,
+                            )
                         elif review_repair_reason == "invalid_city_review_value":
                             force_semantic_reassert_keys = {"city"}
                         continue
+                    if (
+                        target_resume_name
+                        and "review your application" in normalize_text(step.surface_text)
+                        and await self._review_resume_matches_requested_cv(
+                            page,
+                            target_cv_name=target_resume_name,
+                        )
+                    ):
+                        resume_review_verified_selection = True
+                    if (
+                        resume_verification_required
+                        and target_resume_name
+                        and "review your application" in normalize_text(step.surface_text)
+                    ):
+                        if await self._review_resume_matches_requested_cv(
+                            page,
+                            target_cv_name=target_resume_name,
+                        ):
+                            resume_review_verified_selection = True
+                            resume_verification_required = False
+                        else:
+                            notes = (
+                                "LinkedIn Easy Apply could not verify that the requested tailored "
+                                "resume is selected in the review step, so the submission was "
+                                "blocked to avoid sending a stale resume."
+                            )
+                            artifacts.extend(
+                                await self._capture_debug_bundle(
+                                    page,
+                                    run_dir=run_dir,
+                                    submission_id=submission_id,
+                                    label="failure_resume_verification",
+                                ),
+                            )
+                            self._record_event(
+                                execution_events,
+                                execution_id=execution_id,
+                                submission_id=submission_id,
+                                event_type=ExecutionEventType.JOB_PROCESSED,
+                                payload={
+                                    "job_posting_id": str(posting.id),
+                                    "reason": "resume_verification_failed",
+                                    "status": SubmissionStatus.FAILED.value,
+                                    "notes": notes,
+                                    "target_cv_name": target_resume_name,
+                                },
+                            )
+                            return EasyApplyExecutionResult(
+                                submission_id=submission_id,
+                                started_at=started_at,
+                                status=SubmissionStatus.FAILED,
+                                resume_mode=resume_mode,
+                                target_language=target_language,
+                                matched_role_target=matched_role_target,
+                                matched_specializations=matched_specializations,
+                                notes=notes,
+                                answers=tuple(answers),
+                                execution_events=tuple(execution_events),
+                                artifacts=tuple(artifacts),
+                                recruiter_interactions=tuple(recruiter_interactions),
+                                cv_version=submission_cv_version,
+                            )
 
                     try:
                         update_progress_snapshot(
@@ -1419,6 +1632,47 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         )
 
                     if self._action_indicates_submission(action):
+                        if resume_verification_required and not resume_review_verified_selection:
+                            notes = (
+                                "LinkedIn Easy Apply reached the submit action without a verified "
+                                "selection of the requested tailored resume, so the submission "
+                                "was blocked to avoid sending a stale resume."
+                            )
+                            artifacts.extend(
+                                await self._capture_debug_bundle(
+                                    page,
+                                    run_dir=run_dir,
+                                    submission_id=submission_id,
+                                    label="failure_resume_unverified_submit",
+                                ),
+                            )
+                            self._record_event(
+                                execution_events,
+                                execution_id=execution_id,
+                                submission_id=submission_id,
+                                event_type=ExecutionEventType.JOB_PROCESSED,
+                                payload={
+                                    "job_posting_id": str(posting.id),
+                                    "reason": "resume_unverified_before_submit",
+                                    "status": SubmissionStatus.FAILED.value,
+                                    "notes": notes,
+                                },
+                            )
+                            return EasyApplyExecutionResult(
+                                submission_id=submission_id,
+                                started_at=started_at,
+                                status=SubmissionStatus.FAILED,
+                                resume_mode=resume_mode,
+                                target_language=target_language,
+                                matched_role_target=matched_role_target,
+                                matched_specializations=matched_specializations,
+                                notes=notes,
+                                answers=tuple(answers),
+                                execution_events=tuple(execution_events),
+                                artifacts=tuple(artifacts),
+                                recruiter_interactions=tuple(recruiter_interactions),
+                                cv_version=submission_cv_version,
+                            )
                         update_progress_snapshot(
                             {
                                 "current_stage": "easy_apply_submit_triggered",
@@ -2053,6 +2307,40 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         total_steps=step.total_steps,
                     )
             if applied_value is None:
+                if field.question_type is QuestionType.RESUME_UPLOAD:
+                    target_resume_name = (
+                        submission_cv_path.name
+                        if submission_cv_path is not None
+                        else settings.profile.cv_filename
+                    )
+                    resume_state = _resume_field_verification_state(
+                        field,
+                        target_cv_name=target_resume_name,
+                    )
+                    self._record_event(
+                        execution_events,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
+                        event_type=ExecutionEventType.STEP_REACHED,
+                        payload={
+                            "stage": "easy_apply_resume_selection_unverified",
+                            "step_index": step.step_index,
+                            "normalized_key": field.normalized_key,
+                            "question_type": field.question_type.value,
+                            "control_kind": field.control_kind,
+                            "answer_source": (
+                                resolution.answer_source.value if resolution is not None else None
+                            ),
+                            "fill_strategy": (
+                                resolution.fill_strategy.value if resolution is not None else None
+                            ),
+                            "target_cv_name": target_resume_name,
+                            "selected_value": resume_state.selected_value,
+                            "option_visible": resume_state.option_visible,
+                            "reason": resume_state.reason,
+                        },
+                    )
+                    continue
                 self._record_event(
                     execution_events,
                     execution_id=execution_id,
@@ -3338,6 +3626,23 @@ class PlaywrightLinkedInEasyApplyExecutor:
             }
         return sections
 
+    async def _review_resume_matches_requested_cv(
+        self,
+        page: Page,
+        *,
+        target_cv_name: str,
+    ) -> bool:
+        if not target_cv_name:
+            return False
+        sections = await self._extract_easy_apply_review_sections(page)
+        resume_section = sections.get("resume")
+        if resume_section is None:
+            return False
+        return _resume_text_matches_requested_cv(
+            resume_section.get("body_text", ""),
+            target_cv_name,
+        )
+
     async def _click_easy_apply_review_edit(
         self,
         page: Page,
@@ -3406,7 +3711,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "review_text": resume_section.get("body_text", ""),
                     },
                 )
-                return None
+                return "resume_preview_stale_after_verified_selection"
             if await self._click_easy_apply_review_edit(
                 page,
                 edit_ref=resume_section.get("edit_ref", ""),
@@ -8481,7 +8786,16 @@ class PlaywrightLinkedInEasyApplyExecutor:
         if isinstance(step_index, int):
             progress_payload["current_step"] = step_index + 1
         current_job: dict[str, object] = {}
-        for key in ("job_posting_id", "company_name", "title", "url", "status"):
+        for key in (
+            "job_posting_id",
+            "external_job_id",
+            "company_name",
+            "title",
+            "url",
+            "status",
+            "score",
+            "skip_reason",
+        ):
             if key in payload:
                 current_job[key] = payload[key]
         if current_job and submission_id is not None:
@@ -8495,9 +8809,6 @@ class PlaywrightLinkedInEasyApplyExecutor:
             message = payload.get("message")
             if isinstance(message, str) and message:
                 progress_payload["last_error"] = message
-        notes = payload.get("notes")
-        if isinstance(notes, str) and notes:
-            progress_payload["last_error"] = notes
         update_progress_snapshot(progress_payload)
 
     def _record_exception_event(
