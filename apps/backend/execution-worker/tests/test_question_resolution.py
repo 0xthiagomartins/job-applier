@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from typing import Literal, cast
 
 from pydantic import SecretStr
 
@@ -52,65 +53,57 @@ class LinkedInQuestionClassifierTests(unittest.TestCase):
         self.assertEqual(classification.normalized_key, "referral_source")
         self.assertEqual(classification.matched_rule, "referral_source")
 
-    def test_classifies_current_employer_question(self) -> None:
-        classification = self.classifier.classify(
-            question_raw="Confirm the name of the company where you work",
-            control_kind="text",
-            input_type="text",
-            options=(),
+    def test_classifies_factual_fields_that_must_not_be_inferred(self) -> None:
+        cases = (
+            (
+                "Confirm the name of the company where you work",
+                "text",
+                "text",
+                (),
+                "current_employer",
+            ),
+            (
+                "Você trabalha atualmente no Inter?",
+                "select",
+                "select",
+                ("Sim", "Não"),
+                "current_employer",
+            ),
+            (
+                "Informe seu salário atual/último:",
+                "text",
+                "text",
+                (),
+                "current_salary",
+            ),
+            (
+                "Informe seus Benefícios atuais/últimos:",
+                "text",
+                "text",
+                (),
+                "current_benefits",
+            ),
+            ("CPF", "text", "text", (), "cpf"),
         )
 
-        self.assertEqual(classification.question_type, QuestionType.FREE_TEXT_GENERIC)
-        self.assertEqual(classification.normalized_key, "current_employer")
-        self.assertEqual(classification.matched_rule, "current_employer")
+        for question_raw, control_kind, input_type, options, normalized_key in cases:
+            with self.subTest(normalized_key=normalized_key, question_raw=question_raw):
+                classification = self.classifier.classify(
+                    question_raw=question_raw,
+                    control_kind=cast(
+                        Literal["text", "textarea", "select", "radio", "checkbox", "file"],
+                        control_kind,
+                    ),
+                    input_type=input_type,
+                    options=options,
+                )
 
-    def test_classifies_current_employer_yes_no_question(self) -> None:
-        classification = self.classifier.classify(
-            question_raw="Você trabalha atualmente no Inter?",
-            control_kind="select",
-            input_type="select",
-            options=("Sim", "Não"),
-        )
-
-        self.assertEqual(classification.question_type, QuestionType.FREE_TEXT_GENERIC)
-        self.assertEqual(classification.normalized_key, "current_employer")
-        self.assertEqual(classification.matched_rule, "current_employer")
-
-    def test_classifies_current_salary_question(self) -> None:
-        classification = self.classifier.classify(
-            question_raw="Informe seu salário atual/último:",
-            control_kind="text",
-            input_type="text",
-            options=(),
-        )
-
-        self.assertEqual(classification.question_type, QuestionType.FREE_TEXT_GENERIC)
-        self.assertEqual(classification.normalized_key, "current_salary")
-        self.assertEqual(classification.matched_rule, "current_salary")
-
-    def test_classifies_current_benefits_question(self) -> None:
-        classification = self.classifier.classify(
-            question_raw="Informe seus Benefícios atuais/últimos:",
-            control_kind="text",
-            input_type="text",
-            options=(),
-        )
-
-        self.assertEqual(classification.question_type, QuestionType.FREE_TEXT_GENERIC)
-        self.assertEqual(classification.normalized_key, "current_benefits")
-        self.assertEqual(classification.matched_rule, "current_benefits")
-
-    def test_classifies_cpf_question(self) -> None:
-        classification = self.classifier.classify(
-            question_raw="CPF",
-            control_kind="text",
-            input_type="text",
-            options=(),
-        )
-
-        self.assertEqual(classification.question_type, QuestionType.FREE_TEXT_GENERIC)
-        self.assertEqual(classification.normalized_key, "cpf")
-        self.assertEqual(classification.matched_rule, "cpf")
+                self.assertEqual(
+                    classification.question_type,
+                    QuestionType.FREE_TEXT_GENERIC,
+                )
+                self.assertEqual(classification.normalized_key, normalized_key)
+                self.assertEqual(classification.matched_rule, normalized_key)
 
     def test_does_not_misclassify_workplace_availability_as_start_date(self) -> None:
         classification = self.classifier.classify(
@@ -425,6 +418,7 @@ class LinkedInAnswerResolverRateLimitTests(unittest.IsolatedAsyncioTestCase):
         )
 
         if resolved is not None:
+            self.assertNotEqual(resolved.value, "Sao Paulo")
             self.assertNotEqual(
                 resolved.reasoning,
                 "reuse_previous_answer_with_validation_feedback",
@@ -434,81 +428,53 @@ class LinkedInAnswerResolverRateLimitTests(unittest.IsolatedAsyncioTestCase):
                 "reuse_current_value_with_validation_feedback",
             )
 
-    async def test_required_salary_expectation_without_profile_fact_stays_unresolved(self) -> None:
-        field = EasyApplyField(
-            question_raw="What is your salary expectation?",
-            normalized_key="salary_expectation",
-            question_type=QuestionType.SALARY_EXPECTATION,
-            control_kind="text",
-            input_type="text",
-            required=True,
+    async def test_missing_factual_fields_stay_unresolved_without_profile_or_metadata(self) -> None:
+        cases = (
+            EasyApplyField(
+                question_raw="What is your salary expectation?",
+                normalized_key="salary_expectation",
+                question_type=QuestionType.SALARY_EXPECTATION,
+                control_kind="text",
+                input_type="text",
+                required=True,
+            ),
+            EasyApplyField(
+                question_raw="Informe seu salário atual/último:",
+                normalized_key="current_salary",
+                question_type=QuestionType.FREE_TEXT_GENERIC,
+                control_kind="text",
+                input_type="text",
+                required=True,
+            ),
+            EasyApplyField(
+                question_raw="Informe seus Benefícios atuais/últimos:",
+                normalized_key="current_benefits",
+                question_type=QuestionType.FREE_TEXT_GENERIC,
+                control_kind="text",
+                input_type="text",
+                required=False,
+            ),
+            EasyApplyField(
+                question_raw="CPF",
+                normalized_key="cpf",
+                question_type=QuestionType.FREE_TEXT_GENERIC,
+                control_kind="text",
+                input_type="text",
+                required=True,
+            ),
         )
 
-        resolved = await self.resolver.resolve(
-            field,
-            self.settings,
-            posting=self.posting,
-        )
+        for field in cases:
+            with self.subTest(normalized_key=field.normalized_key):
+                self.generator.calls = 0
+                resolved = await self.resolver.resolve(
+                    field,
+                    self.settings,
+                    posting=self.posting,
+                )
 
-        self.assertIsNone(resolved)
-        self.assertEqual(self.generator.calls, 0)
-
-    async def test_required_current_salary_without_profile_fact_stays_unresolved(self) -> None:
-        field = EasyApplyField(
-            question_raw="Informe seu salário atual/último:",
-            normalized_key="current_salary",
-            question_type=QuestionType.FREE_TEXT_GENERIC,
-            control_kind="text",
-            input_type="text",
-            required=True,
-        )
-
-        resolved = await self.resolver.resolve(
-            field,
-            self.settings,
-            posting=self.posting,
-        )
-
-        self.assertIsNone(resolved)
-        self.assertEqual(self.generator.calls, 0)
-
-    async def test_optional_current_benefits_without_profile_fact_stays_unresolved(self) -> None:
-        field = EasyApplyField(
-            question_raw="Informe seus Benefícios atuais/últimos:",
-            normalized_key="current_benefits",
-            question_type=QuestionType.FREE_TEXT_GENERIC,
-            control_kind="text",
-            input_type="text",
-            required=False,
-        )
-
-        resolved = await self.resolver.resolve(
-            field,
-            self.settings,
-            posting=self.posting,
-        )
-
-        self.assertIsNone(resolved)
-        self.assertEqual(self.generator.calls, 0)
-
-    async def test_required_cpf_without_profile_fact_stays_unresolved(self) -> None:
-        field = EasyApplyField(
-            question_raw="CPF",
-            normalized_key="cpf",
-            question_type=QuestionType.FREE_TEXT_GENERIC,
-            control_kind="text",
-            input_type="text",
-            required=True,
-        )
-
-        resolved = await self.resolver.resolve(
-            field,
-            self.settings,
-            posting=self.posting,
-        )
-
-        self.assertIsNone(resolved)
-        self.assertEqual(self.generator.calls, 0)
+                self.assertIsNone(resolved)
+                self.assertEqual(self.generator.calls, 0)
 
     async def test_required_cpf_with_private_metadata_uses_agentic_answer(self) -> None:
         generator = _RecordingAnswerGenerator(

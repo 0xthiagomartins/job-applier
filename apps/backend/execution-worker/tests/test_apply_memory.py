@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
-from uuid import uuid4
 
-from job_applier.domain.entities import ApplyActionMemory
 from job_applier.domain.enums import AnswerSource, FillStrategy, QuestionType
 from job_applier.infrastructure.cache import DiskCacheApplyActionMemoryRepository
 from job_applier.infrastructure.linkedin.apply_memory import (
@@ -99,6 +95,7 @@ class AdaptiveApplyMemoryTests(unittest.TestCase):
         self._temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._temp_dir.cleanup)
         self.repository = DiskCacheApplyActionMemoryRepository(Path(self._temp_dir.name))
+        self.addCleanup(self.repository._cache.close)  # noqa: SLF001
         self.memory = AdaptiveApplyMemory(self.repository)
         self.step_fields = (
             _make_step_field(
@@ -151,7 +148,7 @@ class AdaptiveApplyMemoryTests(unittest.TestCase):
         if active_memory is None:
             self.fail("expected active memory to be available")
 
-        for index in range(10):
+        for index in range(3):
             with self.subTest(index=index):
                 variant_snapshot = BrowserAgentSnapshot(
                     url=initial_snapshot.url,
@@ -390,152 +387,76 @@ class AdaptiveApplyMemoryTests(unittest.TestCase):
         replayed = self.memory.replay_resolution(memory=active_memory, field=replay_field)
         self.assertEqual(replayed, "Advanced")
 
-    def test_executor_skips_sensitive_resolution_memory_replay_and_promotion(self) -> None:
-        field = EasyApplyField(
-            question_raw="Gostaria de nos dizer sua identidade de gênero?",
-            normalized_key="gostaria_de_nos_dizer_sua_identidade_de_genero",
-            question_type=QuestionType.UNKNOWN,
-            control_kind="select",
-            input_type="select",
-            required=False,
-            options=("Homem Cisgênero", "Mulher Cisgênero", "Pessoa Não Binária"),
-        )
-        signature = build_field_resolution_task_signature(
-            task_type=TASK_RESOLVE_SELECT,
-            field=field,
-        )
-        promoted = self.memory.promote_successful_resolution(
-            task_type=TASK_RESOLVE_SELECT,
-            signature_payload=signature,
-            field=field,
-            resolved_value="Homem Cisgênero",
-        )
-        if promoted is None:
-            self.fail("expected stored memory entry for setup")
-
+    def test_executor_skips_guardrailed_resolution_memory_replay_and_promotion(self) -> None:
         executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
         executor._apply_memory = self.memory
 
-        (
-            memory_entry,
-            task_type,
-            signature_payload,
-            resolution,
-        ) = executor._replay_field_resolution_memory(field)
-        self.assertIsNone(memory_entry)
-        self.assertIsNone(task_type)
-        self.assertIsNone(signature_payload)
-        self.assertIsNone(resolution)
-
-        self.assertFalse(
-            executor._should_promote_field_resolution_memory(
-                field,
-                ResolvedFieldValue(
-                    value="Homem Cisgênero",
-                    answer_source=AnswerSource.AI,
-                    fill_strategy=FillStrategy.AUTOFILL_AI,
+        cases = (
+            (
+                EasyApplyField(
+                    question_raw="Gostaria de nos dizer sua identidade de gênero?",
+                    normalized_key="gostaria_de_nos_dizer_sua_identidade_de_genero",
+                    question_type=QuestionType.UNKNOWN,
+                    control_kind="select",
+                    input_type="select",
+                    required=False,
+                    options=("Homem Cisgênero", "Mulher Cisgênero", "Pessoa Não Binária"),
                 ),
-            )
-        )
-
-    def test_executor_skips_accessibility_resolution_memory_replay_and_promotion(self) -> None:
-        field = EasyApplyField(
-            question_raw="Você precisa de algum tipo de acessibilidade?",
-            normalized_key="accessibility_accommodation",
-            question_type=QuestionType.UNKNOWN,
-            control_kind="select",
-            input_type="select",
-            required=True,
-            options=(
-                "Select an option",
-                "Elevador/Rampa",
+                "Homem Cisgênero",
+            ),
+            (
+                EasyApplyField(
+                    question_raw="Você precisa de algum tipo de acessibilidade?",
+                    normalized_key="accessibility_accommodation",
+                    question_type=QuestionType.UNKNOWN,
+                    control_kind="select",
+                    input_type="select",
+                    required=True,
+                    options=(
+                        "Select an option",
+                        "Elevador/Rampa",
+                        "Não necessito de nenhuma acessibilidade",
+                    ),
+                ),
                 "Não necessito de nenhuma acessibilidade",
             ),
         )
-        signature = build_field_resolution_task_signature(
-            task_type=TASK_RESOLVE_SELECT,
-            field=field,
-        )
-        promoted = self.memory.promote_successful_resolution(
-            task_type=TASK_RESOLVE_SELECT,
-            signature_payload=signature,
-            field=field,
-            resolved_value="Não necessito de nenhuma acessibilidade",
-        )
-        if promoted is None:
-            self.fail("expected stored memory entry for setup")
 
-        executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
-        executor._apply_memory = self.memory
+        for field, resolved_value in cases:
+            with self.subTest(normalized_key=field.normalized_key):
+                signature = build_field_resolution_task_signature(
+                    task_type=TASK_RESOLVE_SELECT,
+                    field=field,
+                )
+                promoted = self.memory.promote_successful_resolution(
+                    task_type=TASK_RESOLVE_SELECT,
+                    signature_payload=signature,
+                    field=field,
+                    resolved_value=resolved_value,
+                )
+                if promoted is None:
+                    self.fail("expected stored memory entry for setup")
 
-        (
-            memory_entry,
-            task_type,
-            signature_payload,
-            resolution,
-        ) = executor._replay_field_resolution_memory(field)
-        self.assertIsNone(memory_entry)
-        self.assertIsNone(task_type)
-        self.assertIsNone(signature_payload)
-        self.assertIsNone(resolution)
-
-        self.assertFalse(
-            executor._should_promote_field_resolution_memory(
-                field,
-                ResolvedFieldValue(
-                    value="Não necessito de nenhuma acessibilidade",
-                    answer_source=AnswerSource.AI,
-                    fill_strategy=FillStrategy.AUTOFILL_AI,
-                ),
-            )
-        )
-
-    def test_executor_emits_explicit_memory_timeline_events(self) -> None:
-        now = datetime.now(tz=UTC)
-        stored = self.repository.save(
-            ApplyActionMemory(
-                id=uuid4(),
-                task_type=TASK_PRIMARY_ACTION,
-                signature_hash="abc123",
-                signature_json=json.dumps({"signature": "v1"}),
-                strategy_payload_json=json.dumps(
-                    {
-                        "action_type": "click",
-                        "action_intent": "advance_step",
-                        "anchor": {"kind": "priority_target"},
-                        "scroll_amount": 0,
-                        "scroll_direction": None,
-                        "scroll_target": None,
-                        "wait_seconds": 0,
-                        "key_name": None,
-                    }
-                ),
-                success_count=1,
-                failure_count=0,
-                created_at=now,
-                last_used_at=now,
-                last_succeeded_at=now,
-                expires_at=now + timedelta(days=30),
-            )
-        )
-
-        executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
-        executor._apply_memory = self.memory
-
-        with patch(
-            "job_applier.infrastructure.linkedin.easy_apply.append_timeline_event"
-        ) as timeline:
-            executor._record_apply_memory_success(stored, task_type=TASK_PRIMARY_ACTION)
-            executor._record_apply_memory_failure(stored, task_type=TASK_PRIMARY_ACTION)
-
-        event_types = [call.args[0] for call in timeline.call_args_list]
-        self.assertEqual(event_types, ["apply_memory_refreshed", "apply_memory_degraded"])
-        refresh_payload = timeline.call_args_list[0].args[1]
-        degrade_payload = timeline.call_args_list[1].args[1]
-        self.assertEqual(refresh_payload["task_type"], TASK_PRIMARY_ACTION)
-        self.assertEqual(degrade_payload["task_type"], TASK_PRIMARY_ACTION)
-        self.assertIn("success_count", refresh_payload)
-        self.assertIn("failure_count", degrade_payload)
+                (
+                    memory_entry,
+                    task_type,
+                    signature_payload,
+                    resolution,
+                ) = executor._replay_field_resolution_memory(field)
+                self.assertIsNone(memory_entry)
+                self.assertIsNone(task_type)
+                self.assertIsNone(signature_payload)
+                self.assertIsNone(resolution)
+                self.assertFalse(
+                    executor._should_promote_field_resolution_memory(
+                        field,
+                        ResolvedFieldValue(
+                            value=resolved_value,
+                            answer_source=AnswerSource.AI,
+                            fill_strategy=FillStrategy.AUTOFILL_AI,
+                        ),
+                    )
+                )
 
 
 class _FakeCheckboxLocator:

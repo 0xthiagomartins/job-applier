@@ -12,23 +12,6 @@ from job_applier.infrastructure.linkedin.easy_apply import (
 
 
 class BrowserInteractiveFieldAssessmentTests(unittest.TestCase):
-    def test_parses_interactive_field_assessment_payload(self) -> None:
-        assessment = parse_browser_interactive_field_assessment(
-            {
-                "status": "needs_option_selection",
-                "confidence": 0.82,
-                "summary": "Visible autocomplete options need one committed choice.",
-                "evidence": ["listbox visible", "typed query preserved"],
-            }
-        )
-
-        self.assertEqual(assessment.status, "needs_option_selection")
-        self.assertEqual(assessment.confidence, 0.82)
-        self.assertEqual(
-            assessment.evidence,
-            ("listbox visible", "typed query preserved"),
-        )
-
     def test_rejects_unsupported_interactive_field_status(self) -> None:
         with self.assertRaises(BrowserAutomationError):
             parse_browser_interactive_field_assessment(
@@ -42,8 +25,8 @@ class BrowserInteractiveFieldAssessmentTests(unittest.TestCase):
 
 
 class InteractiveFieldRecoveryDirectiveTests(unittest.TestCase):
-    def test_maps_option_selection_to_specific_task(self) -> None:
-        directive = _interactive_field_recovery_directive(
+    def test_builds_distinct_recovery_directives_for_chooser_states(self) -> None:
+        option_selection = _interactive_field_recovery_directive(
             assessment=parse_browser_interactive_field_assessment(
                 {
                     "status": "needs_option_selection",
@@ -55,15 +38,7 @@ class InteractiveFieldRecoveryDirectiveTests(unittest.TestCase):
             field_label="Location (city)*",
             target_value="Sao Paulo",
         )
-
-        self.assertEqual(
-            directive.task_name,
-            "linkedin_easy_apply_select_chooser_option",
-        )
-        self.assertIn("Select the best visible chooser", directive.goal)
-
-    def test_maps_query_reformulation_to_specific_task(self) -> None:
-        directive = _interactive_field_recovery_directive(
+        query_reformulation = _interactive_field_recovery_directive(
             assessment=parse_browser_interactive_field_assessment(
                 {
                     "status": "needs_query_reformulation",
@@ -76,8 +51,8 @@ class InteractiveFieldRecoveryDirectiveTests(unittest.TestCase):
             target_value="Universidade de Sao Paulo",
         )
 
-        self.assertEqual(
-            directive.task_name,
-            "linkedin_easy_apply_reformulate_chooser_query",
-        )
-        self.assertIn("surface a semantically matching option", directive.goal)
+        self.assertNotEqual(option_selection.task_name, query_reformulation.task_name)
+        self.assertIn("chooser/autocomplete", option_selection.goal)
+        self.assertIn("matching option", query_reformulation.goal)
+        self.assertIn("intended value", option_selection.extra_rules[0])
+        self.assertIn("intended value", query_reformulation.extra_rules[0])

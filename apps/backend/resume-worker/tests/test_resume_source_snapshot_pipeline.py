@@ -85,6 +85,7 @@ class ResumeSourceSnapshotPipelineTests(unittest.TestCase):
         database_path = temp_root / "resume-snapshot.db"
         database_url = f"sqlite:///{database_path}"
         engine = create_sqlalchemy_engine(database_url)
+        self.addCleanup(engine.dispose)
         Base.metadata.create_all(engine)
         self.repository = SqliteResumeSourceSnapshotRepository(create_session_factory(database_url))
         self.runtime_settings = RuntimeSettings(

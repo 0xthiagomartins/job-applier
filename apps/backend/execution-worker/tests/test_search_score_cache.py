@@ -123,6 +123,7 @@ class LinkedInSearchScoreCacheTests(unittest.TestCase):
             job_repository=self.repository,
             ttl_seconds=3600,
         )
+        self.addCleanup(self.cache._cache.close)  # noqa: SLF001
 
     def test_campaign_cache_roundtrip_reuses_saved_postings(self) -> None:
         posting = self.repository.save(_make_posting())

@@ -16,6 +16,7 @@ class DiskCacheApplyActionMemoryRepositoryTests(unittest.TestCase):
         self._temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._temp_dir.cleanup)
         self.repository = DiskCacheApplyActionMemoryRepository(Path(self._temp_dir.name))
+        self.addCleanup(self.repository._cache.close)  # noqa: SLF001
 
     def test_save_replaces_existing_signature_and_prunes_expired(self) -> None:
         now = datetime.now(tz=UTC)
