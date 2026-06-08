@@ -224,6 +224,50 @@ def _normalized_profile_city_value(value: str | None) -> str | None:
     return normalized or city
 
 
+def _validation_feedback_requires_semantic_retry(
+    *,
+    field: EasyApplyField,
+    normalized_validation: str,
+) -> bool:
+    if field.control_kind not in {"text", "textarea"}:
+        return False
+    feedback = normalize_text(
+        " ".join(
+            fragment
+            for fragment in (
+                normalized_validation,
+                field.field_context,
+                field.helper_text or "",
+                field.question_raw,
+                field.normalized_key,
+            )
+            if fragment
+        )
+    )
+    if not feedback:
+        return False
+    return any(
+        token in feedback
+        for token in (
+            "required",
+            "invalid",
+            "selection",
+            "select",
+            "choose",
+            "autocomplete",
+            "combobox",
+            "dropdown",
+            "suggest",
+            "obrigatorio",
+            "obrigatoria",
+            "invalido",
+            "inválido",
+            "selec",
+            "escolh",
+        )
+    )
+
+
 def _canonical_binary_token(value: str) -> str | None:
     normalized = normalize_text(value)
     if normalized in _YES_OPTION_TOKENS:
@@ -2154,6 +2198,10 @@ class LinkedInAnswerResolver:
     ) -> ResolvedFieldValue | None:
         normalized_validation = normalize_text(validation_message or "")
         adapted_field = self._adapt_field_for_validation_feedback(field, normalized_validation)
+        semantic_retry_feedback = _validation_feedback_requires_semantic_retry(
+            field=adapted_field,
+            normalized_validation=normalized_validation,
+        )
         normalized_question = normalize_text(f"{field.question_raw} {field.normalized_key}")
         prefer_numeric_coercion = (
             adapted_field.question_type is QuestionType.YEARS_EXPERIENCE
@@ -2209,10 +2257,13 @@ class LinkedInAnswerResolver:
             if base_resolution is not None:
                 candidates.append(base_resolution)
 
+        suppress_blind_value_reuse = semantic_retry_feedback and not prefer_numeric_coercion
         for raw_value, reasoning in (
             (previous_answer, "reuse_previous_answer_with_validation_feedback"),
             (current_value, "reuse_current_value_with_validation_feedback"),
         ):
+            if suppress_blind_value_reuse:
+                continue
             if raw_value is None or not raw_value.strip():
                 continue
             coerced_value = _coerce_value_for_validation_feedback(

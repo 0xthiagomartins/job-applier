@@ -35,6 +35,16 @@ BrowserAssessmentStatus = Literal[
     "manual_intervention",
     "unknown",
 ]
+BrowserInteractiveFieldStatus = Literal[
+    "accepted",
+    "needs_focus",
+    "needs_option_selection",
+    "needs_query_reformulation",
+    "needs_confirmation",
+    "blocked",
+    "manual_intervention",
+    "unknown",
+]
 BrowserStallStatus = Literal["recoverable", "manual_intervention", "abort"]
 
 STRUCTURED_OUTPUT_SCHEMA = {
@@ -136,6 +146,41 @@ STRUCTURED_ASSESSMENT_SCHEMA = {
             "description": (
                 "Short signals visible in the page snapshot that support the assessment."
             ),
+        },
+    },
+    "required": ["status", "confidence", "summary", "evidence"],
+}
+
+STRUCTURED_INTERACTIVE_FIELD_ASSESSMENT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "status": {
+            "type": "string",
+            "enum": [
+                "accepted",
+                "needs_focus",
+                "needs_option_selection",
+                "needs_query_reformulation",
+                "needs_confirmation",
+                "blocked",
+                "manual_intervention",
+                "unknown",
+            ],
+        },
+        "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+        },
+        "summary": {
+            "type": "string",
+            "description": "Short explanation of the interactive field state.",
+        },
+        "evidence": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Short visible clues from the field snapshot.",
         },
     },
     "required": ["status", "confidence", "summary", "evidence"],
@@ -275,6 +320,16 @@ class BrowserTaskAssessment:
 
 
 @dataclass(frozen=True, slots=True)
+class BrowserInteractiveFieldAssessment:
+    """Structured diagnosis of one chooser/autocomplete field interaction."""
+
+    status: BrowserInteractiveFieldStatus
+    confidence: float
+    summary: str
+    evidence: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class BrowserStallDiagnosis:
     """Structured diagnosis used when the browser flow stops making progress."""
 
@@ -302,6 +357,17 @@ def _serialize_action(action: BrowserAgentAction) -> dict[str, object]:
 
 
 def _serialize_assessment(assessment: BrowserTaskAssessment) -> dict[str, object]:
+    return {
+        "status": assessment.status,
+        "confidence": assessment.confidence,
+        "summary": assessment.summary,
+        "evidence": list(assessment.evidence),
+    }
+
+
+def _serialize_interactive_field_assessment(
+    assessment: BrowserInteractiveFieldAssessment,
+) -> dict[str, object]:
     return {
         "status": assessment.status,
         "confidence": assessment.confidence,
@@ -2061,7 +2127,9 @@ class OpenAIResponsesBrowserAgent:
         is_complete: PageTaskComplete,
         extra_rules: Sequence[str] = (),
         allowed_action_types: Sequence[BrowserActionType] | None = None,
-    ) -> None:
+        focus_locator: Locator | None = None,
+        priority_locator: Locator | None = None,
+    ) -> BrowserAgentAction | None:
         """Drive one volatile browser task until its completion predicate succeeds."""
 
         deadline = asyncio.get_running_loop().time() + timeout_seconds
@@ -2070,12 +2138,18 @@ class OpenAIResponsesBrowserAgent:
         previous_snapshot_signature = ""
         repeated_snapshot_count = 0
         stall_diagnosis: BrowserStallDiagnosis | None = None
+        last_action: BrowserAgentAction | None = None
 
         for step_index in range(self._max_steps):
             if await is_complete(page):
-                return
+                return last_action
 
-            snapshot = await self._snapshotter.capture(page)
+            await self._align_priority_locator_into_view(page, priority_locator)
+            snapshot = await self._snapshotter.capture(
+                page,
+                focus_locator=focus_locator,
+                priority_locator=priority_locator,
+            )
             current_snapshot_signature = snapshot_signature(snapshot)
             snapshot_changed = current_snapshot_signature != previous_snapshot_signature
             repeated_snapshot_count = 1 if snapshot_changed else repeated_snapshot_count + 1
@@ -2230,7 +2304,11 @@ class OpenAIResponsesBrowserAgent:
                 previous_snapshot_signature = ""
                 continue
             try:
-                post_action_snapshot = await self._snapshotter.capture(page)
+                post_action_snapshot = await self._snapshotter.capture(
+                    page,
+                    focus_locator=focus_locator,
+                    priority_locator=priority_locator,
+                )
                 post_action_signature = snapshot_signature(post_action_snapshot)
             except Exception:  # noqa: BLE001
                 post_action_signature = None
@@ -2267,6 +2345,7 @@ class OpenAIResponsesBrowserAgent:
                     "snapshot_changed": snapshot_changed,
                 }
             )
+            last_action = action
             previous_snapshot_signature = current_snapshot_signature
             if (
                 post_action_signature is not None
@@ -2275,7 +2354,7 @@ class OpenAIResponsesBrowserAgent:
                 stall_diagnosis = None
 
         if await is_complete(page):
-            return
+            return last_action
         msg = f"Browser agent exhausted the {task_name} task before completion."
         raise BrowserAutomationError(msg)
 
@@ -2648,6 +2727,75 @@ class OpenAIResponsesBrowserAgent:
         )
         return action
 
+    async def assess_interactive_field(
+        self,
+        *,
+        page: Page,
+        goal: str,
+        task_name: str,
+        extra_rules: Sequence[str] = (),
+        recent_actions: Sequence[dict[str, object]] = (),
+        step_index: int = 0,
+        focus_locator: Locator | None = None,
+    ) -> BrowserInteractiveFieldAssessment:
+        """Return a structured assessment of a chooser/autocomplete field state."""
+
+        snapshot = await self._snapshotter.capture(page, focus_locator=focus_locator)
+        current_snapshot_signature = snapshot_signature(snapshot)
+        self._append_browser_agent_log(
+            "browser-agent/interactive-field-assessment-trace.jsonl",
+            {
+                "kind": "interactive_field_assessment_snapshot",
+                "task_name": task_name,
+                "step_index": step_index,
+                "snapshot_signature": current_snapshot_signature,
+                "snapshot": serialize_snapshot(snapshot),
+            },
+        )
+        if has_manual_intervention_cues(snapshot):
+            return BrowserInteractiveFieldAssessment(
+                status="manual_intervention",
+                confidence=0.99,
+                summary=(
+                    "The page looks like a verification or checkpoint screen that needs a human."
+                ),
+                evidence=("manual_intervention_cue_detected", snapshot.title or snapshot.url),
+            )
+        response_data = await asyncio.to_thread(
+            self._create_interactive_field_assessment_response,
+            snapshot,
+            goal,
+            task_name,
+            step_index,
+            recent_actions,
+            extra_rules,
+        )
+        raw_output = self._extract_output_text(response_data)
+        logger.info(
+            "linkedin_browser_agent_interactive_field_assessment_response",
+            extra={"model": self._model, "task_name": task_name, "response_text": raw_output},
+        )
+        if not raw_output:
+            msg = "Browser agent returned an empty interactive field assessment."
+            raise BrowserAutomationError(msg)
+        try:
+            payload = json.loads(raw_output)
+        except json.JSONDecodeError as exc:
+            msg = "Browser agent returned invalid JSON for the interactive field assessment."
+            raise BrowserAutomationError(msg) from exc
+        assessment = parse_browser_interactive_field_assessment(payload)
+        self._append_browser_agent_log(
+            "browser-agent/interactive-field-assessment-trace.jsonl",
+            {
+                "kind": "interactive_field_assessment_result",
+                "task_name": task_name,
+                "step_index": step_index,
+                "snapshot_signature": current_snapshot_signature,
+                "assessment": _serialize_interactive_field_assessment(assessment),
+            },
+        )
+        return assessment
+
     def _create_response(
         self,
         snapshot: BrowserAgentSnapshot,
@@ -2973,6 +3121,150 @@ class OpenAIResponsesBrowserAgent:
         )
         return response_payload
 
+    def _create_interactive_field_assessment_response(
+        self,
+        snapshot: BrowserAgentSnapshot,
+        goal: str,
+        task_name: str,
+        step_index: int,
+        recent_actions: Sequence[dict[str, object]],
+        extra_rules: Sequence[str],
+    ) -> dict[str, object]:
+        elements_payload = [
+            {
+                "element_id": element.element_id,
+                "tag": element.tag,
+                "role": element.role,
+                "label": element.label,
+                "text": truncate_text(element.text or "", limit=120) or None,
+                "placeholder": element.placeholder,
+                "name": element.name,
+                "input_type": element.input_type,
+                "href": element.href,
+                "current_value": truncate_text(element.current_value or "", limit=80) or None,
+                "disabled": element.disabled,
+                "focused": element.focused,
+                "invalid": element.invalid,
+                "expanded": element.expanded,
+                "selected": element.selected,
+                "validation_text": truncate_text(element.validation_text or "", limit=120) or None,
+                "is_priority_target": element.is_priority_target,
+            }
+            for element in snapshot.elements
+        ]
+        prompt_payload = {
+            "goal": goal,
+            "task_name": task_name,
+            "step_index": step_index,
+            "page": {
+                "url": snapshot.url,
+                "title": snapshot.title,
+                "active_surface": snapshot.active_surface,
+                "active_surface_scrollable": snapshot.active_surface_scrollable,
+                "active_surface_can_scroll_down": snapshot.active_surface_can_scroll_down,
+                "active_surface_can_scroll_up": snapshot.active_surface_can_scroll_up,
+                "page_can_scroll_down": snapshot.page_can_scroll_down,
+                "page_can_scroll_up": snapshot.page_can_scroll_up,
+                "visible_text": snapshot.visible_text,
+                "elements": elements_payload,
+            },
+            "recent_action_history": list(recent_actions),
+            "rules": [
+                "Assess only the interactive field and its nearby chooser/autocomplete state.",
+                "Use accepted only when the field appears genuinely accepted by the UI.",
+                (
+                    "Use needs_focus when the widget likely needs focus recovery or reopening "
+                    "before options or commit actions can work."
+                ),
+                (
+                    "Use needs_option_selection when visible suggestions or options should be "
+                    "selected from the current chooser state."
+                ),
+                (
+                    "Use needs_query_reformulation when the current text likely needs a safer, "
+                    "semantically equivalent query so the chooser can surface the right option."
+                ),
+                (
+                    "Use needs_confirmation when the intended answer seems present or nearly "
+                    "selected but still needs a commit move such as Enter, Tab, or a final click."
+                ),
+                (
+                    "Use blocked when the field is visibly rejected and the current snapshot "
+                    "does not show a safe in-widget recovery path."
+                ),
+                "Use manual_intervention only for captcha, OTP, or human checkpoints.",
+                "Use unknown when the snapshot still lacks enough evidence.",
+                "Keep summary short and concrete.",
+                "Use evidence for short visible clues from the widget snapshot.",
+                *extra_rules,
+            ],
+        }
+        self._append_browser_agent_log(
+            "llm/browser-agent.jsonl",
+            {
+                "kind": "interactive_field_assessment_request",
+                "task_name": task_name,
+                "step_index": step_index,
+                "snapshot_signature": snapshot_signature(snapshot),
+                "model": self._model,
+                "prompt_payload": prompt_payload,
+            },
+        )
+        body = {
+            "model": self._model,
+            "input": [
+                {
+                    "role": "developer",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "You are assessing one interactive chooser/autocomplete field "
+                                "inside a LinkedIn browser task. Return only a structured "
+                                "diagnosis of what kind of interaction that field needs next."
+                            ),
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": json.dumps(prompt_payload, ensure_ascii=True),
+                        },
+                    ],
+                },
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "browser_interactive_field_assessment",
+                    "schema": STRUCTURED_INTERACTIVE_FIELD_ASSESSMENT_SCHEMA,
+                    "strict": True,
+                },
+            },
+        }
+        payload_bytes = json.dumps(body, ensure_ascii=True).encode("utf-8")
+        response_payload = self._post_openai_response(
+            payload_bytes=payload_bytes,
+            task_name=task_name,
+            mode="interactive_field_assessment",
+            log_event_name="openai_browser_agent_interactive_field_assessment_http_error",
+        )
+        self._append_browser_agent_log(
+            "llm/browser-agent.jsonl",
+            {
+                "kind": "interactive_field_assessment_response",
+                "task_name": task_name,
+                "step_index": step_index,
+                "snapshot_signature": snapshot_signature(snapshot),
+                "model": self._model,
+                "response_payload": response_payload,
+            },
+        )
+        return response_payload
+
     async def _diagnose_stall(
         self,
         *,
@@ -3108,7 +3400,7 @@ class OpenAIResponsesBrowserAgent:
         *,
         payload_bytes: bytes,
         task_name: str,
-        mode: Literal["planning", "assessment"],
+        mode: Literal["planning", "assessment", "interactive_field_assessment"],
         log_event_name: str,
     ) -> dict[str, object]:
         for attempt in range(self._openai_max_retries + 1):
@@ -3874,7 +4166,7 @@ def summarize_openai_responses_error(
     status: int,
     body: str,
     task_name: str,
-    mode: Literal["planning", "assessment"],
+    mode: Literal["planning", "assessment", "interactive_field_assessment"],
 ) -> str:
     """Return a clearer OpenAI Responses API error for browser-agent failures."""
 
@@ -4017,6 +4309,49 @@ def parse_browser_task_assessment(payload: dict[str, object]) -> BrowserTaskAsse
 
     return BrowserTaskAssessment(
         status=cast(BrowserAssessmentStatus, status),
+        confidence=max(0.0, min(1.0, confidence)),
+        summary=str(payload.get("summary") or "").strip(),
+        evidence=evidence,
+    )
+
+
+def parse_browser_interactive_field_assessment(
+    payload: dict[str, object],
+) -> BrowserInteractiveFieldAssessment:
+    """Validate the structured chooser/autocomplete assessment payload."""
+
+    status = payload.get("status")
+    if status not in {
+        "accepted",
+        "needs_focus",
+        "needs_option_selection",
+        "needs_query_reformulation",
+        "needs_confirmation",
+        "blocked",
+        "manual_intervention",
+        "unknown",
+    }:
+        msg = "Browser agent returned an unsupported interactive field assessment status."
+        raise BrowserAutomationError(msg)
+
+    confidence_raw = payload.get("confidence", 0.0)
+    if not isinstance(confidence_raw, (int, float, str)):
+        msg = "Browser agent returned an invalid interactive field assessment confidence."
+        raise BrowserAutomationError(msg)
+    try:
+        confidence = float(confidence_raw)
+    except (TypeError, ValueError) as exc:
+        msg = "Browser agent returned an invalid interactive field assessment confidence."
+        raise BrowserAutomationError(msg) from exc
+
+    evidence_raw = payload.get("evidence", ())
+    evidence_items = evidence_raw if isinstance(evidence_raw, list) else ()
+    evidence = tuple(
+        item.strip() for item in evidence_items if isinstance(item, str) and item.strip()
+    )
+
+    return BrowserInteractiveFieldAssessment(
+        status=cast(BrowserInteractiveFieldStatus, status),
         confidence=max(0.0, min(1.0, confidence)),
         summary=str(payload.get("summary") or "").strip(),
         evidence=evidence,

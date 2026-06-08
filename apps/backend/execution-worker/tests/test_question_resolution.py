@@ -32,6 +32,7 @@ from job_applier.infrastructure.linkedin.question_resolution import (
     OpenAIResponsesRateLimitError,
     OpenAISemanticStepPlanner,
     SemanticFieldPlan,
+    _validation_feedback_requires_semantic_retry,
 )
 
 
@@ -399,6 +400,40 @@ class LinkedInAnswerResolverRateLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(resolved)
         self.assertEqual(self.generator.calls, 0)
 
+    async def test_semantic_text_feedback_does_not_blindly_reuse_rejected_value(
+        self,
+    ) -> None:
+        field = EasyApplyField(
+            question_raw="Enter city or location",
+            normalized_key="city",
+            question_type=QuestionType.CITY,
+            control_kind="text",
+            input_type="text",
+            required=True,
+            prefilled=True,
+            current_value="Sao Paulo",
+            field_context="Location (city)* This field is required",
+        )
+
+        resolved = await self.resolver.resolve_with_validation_feedback(
+            field,
+            self.settings,
+            posting=self.posting,
+            validation_message="This field is required",
+            current_value="Sao Paulo",
+            previous_answer="Sao Paulo",
+        )
+
+        if resolved is not None:
+            self.assertNotEqual(
+                resolved.reasoning,
+                "reuse_previous_answer_with_validation_feedback",
+            )
+            self.assertNotEqual(
+                resolved.reasoning,
+                "reuse_current_value_with_validation_feedback",
+            )
+
     async def test_required_salary_expectation_without_profile_fact_stays_unresolved(self) -> None:
         field = EasyApplyField(
             question_raw="What is your salary expectation?",
@@ -710,6 +745,26 @@ class LinkedInAnswerResolverRateLimitTests(unittest.IsolatedAsyncioTestCase):
                     ],
                 }
             },
+        )
+
+
+class ValidationFeedbackSemanticRetryTests(unittest.TestCase):
+    def test_semantic_retry_detects_required_chooser_feedback_for_text_field(self) -> None:
+        field = EasyApplyField(
+            question_raw="Enter city or location",
+            normalized_key="city",
+            question_type=QuestionType.CITY,
+            control_kind="text",
+            input_type="text",
+            required=True,
+            field_context="Location (city)* This field is required",
+        )
+
+        self.assertTrue(
+            _validation_feedback_requires_semantic_retry(
+                field=field,
+                normalized_validation="this field is required",
+            )
         )
 
 

@@ -24,7 +24,11 @@ from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserAgentElement,
     BrowserAgentSnapshot,
 )
-from job_applier.infrastructure.linkedin.easy_apply import PlaywrightLinkedInEasyApplyExecutor
+from job_applier.infrastructure.linkedin.easy_apply import (
+    EasyApplyStep,
+    PlaywrightLinkedInEasyApplyExecutor,
+    _field_requires_agentic_semantic_recovery,
+)
 from job_applier.infrastructure.linkedin.question_resolution import (
     EasyApplyField,
     ResolvedFieldValue,
@@ -733,6 +737,133 @@ class EasyApplyCheckboxStateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(applied)
         self.assertTrue(bool(state["aria_checked"]))
+
+
+class EasyApplySemanticAcceptanceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_field_semantic_acceptance_rejects_same_step_when_feedback_persists(self) -> None:
+        executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
+        field = EasyApplyField(
+            question_raw="Enter city or location",
+            normalized_key="city",
+            question_type=QuestionType.CITY,
+            control_kind="text",
+            input_type="text",
+            required=True,
+            prefilled=True,
+            current_value="Sao Paulo",
+            field_context="Location (city)*",
+            dom_ref="job-applier-city",
+        )
+        current_step = EasyApplyStep(
+            step_index=0,
+            total_steps=3,
+            surface_text="Contact info",
+            fields=(
+                EasyApplyField(
+                    question_raw="Enter city or location",
+                    normalized_key="city",
+                    question_type=QuestionType.CITY,
+                    control_kind="text",
+                    input_type="text",
+                    required=True,
+                    prefilled=True,
+                    current_value="Sao Paulo",
+                    field_context="Location (city)* This field is required",
+                    dom_ref="job-applier-city",
+                ),
+            ),
+        )
+        cast(Any, executor)._extract_step = AsyncMock(return_value=current_step)
+
+        accepted = await (
+            PlaywrightLinkedInEasyApplyExecutor._field_text_value_semantically_accepted(
+                executor,
+                page=cast(Any, object()),
+                field=field,
+                semantic_retry_required=True,
+                last_known_step_index=0,
+                last_known_total_steps=3,
+            )
+        )
+
+        self.assertFalse(accepted)
+
+    async def test_field_semantic_acceptance_accepts_when_step_changes(self) -> None:
+        executor = object.__new__(PlaywrightLinkedInEasyApplyExecutor)
+        field = EasyApplyField(
+            question_raw="Enter city or location",
+            normalized_key="city",
+            question_type=QuestionType.CITY,
+            control_kind="text",
+            input_type="text",
+            required=True,
+            dom_ref="job-applier-city",
+        )
+        advanced_step = EasyApplyStep(
+            step_index=1,
+            total_steps=3,
+            surface_text="Review",
+            fields=(),
+        )
+        cast(Any, executor)._extract_step = AsyncMock(return_value=advanced_step)
+
+        accepted = await (
+            PlaywrightLinkedInEasyApplyExecutor._field_text_value_semantically_accepted(
+                executor,
+                page=cast(Any, object()),
+                field=field,
+                semantic_retry_required=True,
+                last_known_step_index=0,
+                last_known_total_steps=3,
+            )
+        )
+
+        self.assertTrue(accepted)
+
+
+class EasyApplySemanticRecoveryGuardrailTests(unittest.TestCase):
+    def test_prefilled_invalid_text_field_requires_agentic_recovery(self) -> None:
+        field = EasyApplyField(
+            question_raw="Enter city or location",
+            normalized_key="city",
+            question_type=QuestionType.CITY,
+            control_kind="text",
+            input_type="text",
+            current_value="Sao Paulo",
+            prefilled=True,
+            field_context="Location (city)* This field is required",
+        )
+
+        self.assertTrue(_field_requires_agentic_semantic_recovery(field))
+
+    def test_prefilled_valid_text_field_does_not_require_agentic_recovery(self) -> None:
+        field = EasyApplyField(
+            question_raw="Portfolio URL",
+            normalized_key="portfolio_url",
+            question_type=QuestionType.PORTFOLIO_URL,
+            control_kind="text",
+            input_type="text",
+            current_value="https://example.com",
+            prefilled=True,
+            field_context="Portfolio URL",
+        )
+
+        self.assertFalse(_field_requires_agentic_semantic_recovery(field))
+
+    def test_non_text_field_does_not_require_agentic_recovery(self) -> None:
+        field = EasyApplyField(
+            question_raw="Email address*",
+            normalized_key="email",
+            question_type=QuestionType.EMAIL,
+            control_kind="select",
+            input_type="select",
+            current_value="thiago@example.com",
+            prefilled=True,
+            field_context="This field is required",
+            options=("thiago@example.com",),
+        )
+
+        self.assertFalse(_field_requires_agentic_semantic_recovery(field))
 
 
 if __name__ == "__main__":

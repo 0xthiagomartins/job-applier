@@ -92,6 +92,7 @@ from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserAgentSnapshot,
     BrowserAutomationError,
     BrowserDomSnapshotter,
+    BrowserInteractiveFieldAssessment,
     BrowserTaskAssessment,
     OpenAIResponsesBrowserAgent,
 )
@@ -105,6 +106,7 @@ from job_applier.infrastructure.linkedin.question_resolution import (
     _looks_like_sensitive_demographic_question,
     _profile_first_name,
     _profile_last_name,
+    _validation_feedback_requires_semantic_retry,
     field_has_meaningful_current_value,
     field_needs_semantic_step_planning,
     field_reference,
@@ -185,6 +187,14 @@ def _field_has_explicit_invalid_feedback(field: EasyApplyField) -> bool:
     )
 
 
+def _field_requires_agentic_semantic_recovery(field: EasyApplyField) -> bool:
+    if field.control_kind not in {"text", "textarea"}:
+        return False
+    if not field_has_meaningful_current_value(field):
+        return False
+    return _field_has_explicit_invalid_feedback(field)
+
+
 def _resume_field_matches_requested_cv(
     field: EasyApplyField,
     *,
@@ -201,6 +211,104 @@ def _resume_field_matches_requested_cv(
     return _resume_text_matches_requested_cv(field.current_value, target_filename)
 
 
+def _interactive_field_recovery_directive(
+    *,
+    assessment: BrowserInteractiveFieldAssessment,
+    field_label: str,
+    target_value: str,
+) -> InteractiveFieldRecoveryDirective:
+    """Translate one chooser/autocomplete assessment into an agentic recovery plan."""
+
+    common_rule = (
+        f"The field {field_label!r} must end up accepted for the intended value {target_value!r}."
+    )
+    match assessment.status:
+        case "needs_focus":
+            return InteractiveFieldRecoveryDirective(
+                task_name="linkedin_easy_apply_recover_chooser_focus",
+                goal=(
+                    "Recover focus or reopen the current chooser/autocomplete widget so it can "
+                    "surface or accept the intended answer without advancing the step."
+                ),
+                extra_rules=(
+                    common_rule,
+                    (
+                        "Prioritize refocusing the current widget, reopening hidden suggestions, "
+                        "or restoring the chooser state before attempting to confirm anything."
+                    ),
+                ),
+            )
+        case "needs_option_selection":
+            return InteractiveFieldRecoveryDirective(
+                task_name="linkedin_easy_apply_select_chooser_option",
+                goal=(
+                    "Select the best visible chooser/autocomplete option for the current field "
+                    "without advancing or closing the LinkedIn Easy Apply step."
+                ),
+                extra_rules=(
+                    common_rule,
+                    (
+                        "Prioritize selecting one visible option from the current chooser state "
+                        "before reformulating the query or leaving the widget."
+                    ),
+                ),
+            )
+        case "needs_query_reformulation":
+            return InteractiveFieldRecoveryDirective(
+                task_name="linkedin_easy_apply_reformulate_chooser_query",
+                goal=(
+                    "Adjust the chooser query only as much as needed to surface a "
+                    "semantically matching option for the current field."
+                ),
+                extra_rules=(
+                    common_rule,
+                    (
+                        "Preserve the meaning of the intended answer while using a shorter or "
+                        "UI-friendlier query that can reveal a matching suggestion."
+                    ),
+                ),
+            )
+        case "needs_confirmation":
+            return InteractiveFieldRecoveryDirective(
+                task_name="linkedin_easy_apply_confirm_chooser_selection",
+                goal=(
+                    "Commit the current or highlighted chooser/autocomplete selection so the "
+                    "field becomes accepted without advancing or closing the step."
+                ),
+                extra_rules=(
+                    common_rule,
+                    (
+                        "Prioritize a commit move such as clicking the current suggestion or "
+                        "using Enter or Tab only when it finalizes the existing widget state."
+                    ),
+                ),
+            )
+        case "blocked":
+            return InteractiveFieldRecoveryDirective(
+                task_name="linkedin_easy_apply_unblock_chooser_field",
+                goal=(
+                    "Recover the blocked chooser/autocomplete field so the current step can "
+                    "accept the intended answer without advancing or closing the form."
+                ),
+                extra_rules=(
+                    common_rule,
+                    (
+                        "The field currently looks blocked. Prefer materially different recovery "
+                        "moves instead of repeating the same ineffective interaction."
+                    ),
+                ),
+            )
+        case _:
+            return InteractiveFieldRecoveryDirective(
+                task_name="linkedin_easy_apply_finalize_field_interaction",
+                goal=(
+                    "Finish the interaction for the already-filled LinkedIn Easy Apply field so "
+                    "the current step accepts the value without advancing or closing the form."
+                ),
+                extra_rules=(common_rule,),
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class EasyApplyStep:
     """Current Easy Apply step metadata and discovered controls."""
@@ -209,6 +317,15 @@ class EasyApplyStep:
     total_steps: int
     fields: tuple[EasyApplyField, ...]
     surface_text: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class InteractiveFieldRecoveryDirective:
+    """Agentic recovery directive for chooser/autocomplete text widgets."""
+
+    task_name: str
+    goal: str
+    extra_rules: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +471,18 @@ def _step_surface_changed(previous_step: EasyApplyStep, current_step: EasyApplyS
         return False
     return normalize_text(previous_step.surface_text[:240]) != normalize_text(
         current_step.surface_text[:240]
+    )
+
+
+def _same_step_field_identity(left: EasyApplyField, right: EasyApplyField) -> bool:
+    left_ref = field_reference(left)
+    right_ref = field_reference(right)
+    if left_ref and right_ref and left_ref == right_ref:
+        return True
+    return (
+        left.question_type is right.question_type
+        and normalize_text(left.normalized_key) == normalize_text(right.normalized_key)
+        and normalize_text(left.question_raw) == normalize_text(right.question_raw)
     )
 
 
@@ -950,6 +1079,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 last_known_total_steps = 1
                 step_visit_counts: dict[int, int] = {}
                 force_resume_reselection = False
+                force_semantic_reassert_keys: set[str] = set()
                 resume_review_repair_attempted = False
                 resume_review_verified_selection = False
                 for _ in range(max_iterations):
@@ -1071,6 +1201,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             uploaded_cv_paths=uploaded_cv_paths,
                             submission_cv_path=submission_cv_path,
                             force_resume_reselection=force_resume_reselection,
+                            force_semantic_reassert_keys=frozenset(force_semantic_reassert_keys),
                         )
                     except MissingRequiredProfileDataError as exc:
                         notes = str(exc)
@@ -1186,6 +1317,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         if review_repair_reason == "resume_mismatch":
                             resume_review_repair_attempted = True
                             force_resume_reselection = True
+                        elif review_repair_reason == "invalid_city_review_value":
+                            force_semantic_reassert_keys = {"city"}
                         continue
 
                     try:
@@ -1665,6 +1798,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         uploaded_cv_paths: set[str],
         submission_cv_path: Path | None,
         force_resume_reselection: bool = False,
+        force_semantic_reassert_keys: frozenset[str] = frozenset(),
     ) -> tuple[list[ApplicationAnswer], list[ArtifactSnapshot]]:
         root = await self._easy_apply_root(page)
         answers: list[ApplicationAnswer] = []
@@ -1760,6 +1894,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 and submission_cv_path is not None
                 and not resume_field_matches_requested
             )
+            force_semantic_reassert = field.normalized_key in force_semantic_reassert_keys
             resolution: ResolvedFieldValue | None
             resolution_memory_entry: ApplyActionMemory | None = None
             resolution_memory_task_type: str | None = None
@@ -1811,6 +1946,29 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     current_value=field.current_value,
                     previous_answer=field.current_value,
                 )
+            if resolution is None and _field_requires_agentic_semantic_recovery(field):
+                resolution = ResolvedFieldValue(
+                    value=field.current_value,
+                    answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
+                    fill_strategy=FillStrategy.BEST_EFFORT,
+                    ambiguity_flag=True,
+                    confidence=0.05,
+                    reasoning="semantic_retry_existing_field_value",
+                )
+            if (
+                resolution is None
+                and force_semantic_reassert
+                and field_has_meaningful_current_value(field)
+            ):
+                resolution = ResolvedFieldValue(
+                    value=field.current_value,
+                    answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
+                    fill_strategy=FillStrategy.BEST_EFFORT,
+                    ambiguity_flag=True,
+                    confidence=0.05,
+                    reasoning="review_repair_reassert_existing_field_value",
+                )
+
             if resolution is None:
                 stage = (
                     "easy_apply_field_preserved"
@@ -1835,6 +1993,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         "classification_confidence": field.classification_confidence,
                         "field_context": field.field_context[:240],
                         "options_preview": list(field.options[:6]),
+                        "force_semantic_reassert": force_semantic_reassert,
                     },
                 )
                 if field.required and not (
@@ -1855,6 +2014,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 settings,
                 submission_cv_path=submission_cv_path,
                 force_resume_reassert=force_resume_refresh,
+                semantic_retry_required=(
+                    _field_has_explicit_invalid_feedback(field) or force_semantic_reassert
+                ),
+                step_index=step.step_index,
+                total_steps=step.total_steps,
             )
             if (
                 applied_value is None
@@ -1882,6 +2046,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         settings,
                         submission_cv_path=submission_cv_path,
                         force_resume_reassert=force_resume_refresh,
+                        semantic_retry_required=(
+                            _field_has_explicit_invalid_feedback(field) or force_semantic_reassert
+                        ),
+                        step_index=step.step_index,
+                        total_steps=step.total_steps,
                     )
             if applied_value is None:
                 self._record_event(
@@ -2006,6 +2175,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
         *,
         submission_cv_path: Path | None,
         force_resume_reassert: bool = False,
+        semantic_retry_required: bool = False,
+        step_index: int | None = None,
+        total_steps: int | None = None,
     ) -> str | None:
         match field.control_kind:
             case "text" | "textarea":
@@ -2026,6 +2198,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                 field=field,
                                 target_value=resolution.value,
                                 settings=settings,
+                                semantic_retry_required=semantic_retry_required,
+                                last_known_step_index=step_index,
+                                last_known_total_steps=total_steps,
                             ),
                             timeout=(
                                 self._runtime_settings.linkedin_field_interaction_timeout_seconds
@@ -2042,7 +2217,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     locator=locator,
                     initial_state=state,
                 )
-                if committed_state.invalid and field.question_type is QuestionType.CITY:
+                if semantic_retry_required or committed_state.invalid:
                     try:
                         return await asyncio.wait_for(
                             self._complete_text_field_interaction(
@@ -2050,6 +2225,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                 field=field,
                                 target_value=resolution.value,
                                 settings=settings,
+                                semantic_retry_required=semantic_retry_required,
+                                last_known_step_index=step_index,
+                                last_known_total_steps=total_steps,
                             ),
                             timeout=(
                                 self._runtime_settings.linkedin_field_interaction_timeout_seconds
@@ -2058,7 +2236,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     except TimeoutError as exc:
                         msg = (
                             "Timed out while the browser agent was trying to finalize an "
-                            "interactive LinkedIn Easy Apply city field."
+                            "interactive LinkedIn Easy Apply chooser field."
                         )
                         raise LinkedInEasyApplyError(msg) from exc
                 return committed_state.current_value or resolution.value
@@ -2178,9 +2356,11 @@ class PlaywrightLinkedInEasyApplyExecutor:
         field: EasyApplyField,
         target_value: str,
         settings: UserAgentSettings,
+        semantic_retry_required: bool = False,
+        last_known_step_index: int | None = None,
+        last_known_total_steps: int | None = None,
     ) -> str:
         browser_agent = self._create_browser_agent(settings)
-        recent_actions: list[dict[str, object]] = []
         initial_root = await self._easy_apply_root(page)
         initial_locator = await self._find_control_locator(initial_root, field)
         if initial_locator is None:
@@ -2195,7 +2375,6 @@ class PlaywrightLinkedInEasyApplyExecutor:
             visible_option_texts=initial_state.visible_option_texts,
             validation_message=initial_state.validation_message,
         )
-        stale_memory: ApplyActionMemory | None = None
 
         memory_entry, _, _ = await self._attempt_replay_apply_memory(
             browser_agent=browser_agent,
@@ -2211,47 +2390,72 @@ class PlaywrightLinkedInEasyApplyExecutor:
             locator_after_memory = await self._find_control_locator(root_after_memory, field)
             if locator_after_memory is not None:
                 memory_state = await self._inspect_text_field_interaction(locator_after_memory)
-                if self._text_field_interaction_complete(memory_state):
+                if await self._text_field_interaction_resolved(
+                    page,
+                    state=memory_state,
+                    field=field,
+                    semantic_retry_required=semantic_retry_required,
+                    last_known_step_index=last_known_step_index,
+                    last_known_total_steps=last_known_total_steps,
+                ):
                     self._record_apply_memory_success(memory_entry, task_type=TASK_FINALIZE_FIELD)
                     return memory_state.current_value or target_value
             self._record_apply_memory_failure(memory_entry, task_type=TASK_FINALIZE_FIELD)
-            stale_memory = memory_entry
 
-        for attempt_index in range(self._agentic_retry_budget(default=6)):
-            root = await self._easy_apply_root(page)
-            locator = await self._find_control_locator(root, field)
-            if locator is None:
-                msg = (
-                    "LinkedIn removed the current form field while the agent was trying to "
-                    "finalize it."
-                )
-                raise LinkedInEasyApplyError(msg)
-            state = await self._inspect_text_field_interaction(locator)
-            if self._text_field_interaction_complete(state):
-                return state.current_value or target_value
-            focus_locator = await self._field_interaction_focus_locator(root, field)
-            snapshot = await browser_agent.capture_task_snapshot(
-                page=page,
-                focus_locator=focus_locator or root,
-                priority_locator=locator,
+        root = await self._easy_apply_root(page)
+        locator = await self._find_control_locator(root, field)
+        if locator is None:
+            msg = (
+                "LinkedIn removed the current form field while the agent was trying to finalize it."
+            )
+            raise LinkedInEasyApplyError(msg)
+        state = await self._inspect_text_field_interaction(locator)
+        if await self._text_field_interaction_resolved(
+            page,
+            state=state,
+            field=field,
+            semantic_retry_required=semantic_retry_required,
+            last_known_step_index=last_known_step_index,
+            last_known_total_steps=last_known_total_steps,
+        ):
+            return state.current_value or target_value
+
+        focus_locator = await self._field_interaction_focus_locator(root, field)
+
+        async def field_interaction_complete(candidate_page: Page) -> bool:
+            candidate_root = await self._easy_apply_root(candidate_page)
+            candidate_locator = await self._find_control_locator(candidate_root, field)
+            if candidate_locator is None:
+                return True
+            candidate_state = await self._inspect_text_field_interaction(candidate_locator)
+            return await self._text_field_interaction_resolved(
+                candidate_page,
+                state=candidate_state,
+                field=field,
+                semantic_retry_required=semantic_retry_required,
+                last_known_step_index=last_known_step_index,
+                last_known_total_steps=last_known_total_steps,
             )
 
-            action = await browser_agent.perform_single_task_action(
+        try:
+            await browser_agent.complete_browser_task(
                 page=page,
                 available_values={"intended_field_value": target_value},
                 goal=(
-                    "Finish the interaction for the already-filled LinkedIn Easy Apply field "
-                    "so the current step accepts the value without advancing or closing the form."
+                    "Get the current LinkedIn Easy Apply field accepted by its own "
+                    "chooser, autocomplete, or suggestion widget without changing the "
+                    "underlying intended answer."
                 ),
-                task_name="linkedin_easy_apply_finalize_field_interaction",
+                timeout_seconds=self._runtime_settings.linkedin_field_interaction_timeout_seconds,
+                task_name="linkedin_easy_apply_finalize_interactive_field",
+                is_complete=field_interaction_complete,
                 extra_rules=(
-                    f"The already-filled field label is {field.question_raw!r}.",
-                    f"The intended accepted value is {target_value!r}.",
-                    f"The current field value is {state.current_value!r}.",
+                    f"The active field label is {field.question_raw!r}.",
+                    f"The intended accepted answer is {target_value!r}.",
                     (
-                        "The field is currently invalid and still rejected by the page."
-                        if state.invalid
-                        else "The field does not currently show a visible validation error."
+                        f"The field currently contains {state.current_value!r}."
+                        if state.current_value
+                        else "The field is currently blank."
                     ),
                     (
                         f"Visible field validation feedback: {state.validation_message!r}."
@@ -2259,150 +2463,93 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         else "No explicit validation text is currently visible for this field."
                     ),
                     (
-                        f"Visible chooser options: {', '.join(state.visible_option_texts)!r}."
+                        "Visible chooser options right now: "
+                        f"{', '.join(state.visible_option_texts)!r}."
                         if state.visible_option_texts
-                        else "No explicit chooser options are visible right now."
+                        else "No chooser options are visible in the current snapshot yet."
                     ),
                     (
-                        "The current validation says this field requires a selection. Treat "
-                        "this control like a chooser or autocomplete even if it visually "
-                        "resembles a plain text input."
-                        if state.validation_message
-                        and "selection" in normalize_text(state.validation_message)
-                        else "The current validation does not explicitly require a selection."
+                        f"The widget reports aria-autocomplete={state.aria_autocomplete!r}, "
+                        f"aria-expanded={state.aria_expanded}, "
+                        f"has_popup_binding={state.has_popup_binding}, "
+                        f"active_descendant={state.active_descendant!r}."
                     ),
                     (
-                        "Do not replace the field with an unrelated value. "
-                        "You may adjust the typed query only when that helps surface or select "
-                        "a valid option semantically matching the intended value."
+                        "The current step has already rejected this field once. Existing text "
+                        "in the box is not sufficient by itself; the widget must accept or "
+                        "commit the answer."
+                        if semantic_retry_required
+                        else "Treat this as an interactive field finalization task."
                     ),
                     (
-                        "If an autocomplete, combobox, suggestion list, or dropdown choice is "
-                        "visible for the current field, select the best matching option for the "
-                        "intended value."
+                        "This control may look like plain text, but if the UI exposes chooser, "
+                        "typeahead, listbox, or suggestion behavior, you must satisfy that "
+                        "widget rather than only typing text."
                     ),
                     (
-                        "When visible chooser options already exist for this field, prefer "
-                        "clicking the best matching visible option before using Enter or Tab."
+                        "If suggestions appear, select the best semantically matching option "
+                        "for the intended answer."
                     ),
                     (
-                        "A visible option may still be correct even when it is not an exact "
-                        "string match. Abbreviations, state or country suffixes, and nearby "
-                        "regional formats can still represent the intended location."
+                        "If no options are visible yet, recover focus, reopen the chooser, "
+                        "adjust the query only when needed to surface equivalent options, wait "
+                        "for the UI, and then commit the best match."
                     ),
                     (
-                        "The intended value may contain richer profile context or formatting "
-                        "than the UI chooser expects. If the current text is rejected, you may "
-                        "reformulate it into a shorter UI-friendly query only when it still "
-                        "points to the same underlying answer."
+                        "Once the field has a non-empty value, no visible validation error, "
+                        "and the current step no longer presents this field as rejected, you may "
+                        "treat the chooser interaction as complete even if the widget still "
+                        "retains autocomplete wiring such as aria-owns or aria-activedescendant."
                     ),
                     (
-                        "Use ArrowDown or ArrowUp only when they help reveal or highlight a "
-                        "better visible option. Do not rely on Enter as the first confirmation "
-                        "move when visible options are already present."
+                        "The intended answer may need a UI-friendly query variant, but do not "
+                        "drift to a different meaning."
                     ),
                     (
-                        "If no visible chooser option is currently present, the field may need "
-                        "keyboard confirmation or blur. In that case, use press with Enter, "
-                        "Tab, ArrowDown, or ArrowUp before Enter when needed."
+                        "Do not click Continue, Next, Review, Submit, Back, Dismiss, Close, or "
+                        "any other step-level control during this task."
                     ),
                     (
-                        "Do not click Continue, Next, Review, Submit, Dismiss, Close, Back, or "
-                        "other step-level controls in this task."
+                        "Stay inside the scoped field region and any chooser options connected "
+                        "to this field."
                     ),
                     (
-                        "If choices for the current field are hidden below the visible area of "
-                        "the blocking surface, scroll the active surface rather than the page."
-                    ),
-                    (
-                        "Use done only when the current field appears accepted and no chooser "
-                        "for it still needs attention."
-                    ),
-                    (
-                        "If recent_action_history shows field_changed_after_action=false, "
-                        "that previous move had no visible effect on the field. Prefer a "
-                        "materially different next action instead of repeating it."
+                        "Use done only when the widget itself appears to have accepted the "
+                        "answer or when the field disappears because the page no longer needs "
+                        "it."
                     ),
                 ),
                 allowed_action_types=("click", "fill", "press", "scroll", "wait", "done", "fail"),
-                recent_actions=recent_actions[-6:],
-                step_index=attempt_index,
-                focus_locator=focus_locator or root,
+                focus_locator=focus_locator or locator,
                 priority_locator=locator,
             )
-            root_after_action = await self._easy_apply_root(page)
-            locator_after_action = await self._find_control_locator(root_after_action, field)
-            post_state = (
-                await self._inspect_text_field_interaction(locator_after_action)
-                if locator_after_action is not None
-                else None
-            )
-            field_changed_after_action = False
-            if post_state is not None:
-                field_changed_after_action = (
-                    post_state.current_value != state.current_value
-                    or post_state.invalid != state.invalid
-                    or post_state.focused != state.focused
-                    or post_state.aria_expanded != state.aria_expanded
-                    or post_state.visible_option_count != state.visible_option_count
-                    or post_state.visible_option_texts != state.visible_option_texts
-                    or post_state.validation_message != state.validation_message
-                )
-            recent_actions.append(
-                {
-                    "attempt_index": attempt_index,
-                    "action_type": action.action_type,
-                    "action_intent": action.action_intent,
-                    "reasoning": action.reasoning,
-                    "field_key": field.normalized_key,
-                    "field_invalid_before_action": state.invalid,
-                    "field_focused_before_action": state.focused,
-                    "visible_option_count_before_action": state.visible_option_count,
-                    "visible_option_texts_before_action": list(state.visible_option_texts),
-                    "validation_message_before_action": state.validation_message,
-                    "field_value_after_action": (
-                        post_state.current_value if post_state is not None else None
-                    ),
-                    "field_invalid_after_action": (
-                        post_state.invalid if post_state is not None else None
-                    ),
-                    "field_focused_after_action": (
-                        post_state.focused if post_state is not None else None
-                    ),
-                    "visible_option_count_after_action": (
-                        post_state.visible_option_count if post_state is not None else None
-                    ),
-                    "visible_option_texts_after_action": (
-                        list(post_state.visible_option_texts) if post_state is not None else None
-                    ),
-                    "validation_message_after_action": (
-                        post_state.validation_message if post_state is not None else None
-                    ),
-                    "field_changed_after_action": field_changed_after_action,
-                }
-            )
-            if post_state is not None and self._text_field_interaction_complete(post_state):
-                self._promote_apply_memory(
-                    task_type=TASK_FINALIZE_FIELD,
-                    signature_payload=signature_payload,
-                    action=action,
-                    snapshot=snapshot,
-                    existing_memory=stale_memory,
-                    replace_existing=stale_memory is not None,
-                )
-                return post_state.current_value or target_value
-            if action.action_type in {"done", "fail"}:
-                break
+        except BrowserAutomationError as exc:
+            raise LinkedInEasyApplyError(str(exc)) from exc
 
         root = await self._easy_apply_root(page)
         locator = await self._find_control_locator(root, field)
         if locator is None:
-            msg = "LinkedIn changed the current field before the interaction could finish."
-            raise LinkedInEasyApplyError(msg)
+            return target_value
         final_state = await self._inspect_text_field_interaction(locator)
+        if await self._text_field_interaction_resolved(
+            page,
+            state=final_state,
+            field=field,
+            semantic_retry_required=semantic_retry_required,
+            last_known_step_index=last_known_step_index,
+            last_known_total_steps=last_known_total_steps,
+        ):
+            return final_state.current_value or target_value
         if (
             self._text_field_requires_interactive_selection(final_state)
             or not final_state.has_value
+            or not await self._field_text_value_semantically_accepted(
+                page,
+                field=field,
+                semantic_retry_required=semantic_retry_required,
+                last_known_step_index=last_known_step_index,
+                last_known_total_steps=last_known_total_steps,
+            )
         ):
             msg = (
                 "Browser agent could not finish the interactive field flow for the current "
@@ -2775,12 +2922,85 @@ class PlaywrightLinkedInEasyApplyExecutor:
             validation_message=str(payload.get("validation_message") or "").strip() or None,
         )
 
+    async def _field_text_value_semantically_accepted(
+        self,
+        page: Page,
+        *,
+        field: EasyApplyField,
+        semantic_retry_required: bool,
+        last_known_step_index: int | None,
+        last_known_total_steps: int | None,
+    ) -> bool:
+        if not semantic_retry_required:
+            return True
+        if last_known_step_index is None or last_known_total_steps is None:
+            return True
+        try:
+            current_step = await self._extract_step(
+                page,
+                last_known_step_index=last_known_step_index,
+                last_known_total_steps=last_known_total_steps,
+            )
+        except LinkedInEasyApplyError:
+            return True
+        if current_step.step_index != last_known_step_index:
+            return True
+        matching_field = next(
+            (
+                candidate
+                for candidate in current_step.fields
+                if _same_step_field_identity(candidate, field)
+            ),
+            None,
+        )
+        if matching_field is None:
+            return True
+        if not field_has_meaningful_current_value(matching_field):
+            return False
+        return not _validation_feedback_requires_semantic_retry(
+            field=matching_field,
+            normalized_validation=normalize_text(
+                " ".join(
+                    fragment
+                    for fragment in (
+                        matching_field.helper_text or "",
+                        matching_field.field_context,
+                    )
+                    if fragment
+                )
+            ),
+        )
+
     def _text_field_interaction_complete(self, state: TextFieldInteractionState) -> bool:
         return (
             state.has_value
             and not state.invalid
             and not self._text_field_requires_interactive_selection(state)
         )
+
+    async def _text_field_interaction_resolved(
+        self,
+        page: Page,
+        *,
+        state: TextFieldInteractionState,
+        field: EasyApplyField,
+        semantic_retry_required: bool,
+        last_known_step_index: int | None,
+        last_known_total_steps: int | None,
+    ) -> bool:
+        if not state.has_value or state.invalid:
+            return False
+        if not await self._field_text_value_semantically_accepted(
+            page,
+            field=field,
+            semantic_retry_required=semantic_retry_required,
+            last_known_step_index=last_known_step_index,
+            last_known_total_steps=last_known_total_steps,
+        ):
+            return False
+        if semantic_retry_required:
+            return True
+        return not self._text_field_requires_interactive_selection(state)
 
     def _text_field_requires_interactive_selection(
         self,
@@ -4694,11 +4914,103 @@ class PlaywrightLinkedInEasyApplyExecutor:
         locator = await self._find_control_locator(root, field)
         if locator is None:
             return None
+        try:
+            scope_token = await locator.evaluate(
+                """
+                (node) => {
+                  if (!node || node.nodeType !== 1) {
+                    return null;
+                  }
+                  const scopeAttr = "data-job-applier-field-scope";
+                  document
+                    .querySelectorAll(`[${scopeAttr}]`)
+                    .forEach((candidate) => candidate.removeAttribute(scopeAttr));
+
+                  const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                  const currentFieldRef = collapse(
+                    node.getAttribute("data-job-applier-field-ref"),
+                  );
+                  const relatedFieldRefs = (candidate) => {
+                    if (!candidate || candidate.nodeType !== 1) {
+                      return [];
+                    }
+                    const refs = [];
+                    const pushRef = (value) => {
+                      const normalized = collapse(value);
+                      if (normalized) {
+                        refs.push(normalized);
+                      }
+                    };
+                    pushRef(candidate.getAttribute("data-job-applier-field-ref"));
+                    for (const descendant of candidate.querySelectorAll(
+                      "[data-job-applier-field-ref]"
+                    )) {
+                      pushRef(descendant.getAttribute("data-job-applier-field-ref"));
+                    }
+                    return Array.from(new Set(refs));
+                  };
+                  const containsUnsafeGlobalControls = (candidate) => {
+                    if (!candidate || candidate.nodeType !== 1) {
+                      return false;
+                    }
+                    const interactiveDescendants = candidate.querySelectorAll(
+                      "button, a[href], [role='button'], [role='link']"
+                    );
+                    for (const descendant of interactiveDescendants) {
+                      if (
+                        descendant === node
+                        || node.contains(descendant)
+                        || descendant.contains(node)
+                      ) {
+                        continue;
+                      }
+                      return true;
+                    }
+                    return false;
+                  };
+
+                  let best = node;
+                  let current = node.parentElement;
+                  while (current && current !== document.body) {
+                    const refs = relatedFieldRefs(current);
+                    if (
+                      currentFieldRef
+                      && refs.length > 0
+                      && (refs.length > 1 || refs[0] !== currentFieldRef)
+                    ) {
+                      break;
+                    }
+                    if (containsUnsafeGlobalControls(current)) {
+                      break;
+                    }
+                    best = current;
+                    current = current.parentElement;
+                  }
+
+                  const token = currentFieldRef || "active-field-scope";
+                  best.setAttribute(scopeAttr, token);
+                  return token;
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            scope_token = None
+        if isinstance(scope_token, str) and scope_token.strip():
+            container = root.locator(
+                _attribute_selector("data-job-applier-field-scope", scope_token.strip())
+            )
+            if await container.count():
+                return container.first
         container = locator.locator(
-            "xpath=ancestor-or-self::*["
-            "@role='group' or @role='listbox' or @role='dialog' "
-            "or self::fieldset or self::section or self::form or self::div"
-            "][1]"
+            "xpath=ancestor-or-self::*[@role='group' or self::fieldset or self::section][1]"
+        )
+        if await container.count():
+            return container.first
+        wrapper = locator.locator("xpath=ancestor-or-self::div[1]")
+        if await wrapper.count():
+            return wrapper.first
+        container = locator.locator(
+            "xpath=ancestor-or-self::*[@role='listbox' or @role='dialog' or self::form][1]"
         )
         if await container.count():
             return container.first
@@ -7125,6 +7437,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                             effective_resolution,
                             settings,
                             submission_cv_path=None,
+                            semantic_retry_required=True,
+                            step_index=current_step.step_index,
+                            total_steps=current_step.total_steps,
                         ),
                         timeout=self._runtime_settings.linkedin_field_interaction_timeout_seconds,
                     )
@@ -7185,6 +7500,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     effective_resolution,
                     settings,
                     submission_cv_path=None,
+                    semantic_retry_required=True,
+                    step_index=current_step.step_index,
+                    total_steps=current_step.total_steps,
                 )
             except LinkedInEasyApplyError as exc:
                 self._record_event(
@@ -7234,6 +7552,32 @@ class PlaywrightLinkedInEasyApplyExecutor:
         browser_agent = self._create_browser_agent(settings)
         try:
             return await browser_agent.assess_browser_task(
+                page=page,
+                goal=goal,
+                task_name=task_name,
+                extra_rules=extra_rules,
+                recent_actions=recent_actions,
+                step_index=step_index,
+                focus_locator=focus_locator,
+            )
+        except BrowserAutomationError as exc:
+            raise LinkedInEasyApplyError(str(exc)) from exc
+
+    async def _assess_interactive_field_with_agent(
+        self,
+        page: Page,
+        *,
+        settings: UserAgentSettings,
+        task_name: str,
+        goal: str,
+        extra_rules: tuple[str, ...] = (),
+        recent_actions: tuple[dict[str, object], ...] = (),
+        step_index: int = 0,
+        focus_locator: Locator | None = None,
+    ) -> BrowserInteractiveFieldAssessment:
+        browser_agent = self._create_browser_agent(settings)
+        try:
+            return await browser_agent.assess_interactive_field(
                 page=page,
                 goal=goal,
                 task_name=task_name,
