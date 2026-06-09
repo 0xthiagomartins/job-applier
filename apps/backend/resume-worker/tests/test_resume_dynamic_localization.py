@@ -23,6 +23,7 @@ from job_applier.infrastructure.resume_dynamic import (
     ResumeEducationEntry,
     ResumeExperienceEntry,
     ResumeSourceSnapshot,
+    _render_localized_skill_line,
 )
 from job_applier.settings import RuntimeSettings
 
@@ -125,6 +126,20 @@ class ResumeDynamicLocalizationTests(unittest.TestCase):
             )
         )
 
+    def test_resume_item_needs_localization_flags_mixed_english_leaks_for_portuguese(self) -> None:
+        builder = OhMyCvDynamicResumeBuilder(self.runtime_settings)
+
+        self.assertTrue(
+            builder._resume_item_needs_localization(  # noqa: SLF001
+                ref="experience_bullet_0_0",
+                text=(
+                    "Worked on database modeling, service design, API development, "
+                    "testing strategy, and observability."
+                ),
+                target_language=SupportedLanguage.PORTUGUESE,
+            )
+        )
+
     def test_translate_resume_items_uses_larger_batches(self) -> None:
         builder = _BatchCountingResumeBuilder(self.runtime_settings)
         settings = _build_settings(
@@ -201,6 +216,68 @@ class ResumeDynamicLocalizationTests(unittest.TestCase):
         self.assertNotIn("certification_issuer_0", refs)
         self.assertIn("experience_date_0", refs)
         self.assertIn("education_degree_0", refs)
+
+    def test_render_localized_skill_line_translates_common_portuguese_leaks(self) -> None:
+        rendered = _render_localized_skill_line(
+            (
+                "Engineering Practices: Automated Testing, Observability, Production Support, "
+                "Process Orchestration, Reliability Improvement"
+            ),
+            SupportedLanguage.PORTUGUESE,
+        )
+
+        self.assertEqual(
+            (
+                "Práticas de Engenharia: Testes Automatizados, Observabilidade, "
+                "Suporte à Produção, Orquestração de Processos, Melhoria de Confiabilidade"
+            ),
+            rendered,
+        )
+
+    def test_apply_translated_resume_items_finalizes_mixed_portuguese_bullets(self) -> None:
+        builder = OhMyCvDynamicResumeBuilder(self.runtime_settings)
+        snapshot = ResumeSourceSnapshot(
+            header_role="Full Stack Software Engineer",
+            summary="Full Stack Software Engineer with experience in automation and backend.",
+            experience_entries=(
+                ResumeExperienceEntry(
+                    title="Software Developer",
+                    company_name="Example Co",
+                    date_range="2022 - Present",
+                    bullets=("Worked on service design, API development, and observability.",),
+                ),
+            ),
+            skill_lines=(
+                "Engineering Practices: Automated Testing, Observability, Production Support",
+            ),
+        )
+        plan = ResumeAdaptationPlan(
+            headline="Engenheiro de Software Full Stack",
+            summary="Experiência recente em backend e automação.",
+        )
+
+        localized_snapshot, _localized_plan = builder._apply_translated_resume_items(  # noqa: SLF001
+            resume_snapshot=snapshot,
+            adaptation_plan=plan,
+            translated_texts={
+                "experience_bullet_0_0": (
+                    "Worked on service design, API development, and observability."
+                ),
+                "skill_line_0": (
+                    "Engineering Practices: Automated Testing, Observability, Production Support"
+                ),
+            },
+            target_language=SupportedLanguage.PORTUGUESE,
+        )
+
+        self.assertEqual(
+            "Trabalhou com desenho de serviços, desenvolvimento de APIs, e observabilidade.",
+            localized_snapshot.experience_entries[0].bullets[0],
+        )
+        self.assertEqual(
+            "Práticas de Engenharia: Testes Automatizados, Observabilidade, Suporte à Produção",
+            localized_snapshot.skill_lines[0],
+        )
 
 
 if __name__ == "__main__":

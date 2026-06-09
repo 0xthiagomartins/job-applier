@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -320,6 +321,7 @@ _CANONICAL_TEXT_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     (r"\bazure\b", "Azure"),
     (r"\buipath\b", "UiPath"),
     (r"\blangchain\b", "LangChain"),
+    (r"\bmicrosserviços\b", "Microserviços"),
 )
 
 _HEADLINE_SPECIALIZATION_KEYWORDS = frozenset(
@@ -1419,6 +1421,8 @@ class OhMyCvDynamicResumeBuilder:
         sample_text = "\n".join(segment for segment in sampled_segments if segment.strip())
         if not sample_text:
             return False
+        if _resume_text_has_language_leaks(sample_text, target_language):
+            return False
         detection = detect_text_language(
             sample_text,
             default_language=target_language,
@@ -1434,26 +1438,30 @@ class OhMyCvDynamicResumeBuilder:
         translated_texts: dict[str, str],
         target_language: SupportedLanguage,
     ) -> tuple[ResumeSourceSnapshot, ResumeAdaptationPlan]:
+        finalized_translated_texts = {
+            ref: _finalize_localized_resume_text(text, target_language)
+            for ref, text in translated_texts.items()
+        }
         localized_plan = replace(
             adaptation_plan,
-            headline=translated_texts.get("headline", adaptation_plan.headline),
-            summary=translated_texts.get("summary", adaptation_plan.summary),
+            headline=finalized_translated_texts.get("headline", adaptation_plan.headline),
+            summary=finalized_translated_texts.get("summary", adaptation_plan.summary),
         )
 
         localized_experience_entries = tuple(
             replace(
                 entry,
-                title=translated_texts.get(f"experience_title_{index}", entry.title),
-                company_name=translated_texts.get(
+                title=finalized_translated_texts.get(f"experience_title_{index}", entry.title),
+                company_name=finalized_translated_texts.get(
                     f"experience_company_{index}",
                     entry.company_name,
                 ),
-                date_range=translated_texts.get(
+                date_range=finalized_translated_texts.get(
                     f"experience_date_{index}",
                     entry.date_range,
                 ),
                 bullets=tuple(
-                    translated_texts.get(
+                    finalized_translated_texts.get(
                         f"experience_bullet_{index}_{bullet_index}",
                         bullet,
                     )
@@ -1465,8 +1473,11 @@ class OhMyCvDynamicResumeBuilder:
         localized_certifications = tuple(
             replace(
                 certification,
-                name=translated_texts.get(f"certification_name_{index}", certification.name),
-                issuer=translated_texts.get(
+                name=finalized_translated_texts.get(
+                    f"certification_name_{index}",
+                    certification.name,
+                ),
+                issuer=finalized_translated_texts.get(
                     f"certification_issuer_{index}",
                     certification.issuer,
                 ),
@@ -1476,27 +1487,33 @@ class OhMyCvDynamicResumeBuilder:
         localized_education_entries = tuple(
             replace(
                 education,
-                institution=translated_texts.get(
+                institution=finalized_translated_texts.get(
                     f"education_institution_{index}",
                     education.institution,
                 ),
-                degree=translated_texts.get(f"education_degree_{index}", education.degree),
-                location=translated_texts.get(f"education_location_{index}", education.location),
+                degree=finalized_translated_texts.get(
+                    f"education_degree_{index}",
+                    education.degree,
+                ),
+                location=finalized_translated_texts.get(
+                    f"education_location_{index}",
+                    education.location,
+                ),
             )
             for index, education in enumerate(resume_snapshot.education_entries)
         )
         localized_skill_lines = tuple(
             self._localize_skill_line(
-                translated_texts.get(f"skill_line_{index}", skill_line),
+                finalized_translated_texts.get(f"skill_line_{index}", skill_line),
                 target_language=target_language,
             )
             for index, skill_line in enumerate(resume_snapshot.skill_lines)
         )
         localized_additional_sections = tuple(
             (
-                translated_texts.get(f"additional_title_{section_index}", title),
+                finalized_translated_texts.get(f"additional_title_{section_index}", title),
                 tuple(
-                    translated_texts.get(
+                    finalized_translated_texts.get(
                         f"additional_line_{section_index}_{line_index}",
                         line,
                     )
@@ -1507,9 +1524,9 @@ class OhMyCvDynamicResumeBuilder:
         )
         localized_snapshot = replace(
             resume_snapshot,
-            header_role=translated_texts.get("headline", resume_snapshot.header_role),
-            summary=translated_texts.get("summary", resume_snapshot.summary),
-            city=translated_texts.get("city", resume_snapshot.city),
+            header_role=finalized_translated_texts.get("headline", resume_snapshot.header_role),
+            summary=finalized_translated_texts.get("summary", resume_snapshot.summary),
+            city=finalized_translated_texts.get("city", resume_snapshot.city),
             experience_entries=localized_experience_entries,
             certifications=localized_certifications,
             education_entries=localized_education_entries,
@@ -1597,7 +1614,7 @@ class OhMyCvDynamicResumeBuilder:
                     continue
                 localized_skill_lines[index] = (
                     f"{localized_skill_category_label(prefix, target_language)}: "
-                    f"{_normalize_resume_copy(translated_suffix)}"
+                    f"{_finalize_localized_resume_text(translated_suffix, target_language)}"
                 )
             localized_snapshot = replace(
                 localized_snapshot,
@@ -1617,6 +1634,8 @@ class OhMyCvDynamicResumeBuilder:
             return False
         if self._resume_item_should_stay_verbatim(ref=ref, text=normalized_text):
             return False
+        if _resume_text_has_language_leaks(normalized_text, target_language):
+            return True
         alpha_tokens = re.findall(r"[A-Za-zÀ-ÿ]{2,}", normalized_text)
         if not alpha_tokens:
             return False
@@ -2439,7 +2458,7 @@ class OhMyCvDynamicResumeBuilder:
                 "delivery, automation, and applied AI."
             ),
         )
-        summary_text = _localize_resume_phrase_overrides(summary_text, render_language)
+        summary_text = _finalize_localized_resume_text(summary_text, render_language)
         header_items: list[tuple[str, str | None, str | None]] = [
             (
                 "  - text: |",
@@ -2534,7 +2553,7 @@ class OhMyCvDynamicResumeBuilder:
 
         for entry in prioritized_experience_entries:
             markdown_lines.append(
-                f"**{_localize_resume_phrase_overrides(entry.title, render_language)}**"
+                f"**{_finalize_localized_resume_text(entry.title, render_language)}**"
             )
             if entry.company_name:
                 markdown_lines.append(
@@ -2549,9 +2568,8 @@ class OhMyCvDynamicResumeBuilder:
                 )
             markdown_lines.append("")
             for bullet in entry.bullets:
-                markdown_lines.append(
-                    f"- {_localize_resume_phrase_overrides(bullet, render_language)}"
-                )
+                localized_bullet = _finalize_localized_resume_text(bullet, render_language)
+                markdown_lines.append(f"- {localized_bullet}")
             markdown_lines.append("")
 
         if resume_snapshot.certifications:
@@ -2560,12 +2578,12 @@ class OhMyCvDynamicResumeBuilder:
             )
             for certification in resume_snapshot.certifications:
                 markdown_lines.append(
-                    f"**{_localize_resume_phrase_overrides(certification.name, render_language)}**"
+                    f"**{_finalize_localized_resume_text(certification.name, render_language)}**"
                 )
                 if certification.issuer:
                     markdown_lines.append(
                         "  ~ "
-                        + _localize_resume_phrase_overrides(
+                        + _finalize_localized_resume_text(
                             certification.issuer,
                             render_language,
                         )
@@ -2579,7 +2597,7 @@ class OhMyCvDynamicResumeBuilder:
             for education in resume_snapshot.education_entries:
                 markdown_lines.append(
                     "**"
-                    + _localize_resume_phrase_overrides(
+                    + _finalize_localized_resume_text(
                         education.institution,
                         render_language,
                     )
@@ -2595,7 +2613,7 @@ class OhMyCvDynamicResumeBuilder:
                 markdown_lines.append("")
                 if education.degree:
                     markdown_lines.append(
-                        _localize_resume_phrase_overrides(education.degree, render_language)
+                        _finalize_localized_resume_text(education.degree, render_language)
                     )
                 if education.date_range:
                     markdown_lines.append(
@@ -2615,10 +2633,10 @@ class OhMyCvDynamicResumeBuilder:
             if not lines:
                 continue
             markdown_lines.extend(
-                [_localize_resume_phrase_overrides(f"## {title}", render_language), ""]
+                [_finalize_localized_resume_text(f"## {title}", render_language), ""]
             )
             markdown_lines.extend(
-                _localize_resume_phrase_overrides(line, render_language) for line in lines
+                _finalize_localized_resume_text(line, render_language) for line in lines
             )
             markdown_lines.append("")
 
@@ -4069,6 +4087,7 @@ def _localize_resume_phrase_overrides(
     if not normalized:
         return ""
     localized = normalized
+    replacements: tuple[tuple[str, str], ...]
     if target_language is SupportedLanguage.PORTUGUESE:
         replacements = (
             (r"\bApplied AI\b", "IA Aplicada"),
@@ -4080,6 +4099,56 @@ def _localize_resume_phrase_overrides(
             (r"\bMachine Learning\b", "Aprendizado de Máquina"),
             (r"\bCryptography\b", "Criptografia"),
             (r"\bScalable Systems\b", "Sistemas Escaláveis"),
+            (r"\bAutomated Testing\b", "Testes Automatizados"),
+            (r"\bObservability\b", "Observabilidade"),
+            (r"\bProduction Support\b", "Suporte à Produção"),
+            (r"\bProcess Orchestration\b", "Orquestração de Processos"),
+            (r"\bReliability Improvement\b", "Melhoria de Confiabilidade"),
+            (r"\bIntelligent Automation\b", "Automação Inteligente"),
+            (r"\bAI-assisted Workflows\b", "Fluxos de Trabalho Assistidos por IA"),
+            (r"\bChatbot Systems\b", "Sistemas de Chatbot"),
+            (r"\bWorkflow Optimization\b", "Otimização de Fluxos de Trabalho"),
+            (r"\bRAG-powered Chatbots\b", "Chatbots com RAG"),
+            (r"\bWorked on\b", "Trabalhou com"),
+            (r"\bDesigned and delivered\b", "Projetou e entregou"),
+            (r"\bLed projects\b", "Liderou projetos"),
+            (r"\bBuilt solutions\b", "Desenvolveu soluções"),
+            (r"\bAutomation Developer\b", "Desenvolvedor de Automação"),
+            (r"\bSoftware Developer\b", "Desenvolvedor de Software"),
+            (r"\bFreelance Full Stack Developer\b", "Desenvolvedor Full Stack Freelancer"),
+            (r"\bCustom Digital Solutions\b", "Soluções Digitais Sob Medida"),
+            (r"\bWeb Applications\b", "Aplicações Web"),
+            (r"\bMobile Development\b", "Desenvolvimento Mobile"),
+            (r"\bService Design\b", "Desenho de Serviços"),
+            (r"\bAPI Development\b", "Desenvolvimento de APIs"),
+            (r"\bTesting Strategy\b", "Estratégia de Testes"),
+            (r"\bProduction Readiness\b", "Prontidão para Produção"),
+            (r"\bMaintainability\b", "Manutenibilidade"),
+            (r"\bTraceability\b", "Rastreabilidade"),
+            (r"\bEfficient Workflows\b", "Fluxos de Trabalho Eficientes"),
+            (r"\bConcept to Production\b", "Concepção à Produção"),
+            (r"\bTo Improve\b", "Para Melhorar"),
+            (r"\bSpanning\b", "Abrangendo"),
+            (r"\bTranslating\b", "Transformando"),
+            (r"\bTrabalhar em\b", "Trabalhou em"),
+            (r"\bTrabalhar com\b", "Trabalhou com"),
+            (r"\bTrabalhar no\b", "Trabalhou no"),
+            (r"\bProjetar e suportar\b", "Projetou e deu suporte a"),
+            (r"\bProjetar e dar suporte a\b", "Projetou e deu suporte a"),
+            (r"\bProjetar e oferecer suporte a\b", "Projetou e deu suporte a"),
+            (r"\bSuportou a entrega de\b", "Apoiou a entrega de"),
+            (r"\bContribuir para\b", "Contribuiu para"),
+            (r"\bModelamento de Banco de Dados\b", "Modelagem de Banco de Dados"),
+            (r"\bDesenvolvimento de API\b", "Desenvolvimento de APIs"),
+            (r"\bDesenvolvimento de APIs\b", "desenvolvimento de APIs"),
+            (r"\bSoluções Digitais Customizadas\b", "Soluções Digitais Personalizadas"),
+            (r"\bChatbots Impulsionados por RAG\b", "Chatbots com RAG"),
+            (r"\bChatbots com Tecnologia RAG\b", "chatbots com RAG"),
+            (r"\bSuporte de Produção\b", "Suporte à Produção"),
+            (r"\bIntegrações de Sistema\b", "Integrações de Sistemas"),
+            (r"\bOtimização de Fluxo de Trabalho\b", "Otimização de Fluxos de Trabalho"),
+            (r"\bIA Aplicada & Automação\b", "IA Aplicada e Automação"),
+            (r"\band\b", "e"),
         )
     else:
         replacements = (
@@ -4094,8 +4163,92 @@ def _localize_resume_phrase_overrides(
             (r"\bSistemas Escaláveis\b", "Scalable Systems"),
         )
     for pattern, replacement in replacements:
-        localized = re.sub(pattern, replacement, localized, flags=re.IGNORECASE)
+        localized = re.sub(
+            pattern,
+            _build_resume_phrase_replacer(replacement),
+            localized,
+            flags=re.IGNORECASE,
+        )
     return _normalize_resume_copy(localized)
+
+
+_PORTUGUESE_RESUME_ENGLISH_LEAK_PATTERNS = (
+    r"\bworked on\b",
+    r"\bdesigned and delivered\b",
+    r"\bled projects\b",
+    r"\bbuilt solutions\b",
+    r"\bcustom digital solutions\b",
+    r"\bweb applications\b",
+    r"\bmobile development\b",
+    r"\bservice design\b",
+    r"\bapi development\b",
+    r"\btesting strategy\b",
+    r"\bobservability\b",
+    r"\bproduction support\b",
+    r"\bprocess orchestration\b",
+    r"\breliability improvement\b",
+    r"\bintelligent automation\b",
+    r"\bai-assisted workflows\b",
+    r"\bchatbot systems\b",
+    r"\bworkflow optimization\b",
+    r"\brag-powered chatbots\b",
+    r"\bproduction readiness\b",
+    r"\bmaintainability\b",
+    r"\btraceability\b",
+    r"\befficient workflows\b",
+    r"\bconcept to production\b",
+)
+
+
+def _resume_text_has_language_leaks(
+    text: str | None,
+    target_language: SupportedLanguage,
+) -> bool:
+    normalized = _normalize_resume_copy(text or "")
+    if not normalized:
+        return False
+    if target_language is not SupportedLanguage.PORTUGUESE:
+        return False
+    lowered = normalized.casefold()
+    return any(re.search(pattern, lowered) for pattern in _PORTUGUESE_RESUME_ENGLISH_LEAK_PATTERNS)
+
+
+def _finalize_localized_resume_text(
+    text: str | None,
+    target_language: SupportedLanguage,
+) -> str:
+    normalized = _normalize_resume_copy(text or "")
+    if not normalized:
+        return ""
+    localized = _localize_resume_meta_text(normalized, target_language)
+    localized = _localize_resume_phrase_overrides(localized, target_language)
+    return _normalize_resume_copy(localized)
+
+
+def _match_resume_copy_case(replacement: str, source: str) -> str:
+    if not source:
+        return replacement
+    if source.isupper():
+        return replacement.upper()
+    if source.islower():
+        return replacement.lower()
+    source_tokens = source.split()
+    if (
+        len(source_tokens) > 1
+        and source_tokens[0].isupper()
+        and all(token.islower() for token in source_tokens[1:])
+    ):
+        return replacement.lower()
+    if source[0].isupper():
+        return replacement
+    return replacement
+
+
+def _build_resume_phrase_replacer(replacement: str) -> Callable[[re.Match[str]], str]:
+    def _replace(match: re.Match[str]) -> str:
+        return _match_resume_copy_case(replacement, match.group(0))
+
+    return _replace
 
 
 def _render_localized_skill_line(
@@ -4107,9 +4260,9 @@ def _render_localized_skill_line(
         return ""
     prefix, separator, suffix = normalized_line.partition(":")
     if not separator:
-        return _localize_resume_phrase_overrides(normalized_line, target_language)
+        return _finalize_localized_resume_text(normalized_line, target_language)
     localized_prefix = localized_skill_category_label(prefix, target_language)
-    localized_suffix = _localize_resume_phrase_overrides(suffix.strip(), target_language)
+    localized_suffix = _finalize_localized_resume_text(suffix.strip(), target_language)
     if not localized_suffix:
         return localized_prefix
     return f"{localized_prefix}: {localized_suffix}"
