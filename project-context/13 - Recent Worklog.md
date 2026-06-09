@@ -4,6 +4,7 @@ This file summarizes the most relevant recent changes so a new harness does not 
 
 ## Important Recent Commits
 
+- `working tree` `optimize dynamic resume cold-start localization cost`
 - `ac82458` `feat: improve private metadata feedback`
 - `3349fd5` `feat: add run cost observability`
 - `working tree` `persist canonical resume source snapshots and reuse them in dynamic resume generation`
@@ -56,6 +57,8 @@ This file summarizes the most relevant recent changes so a new harness does not 
   - apply memory
   - search cache
   - resume snapshot reuse
+- PT dynamic resume localization now skips factual/proper-name fields during translation
+- PT dynamic resume localization now uses larger translation batches to reduce call count and prompt overhead
 
 ## Recent Real Successes
 
@@ -78,6 +81,16 @@ The main remaining area to keep validating is:
 - how much the new 1-hour search+score cache reduces repeated full-stage validation cost
 - how often private-metadata-backed fields appear in production and which factual keys are most needed first
 - whether cost telemetry shows the expected drop in OpenAI usage as cache/memory warm up
+
+The latest direct PT dynamic-resume cost check improved the cold-start path for one real backend target from:
+
+- `6` resume-worker OpenAI calls and `20,268` tokens
+
+to:
+
+- `3` resume-worker OpenAI calls and `15,051` tokens
+
+while still producing a valid tailored markdown/PDF pair.
 
 There is no single known blocker in dynamic resume quality right now; the higher-value work is cost control and apply robustness.
 

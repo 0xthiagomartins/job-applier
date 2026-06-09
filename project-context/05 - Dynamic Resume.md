@@ -94,3 +94,13 @@ Portuguese dynamic resumes:
 - have already passed real successful apply flows
 - are materially better than the earlier mixed-language artifacts
 - should still be reaudited whenever localization prompts or rendering logic changes
+
+## Current Cost Optimization Notes
+
+The latest cold-start optimization for PT localization is intentionally conservative:
+
+- factual/proper-name fields such as company names, institutions, issuers, certification names, and city are no longer sent through the translation step
+- only items that still look like natural-language localization work are sent to OpenAI
+- translation batches are larger now, which reduces the number of `resume_translation` calls
+
+This keeps the optimization low-risk because it avoids changing the overall factual rendering contract.

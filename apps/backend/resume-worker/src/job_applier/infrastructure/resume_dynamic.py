@@ -1166,12 +1166,20 @@ class OhMyCvDynamicResumeBuilder:
         source_language: SupportedLanguage,
         target_language: SupportedLanguage,
     ) -> tuple[ResumeSourceSnapshot, ResumeAdaptationPlan, bool]:
-        translation_items = self._build_resume_translation_items(
-            resume_snapshot=resume_snapshot,
-            adaptation_plan=adaptation_plan,
+        translation_items = tuple(
+            item
+            for item in self._build_resume_translation_items(
+                resume_snapshot=resume_snapshot,
+                adaptation_plan=adaptation_plan,
+            )
+            if self._resume_item_needs_localization(
+                ref=item[0],
+                text=item[1],
+                target_language=target_language,
+            )
         )
         if not translation_items:
-            return resume_snapshot, adaptation_plan, False
+            return resume_snapshot, adaptation_plan, True
         translated_texts = self._translate_resume_items(
             settings=settings,
             translation_items=translation_items,
@@ -1342,8 +1350,8 @@ class OhMyCvDynamicResumeBuilder:
         batches: list[tuple[tuple[str, str], ...]] = []
         current_batch: list[tuple[str, str]] = []
         current_chars = 0
-        max_items_per_batch = 10
-        max_chars_per_batch = 1800
+        max_items_per_batch = 16
+        max_chars_per_batch = 3200
         for item in translation_items:
             ref, text = item
             item_chars = len(ref) + len(text)
@@ -1607,16 +1615,14 @@ class OhMyCvDynamicResumeBuilder:
         normalized_text = _normalize_resume_copy(text)
         if not normalized_text:
             return False
+        if self._resume_item_should_stay_verbatim(ref=ref, text=normalized_text):
+            return False
         alpha_tokens = re.findall(r"[A-Za-zÀ-ÿ]{2,}", normalized_text)
         if not alpha_tokens:
             return False
         always_repair_meta_prefixes = (
-            "experience_company_",
             "experience_date_",
-            "certification_name_",
-            "certification_issuer_",
             "education_degree_",
-            "education_location_",
         )
         minimum_token_count = 3
         if ref.startswith(always_repair_meta_prefixes):
@@ -1633,6 +1639,20 @@ class OhMyCvDynamicResumeBuilder:
         if ref.startswith(always_repair_meta_prefixes):
             return not (detection.language is target_language and detection.confidence >= 0.6)
         return detection.language is not target_language and detection.confidence >= 0.45
+
+    def _resume_item_should_stay_verbatim(self, *, ref: str, text: str) -> bool:
+        """Return True when one resume fragment should stay factual/verbatim."""
+
+        always_verbatim_prefixes = (
+            "experience_company_",
+            "education_institution_",
+            "education_location_",
+            "certification_name_",
+            "certification_issuer_",
+        )
+        if ref == "city" or ref.startswith(always_verbatim_prefixes):
+            return True
+        return False
 
     def _localize_skill_line(
         self,
