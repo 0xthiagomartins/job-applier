@@ -254,26 +254,6 @@ def _evaluate_resume_verification(
     )
     if not resume_fields:
         return ResumeVerificationState(target_cv_name=target_cv_name)
-    if any(
-        answer.normalized_key == "resume_upload"
-        and _resume_text_matches_requested_cv(answer.answer_raw, target_cv_name)
-        for answer in step_answers
-    ):
-        selected_value = next(
-            (
-                normalize_text(answer.answer_raw)
-                for answer in step_answers
-                if answer.normalized_key == "resume_upload" and normalize_text(answer.answer_raw)
-            ),
-            "",
-        )
-        return ResumeVerificationState(
-            target_cv_name=target_cv_name,
-            verified=True,
-            option_visible=True,
-            selected_value=selected_value,
-            reason="verified",
-        )
     field_states = tuple(
         _resume_field_verification_state(field, target_cv_name=target_cv_name)
         for field in resume_fields

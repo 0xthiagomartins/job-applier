@@ -123,7 +123,7 @@ class ResumeVerificationTests(unittest.TestCase):
         )
         self.assertEqual(verification.reason, "picker_selected_different_resume")
 
-    def test_marks_resume_verified_when_answer_matches_target(self) -> None:
+    def test_resume_verification_does_not_trust_answer_when_picker_is_stale(self) -> None:
         step = EasyApplyStep(
             step_index=1,
             total_steps=4,
@@ -152,6 +152,28 @@ class ResumeVerificationTests(unittest.TestCase):
         verification = _evaluate_resume_verification(
             step,
             answers,
+            target_cv_name="e8ceaf02-principal-back-end-engineer-tailored.pdf",
+        )
+
+        self.assertFalse(verification.verified)
+        self.assertEqual(verification.reason, "picker_missing_target_resume")
+
+    def test_resume_verification_marks_picker_match_as_verified(self) -> None:
+        step = EasyApplyStep(
+            step_index=1,
+            total_steps=4,
+            fields=(
+                _resume_field(
+                    current_value="PDF e8ceaf02-principal-back-end-engineer-tailored.pdf 6/8/2026",
+                    options=("PDF e8ceaf02-principal-back-end-engineer-tailored.pdf 6/8/2026",),
+                ),
+            ),
+            surface_text="Resume step",
+        )
+
+        verification = _evaluate_resume_verification(
+            step,
+            (),
             target_cv_name="e8ceaf02-principal-back-end-engineer-tailored.pdf",
         )
 
