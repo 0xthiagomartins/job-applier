@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 import unicodedata
 from dataclasses import dataclass, replace
 from typing import Literal, Protocol, cast
@@ -16,6 +17,7 @@ from job_applier.application.panel import (
     PRIVATE_METADATA_DISPLAY_LABELS,
     normalize_private_metadata_key,
 )
+from job_applier.cost_observability import record_openai_usage
 from job_applier.domain.entities import JobPosting
 from job_applier.domain.enums import AnswerSource, FillStrategy, QuestionType
 from job_applier.infrastructure.candidate_capabilities import (
@@ -1550,11 +1552,27 @@ class OpenAISemanticStepPlanner:
             },
             method="POST",
         )
+        started_at = time.perf_counter()
         try:
             with request.urlopen(http_request, timeout=45) as response:  # noqa: S310
-                return cast(dict[str, object], json.loads(response.read().decode("utf-8")))
+                parsed = cast(dict[str, object], json.loads(response.read().decode("utf-8")))
+                record_openai_usage(
+                    category="openai.easy_apply.semantic_step_plan",
+                    model=model,
+                    latency_ms=int((time.perf_counter() - started_at) * 1000),
+                    response_payload=parsed,
+                )
+                return parsed
         except error.HTTPError as exc:
             error_text = exc.read().decode("utf-8", errors="replace")
+            record_openai_usage(
+                category="openai.easy_apply.semantic_step_plan",
+                model=model,
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                status="rate_limited" if exc.code == 429 else "http_error",
+                error_status=exc.code,
+                error_message=error_text[:300],
+            )
             logger.warning(
                 "openai_responses_http_error",
                 extra={"status": exc.code, "body": error_text},
@@ -1877,11 +1895,29 @@ class OpenAIResponsesAnswerGenerator:
             },
             method="POST",
         )
+        started_at = time.perf_counter()
         try:
             with request.urlopen(http_request, timeout=30) as response:  # noqa: S310
-                return cast(dict[str, object], json.loads(response.read().decode("utf-8")))
+                parsed = cast(dict[str, object], json.loads(response.read().decode("utf-8")))
+                record_openai_usage(
+                    category="openai.easy_apply.autofill_answer",
+                    model=model,
+                    latency_ms=int((time.perf_counter() - started_at) * 1000),
+                    response_payload=parsed,
+                    extra={"normalized_key": prompt_payload.get("normalized_key")},
+                )
+                return parsed
         except error.HTTPError as exc:
             error_text = exc.read().decode("utf-8", errors="replace")
+            record_openai_usage(
+                category="openai.easy_apply.autofill_answer",
+                model=model,
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                status="rate_limited" if exc.code == 429 else "http_error",
+                error_status=exc.code,
+                error_message=error_text[:300],
+                extra={"normalized_key": prompt_payload.get("normalized_key")},
+            )
             logger.warning(
                 "openai_responses_http_error",
                 extra={"status": exc.code, "body": error_text},

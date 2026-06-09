@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -25,6 +26,7 @@ import yaml  # type: ignore[import-untyped]
 
 from job_applier.application.config import UserAgentSettings
 from job_applier.application.repositories import ResumeSourceSnapshotRepository
+from job_applier.cost_observability import record_efficiency_counter, record_openai_usage
 from job_applier.domain.entities import JobPosting
 from job_applier.domain.entities import (
     ResumeSourceSnapshotRecord as PersistedResumeSourceSnapshotRecord,
@@ -731,6 +733,11 @@ class OhMyCvDynamicResumeBuilder:
             cv_sha256=cv_sha256,
         )
         if existing_record is not None and not force_refresh:
+            record_efficiency_counter(
+                group="resume_snapshot",
+                metric="reuse_hit",
+                extra={"owner_key": owner_key},
+            )
             try:
                 return self._resolved_source_snapshot_from_record(
                     existing_record,
@@ -746,6 +753,11 @@ class OhMyCvDynamicResumeBuilder:
                     },
                 )
 
+        record_efficiency_counter(
+            group="resume_snapshot",
+            metric="reuse_miss",
+            extra={"owner_key": owner_key, "force_refresh": force_refresh},
+        )
         resume_text = self._extract_resume_text(source_cv_path)
         resume_snapshot = self._build_resume_source_snapshot(
             settings=settings,
@@ -2892,11 +2904,21 @@ class OhMyCvDynamicResumeBuilder:
                 "Authorization": f"Bearer {api_key}",
             },
         )
+        started_at = time.perf_counter()
         try:
             with urllib.request.urlopen(request, timeout=120) as response:  # noqa: S310
                 payload = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
+            record_openai_usage(
+                category=f"openai.resume_worker.{schema_name}",
+                model=model,
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                status="rate_limited" if exc.code == 429 else "http_error",
+                error_status=exc.code,
+                error_message=error_body[:300],
+                extra={"schema_name": schema_name},
+            )
             logger.warning(
                 "dynamic_resume_openai_http_error",
                 extra={"status": exc.code, "body": error_body[:1_000]},
@@ -2906,6 +2928,13 @@ class OhMyCvDynamicResumeBuilder:
         if not isinstance(parsed_payload, dict):
             msg = "OpenAI response payload was not a JSON object."
             raise RuntimeError(msg)
+        record_openai_usage(
+            category=f"openai.resume_worker.{schema_name}",
+            model=model,
+            latency_ms=int((time.perf_counter() - started_at) * 1000),
+            response_payload=parsed_payload,
+            extra={"schema_name": schema_name},
+        )
         return cast(dict[str, object], parsed_payload)
 
     def _extract_output_text(self, response_data: dict[str, object]) -> str:

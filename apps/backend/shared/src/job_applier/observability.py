@@ -40,6 +40,14 @@ _SENSITIVE_KEY_PARTS = (
     "secret",
     "token",
 )
+_SAFE_TOKEN_METRIC_KEYS = frozenset(
+    {
+        "tokens",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+    }
+)
 
 
 def configure_logging(settings: RuntimeSettings) -> None:
@@ -153,6 +161,25 @@ def reset_run_output(
             "successful_submissions": 0,
             "error_count": 0,
             "last_error": None,
+            "cost": {
+                "openai": {
+                    "calls_total": 0,
+                    "rate_limit_count": 0,
+                    "failure_count": 0,
+                    "latency_ms_total": 0,
+                    "tokens": {
+                        "input": 0,
+                        "output": 0,
+                        "total": 0,
+                    },
+                    "by_category": {},
+                },
+                "efficiency": {
+                    "apply_memory": {},
+                    "search_cache": {},
+                    "resume_snapshot": {},
+                },
+            },
         },
         output_dir=output_dir,
     )
@@ -221,6 +248,23 @@ def write_output_text(
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
+
+
+def read_output_json(
+    relative_path: str | Path,
+    *,
+    output_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Read one JSON payload from the current run output bundle."""
+
+    target = _resolve_output_path(relative_path, output_dir=output_dir)
+    if target is None or not target.exists():
+        return {}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def append_output_jsonl(
@@ -441,7 +485,9 @@ class StructuredJsonFormatter(logging.Formatter):
 
 
 def _sanitize_for_logs(value: Any, *, key: str | None = None) -> Any:
-    if key is not None and any(part in key.lower() for part in _SENSITIVE_KEY_PARTS):
+    if key is not None and key.lower() in _SAFE_TOKEN_METRIC_KEYS:
+        pass
+    elif key is not None and any(part in key.lower() for part in _SENSITIVE_KEY_PARTS):
         return "[redacted]"
     if isinstance(value, dict):
         return {

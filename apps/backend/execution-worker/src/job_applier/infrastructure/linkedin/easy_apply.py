@@ -46,6 +46,7 @@ from job_applier.application.snapshotting import (
     SuccessfulSubmissionRecord,
     create_successful_submission_record,
 )
+from job_applier.cost_observability import record_efficiency_counter
 from job_applier.domain.entities import (
     ApplicationAnswer,
     ApplicationSubmission,
@@ -8587,6 +8588,19 @@ class PlaywrightLinkedInEasyApplyExecutor:
             payload["action_intent"] = action_intent
         if replace_existing is not None:
             payload["replace_existing"] = replace_existing
+        metric_by_event = {
+            "apply_memory_promoted": "promoted",
+            "apply_memory_replayed": "replayed",
+            "apply_memory_refreshed": "refreshed",
+            "apply_memory_degraded": "degraded",
+        }
+        metric = metric_by_event.get(event_type)
+        if metric is not None:
+            record_efficiency_counter(
+                group="apply_memory",
+                metric=metric,
+                extra={"task_type": task_type, "signature_hash": signature_hash},
+            )
         append_timeline_event(event_type, payload)
 
     def _record_apply_memory_success(

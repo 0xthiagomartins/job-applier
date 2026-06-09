@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 from job_applier.application.config import (
     AgentConfig,
@@ -21,6 +24,7 @@ from job_applier.infrastructure.sqlite.database import (
     create_sqlalchemy_engine,
 )
 from job_applier.infrastructure.sqlite.repositories import SqliteResumeSourceSnapshotRepository
+from job_applier.observability import bind_run_output, reset_run_output
 from job_applier.settings import RuntimeSettings
 
 
@@ -102,9 +106,15 @@ class ResumeSourceSnapshotPipelineTests(unittest.TestCase):
             resume_source_snapshot_repository=self.repository,
         )
         settings = _build_settings(self.resume_path)
-
-        first = builder.get_or_create_source_snapshot(settings=settings)
-        second = builder.get_or_create_source_snapshot(settings=settings)
+        reset_run_output(
+            self.runtime_settings.output_dir,
+            execution_id="resume-snapshot-test",
+            origin="unit-test",
+            started_at=datetime.now(UTC),
+        )
+        with bind_run_output(self.runtime_settings.output_dir):
+            first = builder.get_or_create_source_snapshot(settings=settings)
+            second = builder.get_or_create_source_snapshot(settings=settings)
 
         self.assertIsNotNone(first)
         self.assertIsNotNone(second)
@@ -114,6 +124,18 @@ class ResumeSourceSnapshotPipelineTests(unittest.TestCase):
             "Full Stack Software Engineer",
             second.snapshot.header_role,  # type: ignore[union-attr]
         )
+        summary = cast(
+            dict[str, object],
+            json.loads((self.runtime_settings.output_dir / "summary.json").read_text("utf-8")),
+        )
+        efficiency = cast(
+            dict[str, object],
+            cast(dict[str, object], cast(dict[str, object], summary["cost"])["efficiency"])[
+                "resume_snapshot"
+            ],
+        )
+        self.assertEqual(efficiency["reuse_miss"], 1)
+        self.assertEqual(efficiency["reuse_hit"], 1)
 
     def test_update_source_snapshot_persists_user_edited_record(self) -> None:
         builder = _CountingResumeBuilder(

@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
@@ -15,6 +16,7 @@ from uuid import UUID
 from playwright.async_api import BrowserContext, Page
 
 from job_applier.application.config import UserAgentSettings
+from job_applier.cost_observability import record_openai_usage
 from job_applier.domain.entities import JobPosting, RecruiterInteraction, utc_now
 from job_applier.domain.enums import RecruiterAction, RecruiterInteractionStatus
 from job_applier.infrastructure.linkedin.question_resolution import normalize_text
@@ -241,13 +243,30 @@ class OpenAIResponsesRecruiterMessageGenerator:
             },
             method="POST",
         )
+        started_at = time.perf_counter()
         try:
             with request.urlopen(http_request, timeout=30) as response:  # noqa: S310
-                return cast(dict[str, object], json.loads(response.read().decode("utf-8")))
+                parsed = cast(dict[str, object], json.loads(response.read().decode("utf-8")))
+                record_openai_usage(
+                    category="openai.recruiter_connect.message",
+                    model=model,
+                    latency_ms=int((time.perf_counter() - started_at) * 1000),
+                    response_payload=parsed,
+                )
+                return parsed
         except error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            record_openai_usage(
+                category="openai.recruiter_connect.message",
+                model=model,
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                status="rate_limited" if exc.code == 429 else "http_error",
+                error_status=exc.code,
+                error_message=error_body[:300],
+            )
             logger.warning(
                 "openai_recruiter_message_http_error",
-                extra={"status": exc.code, "body": exc.read().decode("utf-8", errors="replace")},
+                extra={"status": exc.code, "body": error_body},
             )
             raise
 

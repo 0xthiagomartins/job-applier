@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from urllib import error, parse, request
 
 from pydantic import SecretStr
 
+from job_applier.cost_observability import record_openai_usage
 from job_applier.observability import append_output_jsonl, write_output_text
 
 logger = logging.getLogger(__name__)
@@ -1037,9 +1039,17 @@ class OpenAIResponsesPlaywrightMcpAgent:
             },
             method="POST",
         )
+        started_at = time.perf_counter()
         try:
             with request.urlopen(http_request, timeout=30) as response:  # noqa: S310
                 payload = cast(dict[str, object], json.loads(response.read().decode("utf-8")))
+                record_openai_usage(
+                    category="openai.playwright_mcp.login_planner",
+                    model=self._model,
+                    latency_ms=int((time.perf_counter() - started_at) * 1000),
+                    response_payload=payload,
+                    extra={"step_index": step_index},
+                )
                 append_output_jsonl(
                     "llm/login-planner.jsonl",
                     {
@@ -1052,6 +1062,15 @@ class OpenAIResponsesPlaywrightMcpAgent:
                 return payload
         except error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
+            record_openai_usage(
+                category="openai.playwright_mcp.login_planner",
+                model=self._model,
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                status="rate_limited" if exc.code == 429 else "http_error",
+                error_status=exc.code,
+                error_message=error_body[:300],
+                extra={"step_index": step_index},
+            )
             logger.warning(
                 "openai_playwright_mcp_agent_http_error",
                 extra={"status": exc.code, "body": error_body},

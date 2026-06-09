@@ -20,6 +20,7 @@ from pydantic import SecretStr
 from job_applier.application.agent_execution import JobFetcher
 from job_applier.application.config import UserAgentSettings
 from job_applier.application.repositories import JobPostingRepository
+from job_applier.cost_observability import record_efficiency_counter
 from job_applier.domain.entities import JobPosting
 from job_applier.domain.enums import DebugExecutionStage, Platform, SeniorityLevel, WorkplaceType
 from job_applier.infrastructure.linkedin.auth import (
@@ -904,6 +905,14 @@ class LinkedInJobFetcher(JobFetcher):
                     stage=stage,
                 )
                 if cached_postings is not None:
+                    record_efficiency_counter(
+                        group="search_cache",
+                        metric="campaign_hit",
+                        extra={
+                            "active_role_target": criteria.active_role_target,
+                            "active_search_query": criteria.keywords_text,
+                        },
+                    )
                     logger.info(
                         "linkedin_search_campaign_cache_hit",
                         extra={
@@ -940,6 +949,14 @@ class LinkedInJobFetcher(JobFetcher):
                         },
                     )
                     continue
+                record_efficiency_counter(
+                    group="search_cache",
+                    metric="campaign_miss",
+                    extra={
+                        "active_role_target": criteria.active_role_target,
+                        "active_search_query": criteria.keywords_text,
+                    },
+                )
                 append_timeline_event(
                     "linkedin_search_campaign_cache_miss",
                     {
@@ -1094,6 +1111,15 @@ class LinkedInJobFetcher(JobFetcher):
                     stage=stage,
                 )
                 if cached_postings is not None:
+                    record_efficiency_counter(
+                        group="search_cache",
+                        metric="campaign_hit",
+                        extra={
+                            "active_role_target": criteria.active_role_target,
+                            "active_search_query": criteria.keywords_text,
+                            "incremental": True,
+                        },
+                    )
                     logger.info(
                         "linkedin_search_campaign_cache_hit",
                         extra={
@@ -1157,6 +1183,15 @@ class LinkedInJobFetcher(JobFetcher):
                     if global_stop_requested:
                         break
                     continue
+                record_efficiency_counter(
+                    group="search_cache",
+                    metric="campaign_miss",
+                    extra={
+                        "active_role_target": criteria.active_role_target,
+                        "active_search_query": criteria.keywords_text,
+                        "incremental": True,
+                    },
+                )
                 append_timeline_event(
                     "linkedin_search_campaign_cache_miss",
                     {

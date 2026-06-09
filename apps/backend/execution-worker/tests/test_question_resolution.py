@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal, cast
+from unittest.mock import patch
 
 from pydantic import SecretStr
 
@@ -35,6 +40,21 @@ from job_applier.infrastructure.linkedin.question_resolution import (
     SemanticFieldPlan,
     _validation_feedback_requires_semantic_retry,
 )
+from job_applier.observability import bind_run_output, reset_run_output
+
+
+class _FakeHttpResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = payload
+
+    def __enter__(self) -> _FakeHttpResponse:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps(self._payload).encode("utf-8")
 
 
 class LinkedInQuestionClassifierTests(unittest.TestCase):
@@ -711,6 +731,56 @@ class LinkedInAnswerResolverRateLimitTests(unittest.IsolatedAsyncioTestCase):
                     ],
                 }
             },
+        )
+
+    def test_answer_generator_records_openai_cost_summary(self) -> None:
+        generator = OpenAIResponsesAnswerGenerator()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            reset_run_output(
+                output_dir,
+                execution_id="question-resolution-test",
+                origin="unit-test",
+                started_at=datetime.now(UTC),
+            )
+            with (
+                bind_run_output(output_dir),
+                patch(
+                    "job_applier.infrastructure.linkedin.question_resolution.request.urlopen",
+                    return_value=_FakeHttpResponse(
+                        {
+                            "output": [],
+                            "usage": {
+                                "input_tokens": 50,
+                                "output_tokens": 10,
+                                "total_tokens": 60,
+                            },
+                        }
+                    ),
+                ),
+            ):
+                payload = generator._create_response(  # noqa: SLF001
+                    api_key="test-key",
+                    model="gpt-5",
+                    prompt_payload={"normalized_key": "email"},
+                )
+            summary = cast(
+                dict[str, object],
+                json.loads((output_dir / "summary.json").read_text(encoding="utf-8")),
+            )
+
+        self.assertIn("usage", payload)
+        by_category = cast(
+            dict[str, object],
+            cast(dict[str, object], cast(dict[str, object], summary["cost"])["openai"])[
+                "by_category"
+            ],
+        )
+        category_summary = cast(dict[str, object], by_category["openai.easy_apply.autofill_answer"])
+        self.assertEqual(category_summary["calls"], 1)
+        self.assertEqual(
+            cast(dict[str, object], category_summary["tokens"])["total"],
+            60,
         )
 
 

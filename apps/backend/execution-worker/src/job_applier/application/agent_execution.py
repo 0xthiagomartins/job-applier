@@ -32,6 +32,7 @@ from job_applier.application.snapshotting import (
     build_profile_snapshot,
     create_successful_submission_record,
 )
+from job_applier.cost_observability import record_efficiency_counter
 from job_applier.domain.entities import (
     ApplicationSubmission,
     ExecutionEvent,
@@ -668,6 +669,11 @@ class AgentExecutionOrchestrator:
                         posting=posting,
                     )
                     if cached_score is not None:
+                        record_efficiency_counter(
+                            group="search_cache",
+                            metric="score_hit",
+                            extra={"job_posting_id": current_job["job_posting_id"]},
+                        )
                         scored_job = self._build_scored_job_from_cache(
                             posting=posting,
                             cached_score=cached_score,
@@ -682,6 +688,11 @@ class AgentExecutionOrchestrator:
                             },
                         )
                     else:
+                        record_efficiency_counter(
+                            group="search_cache",
+                            metric="score_miss",
+                            extra={"job_posting_id": current_job["job_posting_id"]},
+                        )
                         append_timeline_event("job_score_cache_miss", current_job)
                         scored_job = await self._job_scorer.score(settings, posting)
                         self._search_score_cache.save_score_decision(

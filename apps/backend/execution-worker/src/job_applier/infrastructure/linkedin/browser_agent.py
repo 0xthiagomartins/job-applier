@@ -17,6 +17,7 @@ from urllib import error, request
 from playwright.async_api import Locator, Page
 from pydantic import SecretStr
 
+from job_applier.cost_observability import record_openai_usage
 from job_applier.observability import append_output_jsonl
 
 logger = logging.getLogger(__name__)
@@ -3403,6 +3404,7 @@ class OpenAIResponsesBrowserAgent:
         mode: Literal["planning", "assessment", "interactive_field_assessment"],
         log_event_name: str,
     ) -> dict[str, object]:
+        category = f"openai.browser_agent.{mode}"
         for attempt in range(self._openai_max_retries + 1):
             http_request = request.Request(
                 self.endpoint,
@@ -3413,11 +3415,29 @@ class OpenAIResponsesBrowserAgent:
                 },
                 method="POST",
             )
+            started_at = time.perf_counter()
             try:
                 with request.urlopen(http_request, timeout=30) as response:  # noqa: S310
-                    return cast(dict[str, object], json.loads(response.read().decode("utf-8")))
+                    parsed = cast(dict[str, object], json.loads(response.read().decode("utf-8")))
+                    record_openai_usage(
+                        category=category,
+                        model=self._model,
+                        latency_ms=int((time.perf_counter() - started_at) * 1000),
+                        response_payload=parsed,
+                        extra={"task_name": task_name, "attempt": attempt + 1},
+                    )
+                    return parsed
             except error.HTTPError as exc:
                 error_body = exc.read().decode("utf-8", errors="replace")
+                record_openai_usage(
+                    category=category,
+                    model=self._model,
+                    latency_ms=int((time.perf_counter() - started_at) * 1000),
+                    status="rate_limited" if exc.code == 429 else "http_error",
+                    error_status=exc.code,
+                    error_message=error_body[:300],
+                    extra={"task_name": task_name, "attempt": attempt + 1},
+                )
                 retry_delay_seconds = estimate_openai_retry_delay_seconds(
                     status=exc.code,
                     body=error_body,
