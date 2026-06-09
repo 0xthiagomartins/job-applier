@@ -388,6 +388,7 @@ def build_user_agent_settings(document: PanelSettingsDocument) -> UserAgentSetti
                     timezone=document.schedule.timezone,
                 ),
                 auto_connect_with_recruiter=document.preferences.auto_connect_with_recruiter,
+                auto_send_job_email=document.preferences.auto_send_job_email,
             ),
             ai=AIConfig(
                 api_key=document.ai.api_key,
@@ -397,6 +398,7 @@ def build_user_agent_settings(document: PanelSettingsDocument) -> UserAgentSetti
                 version="ruleset-v1",
                 allow_best_effort_autofill=True,
                 auto_connect_with_recruiter=document.preferences.auto_connect_with_recruiter,
+                auto_send_job_email=document.preferences.auto_send_job_email,
             ),
         )
     except Exception as exc:  # noqa: BLE001
@@ -1763,6 +1765,7 @@ class AgentExecutionOrchestrator:
                 "agent": {
                     "schedule": settings.agent.schedule.model_dump(mode="json"),
                     "auto_connect_with_recruiter": settings.agent.auto_connect_with_recruiter,
+                    "auto_send_job_email": settings.agent.auto_send_job_email,
                 },
                 "ai": {
                     "model": settings.ai.model,

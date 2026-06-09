@@ -428,6 +428,7 @@ class StoredPreferencesSection(PanelModel):
     positive_keywords: tuple[str, ...] = ()
     negative_keywords: tuple[str, ...] = ()
     auto_connect_with_recruiter: bool = False
+    auto_send_job_email: bool = False
 
 
 class PreferencesFormInput(BaseModel):
@@ -443,6 +444,7 @@ class PreferencesFormInput(BaseModel):
     positive_keywords: tuple[str, ...] = ()
     negative_keywords: tuple[str, ...] = ()
     auto_connect_with_recruiter: bool = False
+    auto_send_job_email: bool = False
 
 
 class StoredAISection(PanelModel):

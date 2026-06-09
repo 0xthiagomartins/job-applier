@@ -47,6 +47,8 @@ There is no active frontend application today; this state is persisted locally a
 - role targets / keywords
 - location
 - positive filters
+- `auto_connect_with_recruiter`
+- `auto_send_job_email`
 
 ## Current Local Role Target Order
 
@@ -63,6 +65,34 @@ The current local file prioritizes Brazilian targets first:
   - `artifacts/runtime/panel/`
 - local runtime database:
   - `artifacts/runtime/job-applier.db`
+
+## Runtime Feature Flags
+
+Some auxiliary automations are controlled both by panel preference and by runtime feature flags from `.env`.
+
+Current runtime gates:
+
+- `JOB_APPLIER_FEATURE_RECRUITER_CONNECT_ENABLED`
+- `JOB_APPLIER_FEATURE_JOB_EMAIL_ENABLED`
+
+Current SMTP settings for job-email delivery:
+
+- `JOB_APPLIER_EMAIL_SMTP_HOST`
+- `JOB_APPLIER_EMAIL_SMTP_PORT`
+- `JOB_APPLIER_EMAIL_SMTP_USERNAME`
+- `JOB_APPLIER_EMAIL_SMTP_PASSWORD`
+- `JOB_APPLIER_EMAIL_SMTP_FROM_ADDRESS`
+- `JOB_APPLIER_EMAIL_SMTP_FROM_NAME`
+- `JOB_APPLIER_EMAIL_SMTP_REPLY_TO`
+- `JOB_APPLIER_EMAIL_SMTP_STARTTLS`
+- `JOB_APPLIER_EMAIL_SMTP_USE_SSL`
+- `JOB_APPLIER_EMAIL_SMTP_TIMEOUT_SECONDS`
+
+Important behavior:
+
+- recruiter connect only runs when both the runtime flag and the user preference are enabled
+- job-email delivery only runs when both the runtime flag and the user preference are enabled
+- the email helper runs only after a successful LinkedIn submit and only when the job description explicitly contains a likely application email target
 
 ## Snapshot Endpoints
 

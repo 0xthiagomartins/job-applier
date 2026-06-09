@@ -246,6 +246,7 @@ class LocalPanelSettingsStore:
                 positive_keywords=(),
                 negative_keywords=("internship",),
                 auto_connect_with_recruiter=False,
+                auto_send_job_email=False,
             ),
             ai=StoredAISection(
                 api_key=self._resolve_bootstrap_ai_key(settings),

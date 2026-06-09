@@ -142,6 +142,15 @@ Runtime behavior:
 - in headful mode, the browser stays visible so the user can solve captcha or checkpoint screens;
 - when the local state is still empty, the app bootstraps a local profile automatically from `.env` and tries to import a CV from `~/Documents`.
 
+Two optional auxiliary automations are also feature-flagged in `.env`:
+
+- `JOB_APPLIER_FEATURE_RECRUITER_CONNECT_ENABLED=true`
+  - enables the post-submit recruiter connection flow, but it still only runs when the user preference `auto_connect_with_recruiter` is enabled too.
+- `JOB_APPLIER_FEATURE_JOB_EMAIL_ENABLED=true`
+  - enables a post-submit email step for vacancies whose description explicitly asks the candidate to email a resume.
+  - it still only runs when the user preference `auto_send_job_email` is enabled too.
+  - SMTP delivery requires the `JOB_APPLIER_EMAIL_SMTP_*` settings in `.env`.
+
 ## Resume and search configuration
 
 Dynamic resume generation is still behind a feature flag.
@@ -160,6 +169,8 @@ The local settings state exposes:
 - `dynamic`: generate a per-job CV variant before application
 - `capability profile`: reviewed capability ranges used in screening answers
 - `keywords / role targets`: broad job families for search and scoring
+- `auto_connect_with_recruiter`: opt-in user preference for the recruiter-connect helper
+- `auto_send_job_email`: opt-in user preference for the post-submit email helper
 
 The search pipeline works best when `Preferences > Keywords` are broad role families rather than narrow stack-specific titles.
 

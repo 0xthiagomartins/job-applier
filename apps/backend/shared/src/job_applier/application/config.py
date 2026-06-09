@@ -122,6 +122,7 @@ class AgentConfig(FrozenModel):
 
     schedule: ScheduleConfig
     auto_connect_with_recruiter: bool = False
+    auto_send_job_email: bool = False
 
 
 class AIConfig(FrozenModel):
@@ -137,6 +138,7 @@ class RulesetConfig(FrozenModel):
     version: str = "ruleset-v1"
     allow_best_effort_autofill: bool = True
     auto_connect_with_recruiter: bool = False
+    auto_send_job_email: bool = False
 
     def to_domain(self) -> Ruleset:
         """Build the domain ruleset model from configuration data."""
@@ -145,6 +147,7 @@ class RulesetConfig(FrozenModel):
             version=self.version,
             allow_best_effort_autofill=self.allow_best_effort_autofill,
             auto_connect_with_recruiter=self.auto_connect_with_recruiter,
+            auto_send_job_email=self.auto_send_job_email,
         )
 
 

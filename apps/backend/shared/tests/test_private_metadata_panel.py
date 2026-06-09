@@ -72,6 +72,7 @@ class PrivateMetadataPanelTests(unittest.TestCase):
             preferences=StoredPreferencesSection(
                 keywords=("Desenvolvedor Backend",),
                 location="Remote",
+                auto_send_job_email=True,
             ),
             ai=StoredAISection(model="o3-mini"),
             private_metadata=StoredPrivateMetadataSection(
@@ -86,6 +87,8 @@ class PrivateMetadataPanelTests(unittest.TestCase):
 
         self.assertEqual(settings.private_metadata.entries["cpf"], "507.329.848-90")
         self.assertTrue(settings.private_metadata.consent_to_ai_usage)
+        self.assertTrue(settings.agent.auto_send_job_email)
+        self.assertTrue(settings.ruleset.auto_send_job_email)
         self.assertEqual(
             snapshot_payload["private_metadata"],
             {

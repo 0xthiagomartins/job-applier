@@ -98,6 +98,10 @@ from job_applier.infrastructure.linkedin.browser_agent import (
     BrowserTaskAssessment,
     OpenAIResponsesBrowserAgent,
 )
+from job_applier.infrastructure.linkedin.job_email import (
+    SmtpJobApplicationEmailSender,
+    detect_job_application_email_target,
+)
 from job_applier.infrastructure.linkedin.question_resolution import (
     EasyApplyField,
     LinkedInAnswerResolver,
@@ -615,6 +619,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
         self._question_extractor = LinkedInQuestionExtractor()
         self._recruiter_candidate_finder = LinkedInRecruiterCandidateFinder()
         self._recruiter_connector = PlaywrightRecruiterConnector(runtime_settings)
+        self._job_email_sender = SmtpJobApplicationEmailSender(runtime_settings)
         self._execution_event_repository = execution_event_repository
         self._dynamic_resume_builder = OhMyCvDynamicResumeBuilder(
             runtime_settings,
@@ -647,6 +652,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
         if self._is_production_apply_run():
             return 64
         return 128
+
+    def _recruiter_connect_feature_enabled(self, settings: UserAgentSettings) -> bool:
+        return (
+            self._runtime_settings.feature_recruiter_connect_enabled
+            and settings.agent.auto_connect_with_recruiter
+        )
 
     async def execute(
         self,
@@ -995,7 +1006,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                 artifacts=tuple(artifacts),
                                 recruiter_interactions=tuple(recruiter_interactions),
                             )
-                recruiter_candidate = await self._recruiter_candidate_finder.find(page, settings)
+                recruiter_candidate = None
+                if self._recruiter_connect_feature_enabled(settings):
+                    recruiter_candidate = await self._recruiter_candidate_finder.find(
+                        page,
+                        settings,
+                    )
                 prepared_submission_cv: PreparedSubmissionCv | None = None
                 submission_cv_path: Path | None = None
                 submission_cv_version = settings.profile.cv_filename
@@ -1736,6 +1752,15 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                     "current_step": None,
                                 },
                             )
+                            await _maybe_send_job_application_email_from_executor(
+                                self,
+                                posting=posting,
+                                settings=settings,
+                                submission_cv_path=submission_cv_path,
+                                execution_id=execution_id,
+                                submission_id=submission_id,
+                                execution_events=execution_events,
+                            )
                             if recruiter_candidate is not None:
                                 self._record_event(
                                     execution_events,
@@ -1811,6 +1836,23 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                             ),
                                         },
                                     )
+                            elif settings.agent.auto_connect_with_recruiter:
+                                reason = (
+                                    "feature_flag_disabled"
+                                    if not self._runtime_settings.feature_recruiter_connect_enabled
+                                    else "candidate_not_found"
+                                )
+                                self._record_event(
+                                    execution_events,
+                                    execution_id=execution_id,
+                                    submission_id=submission_id,
+                                    event_type=ExecutionEventType.RECRUITER_CONNECT_ATTEMPTED,
+                                    payload={
+                                        "job_posting_id": str(posting.id),
+                                        "status": "skipped",
+                                        "reason": reason,
+                                    },
+                                )
                             self._record_event(
                                 execution_events,
                                 execution_id=execution_id,
@@ -9462,6 +9504,119 @@ async def _checkbox_option_is_checked(locator: Locator) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return bool(payload)
+
+
+async def _maybe_send_job_application_email_from_executor(
+    executor: PlaywrightLinkedInEasyApplyExecutor,
+    *,
+    posting: JobPosting,
+    settings: UserAgentSettings,
+    submission_cv_path: Path | None,
+    execution_id: UUID,
+    submission_id: UUID,
+    execution_events: list[ExecutionEvent],
+) -> None:
+    if not settings.agent.auto_send_job_email:
+        return
+
+    if not executor._runtime_settings.feature_job_email_enabled:  # noqa: SLF001
+        executor._record_event(  # noqa: SLF001
+            execution_events,
+            execution_id=execution_id,
+            submission_id=submission_id,
+            event_type=ExecutionEventType.JOB_EMAIL_ATTEMPTED,
+            payload={
+                "job_posting_id": str(posting.id),
+                "status": "skipped",
+                "reason": "feature_flag_disabled",
+            },
+        )
+        return
+
+    email_target = detect_job_application_email_target(posting.description_raw)
+    if email_target is None:
+        executor._record_event(  # noqa: SLF001
+            execution_events,
+            execution_id=execution_id,
+            submission_id=submission_id,
+            event_type=ExecutionEventType.JOB_EMAIL_ATTEMPTED,
+            payload={
+                "job_posting_id": str(posting.id),
+                "status": "skipped",
+                "reason": "application_email_not_found",
+            },
+        )
+        return
+
+    resume_path = submission_cv_path or _existing_path(settings.profile.cv_path)
+    if resume_path is None:
+        executor._record_event(  # noqa: SLF001
+            execution_events,
+            execution_id=execution_id,
+            submission_id=submission_id,
+            event_type=ExecutionEventType.JOB_EMAIL_ATTEMPTED,
+            payload={
+                "job_posting_id": str(posting.id),
+                "status": "skipped",
+                "reason": "resume_attachment_missing",
+                "recipient_email": email_target.recipient_email,
+            },
+        )
+        return
+
+    try:
+        attempt = await asyncio.to_thread(
+            executor._job_email_sender.send,  # noqa: SLF001
+            posting=posting,
+            settings=settings,
+            recipient_email=email_target.recipient_email,
+            resume_path=resume_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        executor._record_exception_event(  # noqa: SLF001
+            execution_events,
+            execution_id=execution_id,
+            submission_id=submission_id,
+            stage="job_email",
+            error=exc,
+        )
+        executor._record_event(  # noqa: SLF001
+            execution_events,
+            execution_id=execution_id,
+            submission_id=submission_id,
+            event_type=ExecutionEventType.JOB_EMAIL_ATTEMPTED,
+            payload={
+                "job_posting_id": str(posting.id),
+                "status": "failed",
+                "reason": "smtp_delivery_failed",
+                "recipient_email": email_target.recipient_email,
+                "notes": str(exc),
+            },
+        )
+        logger.exception(
+            "linkedin_job_email_failed",
+            extra={
+                "job_posting_id": str(posting.id),
+                "submission_id": str(submission_id),
+                "recipient_email": email_target.recipient_email,
+            },
+        )
+        return
+
+    executor._record_event(  # noqa: SLF001
+        execution_events,
+        execution_id=execution_id,
+        submission_id=submission_id,
+        event_type=ExecutionEventType.JOB_EMAIL_ATTEMPTED,
+        payload={
+            "job_posting_id": str(posting.id),
+            "status": attempt.status,
+            "reason": attempt.notes,
+            "recipient_email": attempt.recipient_email,
+            "subject": attempt.subject,
+            "resume_filename": resume_path.name,
+        },
+    )
 
 
 def _build_file_artifact(

@@ -21,6 +21,12 @@ from job_applier.infrastructure.linkedin.easy_apply import (
     LinkedInEasyApplySubmitter,
     PlaywrightLinkedInEasyApplyExecutor,
 )
+from job_applier.infrastructure.linkedin.job_email import (
+    JobApplicationEmailAttempt,
+    JobApplicationEmailTarget,
+    SmtpJobApplicationEmailSender,
+    detect_job_application_email_target,
+)
 from job_applier.infrastructure.linkedin.playwright_mcp import (
     OpenAIResponsesPlaywrightMcpAgent,
     PlaywrightMcpAction,
@@ -84,6 +90,8 @@ __all__ = [
     "EasyApplyField",
     "EasyApplyStep",
     "GeneratedAnswer",
+    "JobApplicationEmailAttempt",
+    "JobApplicationEmailTarget",
     "LINKEDIN_JOBS_URL",
     "LinkedInAuthError",
     "LinkedInAnswerResolver",
@@ -116,9 +124,11 @@ __all__ = [
     "RecruiterCandidate",
     "RecruiterConnectAttempt",
     "RecruiterMessageGenerator",
+    "SmtpJobApplicationEmailSender",
     "build_paginated_search_url",
     "build_recruiter_message_template",
     "build_search_criteria",
+    "detect_job_application_email_target",
     "extract_mcp_text_content",
     "finalize_recruiter_message",
     "has_manual_intervention_cues",

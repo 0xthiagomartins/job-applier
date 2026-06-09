@@ -54,6 +54,8 @@ Responsibilities:
 - answer fields
 - upload the right CV
 - confirm submission or skip with diagnosis
+- optionally send a recruiter connection request after a successful submission
+- optionally send a follow-up application email when the vacancy description explicitly requests it
 
 ## Persistence Layers
 
@@ -74,6 +76,7 @@ Responsibilities:
 - dynamic resume building and localization
 - Easy Apply execution
 - adaptive apply memory and field replay
+- recruiter connect and job-email post-submit helpers
 - timeline/artifact/event telemetry
 
 ## Single-User But Future-Ready

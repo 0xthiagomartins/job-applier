@@ -10,7 +10,7 @@ from urllib import parse
 
 from alembic import command
 from alembic.config import Config
-from pydantic import AnyUrl, Field, SecretStr
+from pydantic import AnyUrl, EmailStr, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from job_applier.domain.enums import DebugExecutionStage
@@ -63,6 +63,18 @@ class RuntimeSettings(BaseSettings):
     openai_api_key: SecretStr | None = None
     openai_responses_max_retries: int = 2
     openai_responses_retry_max_delay_seconds: float = 20.0
+    feature_recruiter_connect_enabled: bool = False
+    feature_job_email_enabled: bool = False
+    email_smtp_host: str | None = None
+    email_smtp_port: int = 587
+    email_smtp_username: str | None = None
+    email_smtp_password: SecretStr | None = None
+    email_smtp_from_address: EmailStr | None = None
+    email_smtp_from_name: str | None = None
+    email_smtp_reply_to: EmailStr | None = None
+    email_smtp_starttls: bool = True
+    email_smtp_use_ssl: bool = False
+    email_smtp_timeout_seconds: float = 15.0
     browser_agent_single_action_max_attempts: int = 3
     browser_agent_stall_threshold: int = 3
     linkedin_field_interaction_timeout_seconds: int = 45

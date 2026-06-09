@@ -27,6 +27,8 @@ This file summarizes the most relevant recent changes so a new harness does not 
 
 ## Issues Recently Addressed
 
+- feature-flagged recruiter-connect/runtime gate in addition to the user preference
+- feature-flagged post-submit job-email delivery through SMTP when the vacancy description explicitly requests resume submission by email
 - backend workspace reorganization under `apps/backend/...`
 - removal of the old frontend surface
 - `.env` precedence for OpenAI key

@@ -397,6 +397,7 @@ async def save_preferences(
     positive_keywords: Annotated[str, Form()] = "",
     negative_keywords: Annotated[str, Form()] = "",
     auto_connect_with_recruiter: Annotated[bool, Form()] = False,
+    auto_send_job_email: Annotated[bool, Form()] = False,
 ) -> JSONResponse:
     """Persist search filters and preferences from the panel."""
 
@@ -411,6 +412,7 @@ async def save_preferences(
         positive_keywords=parse_csv_lines(positive_keywords),
         negative_keywords=parse_csv_lines(negative_keywords),
         auto_connect_with_recruiter=auto_connect_with_recruiter,
+        auto_send_job_email=auto_send_job_email,
     )
     document = store.save_preferences(preferences_input)
     return JSONResponse(

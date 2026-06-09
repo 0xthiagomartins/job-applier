@@ -103,6 +103,7 @@ class ExecutionEventType(StrEnum):
     AUTOFILL_APPLIED = "autofill_applied"
     QUESTION_CLASSIFICATION_FAILED = "question_classification_failed"
     RECRUITER_CONNECT_ATTEMPTED = "recruiter_connect_attempted"
+    JOB_EMAIL_ATTEMPTED = "job_email_attempted"
     SUBMISSION_COMPLETED = "submission_completed"
     EXECUTION_FAILED = "execution_failed"
     EXCEPTION_CAPTURED = "exception_captured"
