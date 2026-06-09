@@ -121,7 +121,7 @@ class AgentConfig(FrozenModel):
     """Non-sensitive agent runtime preferences."""
 
     schedule: ScheduleConfig
-    auto_connect_with_recruiter: bool = False
+    auto_connect_with_recruiter: bool = True
     auto_send_job_email: bool = False
 
 
@@ -137,7 +137,7 @@ class RulesetConfig(FrozenModel):
 
     version: str = "ruleset-v1"
     allow_best_effort_autofill: bool = True
-    auto_connect_with_recruiter: bool = False
+    auto_connect_with_recruiter: bool = True
     auto_send_job_email: bool = False
 
     def to_domain(self) -> Ruleset:

@@ -245,7 +245,7 @@ class LocalPanelSettingsStore:
                 easy_apply_only=True,
                 positive_keywords=(),
                 negative_keywords=("internship",),
-                auto_connect_with_recruiter=False,
+                auto_connect_with_recruiter=True,
                 auto_send_job_email=False,
             ),
             ai=StoredAISection(

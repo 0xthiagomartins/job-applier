@@ -63,7 +63,7 @@ class RuntimeSettings(BaseSettings):
     openai_api_key: SecretStr | None = None
     openai_responses_max_retries: int = 2
     openai_responses_retry_max_delay_seconds: float = 20.0
-    feature_recruiter_connect_enabled: bool = False
+    feature_recruiter_connect_enabled: bool = True
     feature_job_email_enabled: bool = False
     email_smtp_host: str | None = None
     email_smtp_port: int = 587

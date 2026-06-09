@@ -364,7 +364,7 @@ class ScheduleConfigSchema(BaseModel):
 
 class AgentConfigSchema(BaseModel):
     schedule: ScheduleConfigSchema
-    auto_connect_with_recruiter: bool = False
+    auto_connect_with_recruiter: bool = True
     auto_send_job_email: bool = False
 
 
@@ -380,7 +380,7 @@ class AIConfigReadSchema(BaseModel):
 class RulesetConfigSchema(BaseModel):
     version: str = "ruleset-v1"
     allow_best_effort_autofill: bool = True
-    auto_connect_with_recruiter: bool = False
+    auto_connect_with_recruiter: bool = True
     auto_send_job_email: bool = False
 
 

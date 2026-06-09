@@ -90,7 +90,7 @@ Current SMTP settings for job-email delivery:
 
 Important behavior:
 
-- recruiter connect only runs when both the runtime flag and the user preference are enabled
+- recruiter connect is enabled by default and only runs when both the runtime flag and the user preference are enabled
 - job-email delivery only runs when both the runtime flag and the user preference are enabled
 - the email helper runs only after a successful LinkedIn submit and only when the job description explicitly contains a likely application email target
 

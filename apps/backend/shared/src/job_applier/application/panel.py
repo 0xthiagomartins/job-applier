@@ -427,7 +427,7 @@ class StoredPreferencesSection(PanelModel):
     minimum_score_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     positive_keywords: tuple[str, ...] = ()
     negative_keywords: tuple[str, ...] = ()
-    auto_connect_with_recruiter: bool = False
+    auto_connect_with_recruiter: bool = True
     auto_send_job_email: bool = False
 
 
@@ -443,7 +443,7 @@ class PreferencesFormInput(BaseModel):
     minimum_score_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     positive_keywords: tuple[str, ...] = ()
     negative_keywords: tuple[str, ...] = ()
-    auto_connect_with_recruiter: bool = False
+    auto_connect_with_recruiter: bool = True
     auto_send_job_email: bool = False
 
 
