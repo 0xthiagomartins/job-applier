@@ -100,6 +100,30 @@ Important behavior:
 - the user must explicitly consent before this metadata can be sent to OpenAI
 - panel state exposes only a safe summary, not the raw metadata block
 
+Current safe state summary now includes:
+
+- `entry_count`
+- `stored_keys`
+- `stored_labels`
+- `consent_to_ai_usage`
+- `ai_usage_warning`
+- `parse_error`
+
+Current aggregated feedback now also includes:
+
+- `missing_fields`
+- `configured_missing_fields`
+- `missing_unconfigured_fields`
+- `consent_required_for_ai_usage`
+- `suggested_raw_text_template`
+- `next_action`
+
+Important nuance:
+
+- the feedback is cumulative from recent skipped submissions
+- but it is also re-evaluated against the current private metadata state on every `GET /api/panel/state`
+- so a field that failed in the past can later appear as already configured, even before a new apply run proves the fix end to end
+
 ## Important Sharing Warning
 
 Before sharing the project with another harness or person, review:

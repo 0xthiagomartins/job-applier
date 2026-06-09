@@ -4,6 +4,8 @@ This file summarizes the most relevant recent changes so a new harness does not 
 
 ## Important Recent Commits
 
+- `ac82458` `feat: improve private metadata feedback`
+- `3349fd5` `feat: add run cost observability`
 - `working tree` `persist canonical resume source snapshots and reuse them in dynamic resume generation`
 - `412d90d` `fix: harden accessibility field resolution`
 - `495734f` `fix: harden linkedin prod apply guardrails`
@@ -43,7 +45,17 @@ This file summarizes the most relevant recent changes so a new harness does not 
 - sensitive-question guardrails no longer false-positive on generic `drug test` yes/no questions because of substring token collisions like `cor` inside `accordance`
 - private metadata now has a separate panel/runtime flow for unresolved factual apply fields
 - panel state now reports aggregated `missing_private_metadata` feedback without exposing raw metadata values
+- panel state now also distinguishes:
+  - fields already configured
+  - fields still missing
+  - cases where consent still blocks AI usage
+  - a suggested raw-text template and next action for the user
 - the Easy Apply resolver can now use user-consented private metadata agentically through OpenAI with field-scoped context only
+- run artifacts now expose explicit cost/efficiency telemetry for:
+  - OpenAI usage by category
+  - apply memory
+  - search cache
+  - resume snapshot reuse
 
 ## Recent Real Successes
 
@@ -65,6 +77,7 @@ The main remaining area to keep validating is:
 - how much the persisted resume snapshot reduces repeated dynamic-resume setup cost
 - how much the new 1-hour search+score cache reduces repeated full-stage validation cost
 - how often private-metadata-backed fields appear in production and which factual keys are most needed first
+- whether cost telemetry shows the expected drop in OpenAI usage as cache/memory warm up
 
 There is no single known blocker in dynamic resume quality right now; the higher-value work is cost control and apply robustness.
 

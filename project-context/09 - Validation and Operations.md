@@ -24,6 +24,22 @@ Latest run bundle:
 - `artifacts/last-run/timeline.jsonl`
 - `artifacts/last-run/run.log`
 
+Cost observability is now embedded directly into run artifacts:
+
+- `summary.json`
+  - `cost.openai.calls_total`
+  - `cost.openai.by_category`
+  - `cost.openai.latency_ms_total`
+  - `cost.openai.tokens`
+  - `cost.openai.rate_limit_count`
+  - `cost.openai.failure_count`
+  - `cost.efficiency.apply_memory.*`
+  - `cost.efficiency.search_cache.*`
+  - `cost.efficiency.resume_snapshot.*`
+- `timeline.jsonl`
+  - `openai_cost_recorded`
+  - `cost_efficiency_recorded`
+
 Durable evidence:
 
 - `artifacts/runtime/artifacts/linkedin/submissions/...`
@@ -94,6 +110,11 @@ Validation checklist:
 3. `GET /api/panel/private-metadata` is the only route that may expose the raw user-managed block
 4. when consent is enabled and matching metadata exists, the Easy Apply resolver may use OpenAI with only the relevant metadata subset for the current field
 5. snapshots and panel state summaries must not contain the raw metadata values
+6. `GET /api/panel/state` should distinguish:
+   - fields still missing
+   - fields already configured in private metadata
+   - cases where consent is still blocking AI usage
+7. the suggested raw-text template should only mention unconfigured fields
 
 ## What “Good” Looks Like
 
@@ -119,3 +140,4 @@ When something looks wrong:
 7. any `linkedin_search_campaign_cache_*` or `job_score_cache_*` events
 8. whether the run halted on an OpenAI `429` instead of retrying indefinitely
 9. whether the canonical resume snapshot is stale or user-edited
+10. whether `summary.json.cost` shows the expected cache/memory hits and OpenAI call categories
