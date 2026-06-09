@@ -485,6 +485,21 @@ class ResumeVerificationState:
 
 
 @dataclass(frozen=True, slots=True)
+class ResumeUploadSettleState:
+    """Observed completion state for a LinkedIn resume upload interaction."""
+
+    selection_matches: bool = False
+    target_visible: bool = False
+    success_feedback: bool = False
+    uploading: bool = False
+    status_text: str | None = None
+
+    @property
+    def settled(self) -> bool:
+        return self.selection_matches or self.target_visible or self.success_feedback
+
+
+@dataclass(frozen=True, slots=True)
 class TextFieldInteractionState:
     """Interactive state for a filled text-like control."""
 
@@ -2603,6 +2618,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         settings=settings,
                         submission_cv_path=submission_cv_path,
                         force_reassert=force_resume_reassert,
+                        step_index=step_index,
+                        total_steps=total_steps,
                     )
                 option_index = _pick_option_index(field.options, preferred=resolution.value)
                 if option_index is None:
@@ -2635,7 +2652,18 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 if locator is None or resolved_cv_path is None:
                     return None
                 await locator.set_input_files(resolved_cv_path)
-                return settings.profile.cv_filename or resolved_cv_path.name
+                target_cv_name = (
+                    submission_cv_path.name
+                    if submission_cv_path is not None
+                    else settings.profile.cv_filename or resolved_cv_path.name
+                )
+                settle_state = await self._await_resume_upload_settlement(
+                    page,
+                    target_cv_name=target_cv_name,
+                )
+                if settle_state.settled:
+                    return settings.profile.cv_filename or resolved_cv_path.name
+                return None
 
     async def _complete_text_field_interaction(
         self,
@@ -3320,8 +3348,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
         settings: UserAgentSettings,
         submission_cv_path: Path | None,
         force_reassert: bool = False,
+        step_index: int | None = None,
+        total_steps: int | None = None,
+        target_cv_name_override: str | None = None,
+        allow_upload: bool = True,
     ) -> str | None:
-        target_cv_name = (
+        target_cv_name = target_cv_name_override or (
             submission_cv_path.name
             if submission_cv_path is not None
             else settings.profile.cv_filename
@@ -3338,8 +3370,8 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 page=page,
                 root=root,
                 submission_cv_path=submission_cv_path,
+                target_cv_name=target_cv_name,
             ):
-                await page.wait_for_timeout(900)
                 refreshed_root = await self._easy_apply_root(page)
                 if await self._resume_picker_selection_matches_requested_cv(
                     refreshed_root,
@@ -3348,18 +3380,41 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     return target_cv_name
         option_index = _pick_resume_option_index(field.options, target_cv_name)
         if option_index is None:
-            if submission_cv_path is not None and await self._upload_resume_from_choice_step(
-                page=page,
-                root=root,
-                submission_cv_path=submission_cv_path,
+            if (
+                allow_upload
+                and submission_cv_path is not None
+                and await self._upload_resume_from_choice_step(
+                    page=page,
+                    root=root,
+                    submission_cv_path=submission_cv_path,
+                    target_cv_name=target_cv_name,
+                )
             ):
-                await page.wait_for_timeout(900)
                 refreshed_root = await self._easy_apply_root(page)
                 if await self._resume_picker_selection_matches_requested_cv(
                     refreshed_root,
                     target_cv_name=target_cv_name,
                 ):
                     return target_cv_name
+                refreshed_field = await self._reload_resume_choice_field(
+                    page=page,
+                    field=field,
+                    step_index=step_index,
+                    total_steps=total_steps,
+                )
+                if refreshed_field is not None:
+                    return await self._apply_resume_choice_field(
+                        page=page,
+                        root=refreshed_root,
+                        field=refreshed_field,
+                        settings=settings,
+                        submission_cv_path=None,
+                        force_reassert=True,
+                        step_index=step_index,
+                        total_steps=total_steps,
+                        target_cv_name_override=target_cv_name,
+                        allow_upload=False,
+                    )
                 return None
             if submission_cv_path is not None:
                 msg = (
@@ -3450,6 +3505,42 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         return target_cv_name
         return None
 
+    async def _reload_resume_choice_field(
+        self,
+        *,
+        page: Page,
+        field: EasyApplyField,
+        step_index: int | None,
+        total_steps: int | None,
+    ) -> EasyApplyField | None:
+        if step_index is None or total_steps is None:
+            return None
+        try:
+            current_step = await self._extract_step(
+                page,
+                last_known_step_index=step_index,
+                last_known_total_steps=total_steps,
+            )
+        except LinkedInEasyApplyError:
+            return None
+        if current_step.step_index != step_index:
+            return None
+        return next(
+            (
+                candidate
+                for candidate in current_step.fields
+                if _same_step_field_identity(candidate, field)
+            ),
+            next(
+                (
+                    candidate
+                    for candidate in current_step.fields
+                    if candidate.question_type is QuestionType.RESUME_UPLOAD
+                ),
+                None,
+            ),
+        )
+
     async def _resume_picker_selection_matches_requested_cv(
         self,
         root: Locator,
@@ -3531,6 +3622,153 @@ class PlaywrightLinkedInEasyApplyExecutor:
         except Exception:  # noqa: BLE001
             return False
         return bool(payload)
+
+    async def _inspect_resume_upload_settlement(
+        self,
+        page: Page,
+        *,
+        target_cv_name: str,
+    ) -> ResumeUploadSettleState:
+        if not target_cv_name:
+            return ResumeUploadSettleState()
+        root = await self._easy_apply_root(page)
+        try:
+            payload = await root.evaluate(
+                """
+                (node, { targetCvName }) => {
+                  const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                  const normalize = (value) => collapse(value).toLowerCase();
+                  const target = normalize(targetCvName);
+                  const isVisible = (element) => {
+                    if (!(element instanceof Element)) {
+                      return false;
+                    }
+                    const style = window.getComputedStyle(element);
+                    if (
+                      style.display === "none"
+                      || style.visibility === "hidden"
+                      || style.opacity === "0"
+                    ) {
+                      return false;
+                    }
+                    const rect = element.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  };
+                  const matchesTarget = (text) => {
+                    const normalizedText = normalize(text);
+                    return Boolean(normalizedText && normalizedText.includes(target));
+                  };
+
+                  let selectionMatches = false;
+                  const radios = Array.from(node.querySelectorAll('input[type="radio"]'));
+                  for (const radio of radios) {
+                    if (!(radio instanceof HTMLInputElement) || !radio.checked) {
+                      continue;
+                    }
+                    const card = radio.closest('[role="button"], label, fieldset, div');
+                    const cardText = collapse(card?.innerText || card?.textContent || "");
+                    if (matchesTarget(cardText)) {
+                      selectionMatches = true;
+                      break;
+                    }
+                  }
+                  if (!selectionMatches) {
+                    for (const roleRadio of node.querySelectorAll(
+                      '[role="radio"][aria-checked="true"]'
+                    )) {
+                      if (!isVisible(roleRadio)) {
+                        continue;
+                      }
+                      const text = collapse(roleRadio.innerText || roleRadio.textContent || "");
+                      if (matchesTarget(text)) {
+                        selectionMatches = true;
+                        break;
+                      }
+                    }
+                  }
+                  if (!selectionMatches) {
+                    for (const card of node.querySelectorAll(
+                      '[aria-selected="true"], [data-selected="true"], [aria-current="true"]'
+                    )) {
+                      if (!isVisible(card)) {
+                        continue;
+                      }
+                      const text = collapse(card.innerText || card.textContent || "");
+                      if (matchesTarget(text)) {
+                        selectionMatches = true;
+                        break;
+                      }
+                    }
+                  }
+
+                  const rootText = collapse(node.innerText || node.textContent || "");
+                  const targetVisible = matchesTarget(rootText);
+                  const statusTexts = [];
+                  for (const candidate of document.querySelectorAll(
+                    [
+                      '[role="status"]',
+                      '[role="alert"]',
+                      '[aria-live="polite"]',
+                      '[aria-live="assertive"]',
+                    ].join(', ')
+                  )) {
+                    if (!isVisible(candidate)) {
+                      continue;
+                    }
+                    const text = collapse(candidate.innerText || candidate.textContent || '');
+                    if (text) {
+                      statusTexts.push(text);
+                    }
+                  }
+                  const normalizedStatus = normalize(statusTexts.join(' '));
+                  const successFeedback =
+                    normalizedStatus.includes('resume uploaded successfully')
+                    || normalizedStatus.includes('uploaded successfully')
+                    || normalizedStatus.includes('successfully uploaded');
+                  const uploading =
+                    normalizedStatus.includes('uploading')
+                    || normalizedStatus.includes('processing upload');
+                  return {
+                    selection_matches: selectionMatches,
+                    target_visible: targetVisible,
+                    success_feedback: successFeedback,
+                    uploading,
+                    status_text: collapse(statusTexts.join(' ')),
+                  };
+                }
+                """,
+                {"targetCvName": target_cv_name},
+            )
+        except Exception:  # noqa: BLE001
+            return ResumeUploadSettleState()
+        return ResumeUploadSettleState(
+            selection_matches=bool(payload.get("selection_matches")),
+            target_visible=bool(payload.get("target_visible")),
+            success_feedback=bool(payload.get("success_feedback")),
+            uploading=bool(payload.get("uploading")),
+            status_text=str(payload.get("status_text") or "").strip() or None,
+        )
+
+    async def _await_resume_upload_settlement(
+        self,
+        page: Page,
+        *,
+        target_cv_name: str,
+        timeout_ms: int = 6_500,
+        poll_interval_ms: int = 250,
+    ) -> ResumeUploadSettleState:
+        deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
+        last_state = ResumeUploadSettleState()
+        while True:
+            last_state = await self._inspect_resume_upload_settlement(
+                page,
+                target_cv_name=target_cv_name,
+            )
+            if last_state.settled:
+                return last_state
+            if asyncio.get_running_loop().time() >= deadline:
+                return last_state
+            await page.wait_for_timeout(poll_interval_ms)
 
     async def _extract_easy_apply_review_sections(
         self,
@@ -3760,37 +3998,59 @@ class PlaywrightLinkedInEasyApplyExecutor:
         page: Page,
         root: Locator,
         submission_cv_path: Path,
+        target_cv_name: str,
     ) -> bool:
         if not submission_cv_path.exists():
             return False
 
-        direct_file_input = await self._locate_resume_file_input(root, page)
-        if direct_file_input is not None:
-            await direct_file_input.set_input_files(submission_cv_path)
-            await page.wait_for_timeout(750)
-            return True
-
         upload_trigger = await self._locate_resume_upload_trigger(root)
-        if upload_trigger is None:
-            return False
-
-        try:
-            async with page.expect_file_chooser(timeout=2_500) as chooser_info:
+        if upload_trigger is not None:
+            try:
+                async with page.expect_file_chooser(timeout=2_500) as chooser_info:
+                    await upload_trigger.click()
+                chooser = await chooser_info.value
+                await chooser.set_files(submission_cv_path)
+                settle_state = await self._await_resume_upload_settlement(
+                    page,
+                    target_cv_name=target_cv_name,
+                )
+                return settle_state.settled
+            except PlaywrightTimeoutError:
                 await upload_trigger.click()
-            chooser = await chooser_info.value
-            await chooser.set_files(submission_cv_path)
-            await page.wait_for_timeout(900)
-            return True
-        except PlaywrightTimeoutError:
-            await upload_trigger.click()
-            await page.wait_for_timeout(250)
+                await page.wait_for_timeout(250)
 
-        revealed_file_input = await self._locate_resume_file_input(root, page)
-        if revealed_file_input is None:
+            revealed_file_input = await self._locate_resume_file_input(
+                root,
+                page,
+                include_page_fallback=True,
+            )
+            if revealed_file_input is not None:
+                await revealed_file_input.set_input_files(submission_cv_path)
+                settle_state = await self._await_resume_upload_settlement(
+                    page,
+                    target_cv_name=target_cv_name,
+                )
+                return settle_state.settled
+
+        direct_file_input = await self._locate_resume_file_input(
+            root,
+            page,
+            include_page_fallback=False,
+        )
+        if direct_file_input is None:
+            direct_file_input = await self._locate_resume_file_input(
+                root,
+                page,
+                include_page_fallback=True,
+            )
+        if direct_file_input is None:
             return False
-        await revealed_file_input.set_input_files(submission_cv_path)
-        await page.wait_for_timeout(900)
-        return True
+        await direct_file_input.set_input_files(submission_cv_path)
+        settle_state = await self._await_resume_upload_settlement(
+            page,
+            target_cv_name=target_cv_name,
+        )
+        return settle_state.settled
 
     async def _locate_resume_upload_trigger(self, root: Locator) -> Locator | None:
         candidates = (
@@ -3810,11 +4070,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
         self,
         root: Locator,
         page: Page,
+        *,
+        include_page_fallback: bool = True,
     ) -> Locator | None:
-        candidates = (
-            root.locator('input[type="file"]'),
-            page.locator('input[type="file"]'),
-        )
+        candidates = [root.locator('input[type="file"]')]
+        if include_page_fallback:
+            candidates.append(page.locator('input[type="file"]'))
         for candidate in candidates:
             try:
                 if await candidate.count() > 0:
