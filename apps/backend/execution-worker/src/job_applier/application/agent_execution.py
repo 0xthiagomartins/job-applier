@@ -52,6 +52,7 @@ from job_applier.observability import (
     append_timeline_event,
     bind_execution_context,
     bind_run_output,
+    read_output_json,
     reset_run_output,
     update_progress_snapshot,
     write_output_json,
@@ -1774,7 +1775,12 @@ class AgentExecutionOrchestrator:
     def _persist_run_summary(self, summary: ExecutionRunSummary) -> None:
         if self._output_dir is None:
             return
-        write_output_json("summary.json", summary.model_dump(mode="json"))
+        payload = summary.model_dump(mode="json")
+        existing_summary = read_output_json("summary.json", output_dir=self._output_dir)
+        existing_cost = existing_summary.get("cost")
+        if isinstance(existing_cost, dict) and "cost" not in payload:
+            payload["cost"] = existing_cost
+        write_output_json("summary.json", payload)
 
     def _persist_running_summary(
         self,
