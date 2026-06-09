@@ -14,6 +14,7 @@ from job_applier.application.panel import (
     StoredProfileSection,
     StoredScheduleSection,
     build_missing_private_metadata_feedback,
+    build_private_metadata_state_summary,
     parse_private_metadata_lines,
 )
 from job_applier.domain.enums import ResumeMode, SupportedLanguage
@@ -95,6 +96,20 @@ class PrivateMetadataPanelTests(unittest.TestCase):
         self.assertNotIn("507.329.848-90", str(snapshot_payload))
         self.assertNotIn("Maria Example", str(snapshot_payload))
 
+    def test_build_private_metadata_state_summary_exposes_safe_labels_only(self) -> None:
+        summary = build_private_metadata_state_summary(
+            raw_text="CPF: 507.329.848-90\nMÃE: Maria Example",
+            consent_to_ai_usage=False,
+        )
+
+        self.assertTrue(summary["has_entries"])
+        self.assertEqual(summary["entry_count"], 2)
+        self.assertEqual(summary["stored_keys"], ["cpf", "mother_name"])
+        self.assertEqual(summary["stored_labels"], ["CPF", "Nome da mãe"])
+        self.assertFalse(summary["consent_to_ai_usage"])
+        self.assertNotIn("507.329.848-90", str(summary))
+        self.assertNotIn("Maria Example", str(summary))
+
     def test_build_missing_private_metadata_feedback_aggregates_without_job_identity(self) -> None:
         feedback = build_missing_private_metadata_feedback(
             (
@@ -115,18 +130,56 @@ class PrivateMetadataPanelTests(unittest.TestCase):
                     "control_kind=text."
                 ),
                 "some unrelated note",
-            )
+            ),
+            raw_text="CPF: 507.329.848-90",
+            consent_to_ai_usage=False,
         )
 
         self.assertTrue(feedback["has_missing_fields"])
         self.assertEqual(feedback["skipped_submission_count"], 3)
+        self.assertEqual(feedback["missing_field_count"], 2)
+        self.assertEqual(feedback["configured_missing_field_count"], 1)
+        self.assertEqual(feedback["missing_unconfigured_field_count"], 1)
+        self.assertTrue(feedback["consent_required_for_ai_usage"])
         missing_fields = feedback["missing_fields"]
         assert isinstance(missing_fields, list)
         self.assertEqual(missing_fields[0]["key"], "cpf")
         self.assertEqual(missing_fields[0]["occurrences"], 2)
+        self.assertTrue(missing_fields[0]["is_configured"])
+        self.assertEqual(
+            feedback["suggested_raw_text_template"],
+            "Salário atual/último: ",
+        )
+        next_action = feedback["next_action"]
+        assert isinstance(next_action, str)
+        self.assertIn("habilite o consentimento", next_action)
         message = feedback["message"]
         assert isinstance(message, str)
         self.assertIn("Nao consegui aplicar em 3 vaga(s)", message)
+        self.assertNotIn("442", message)
+
+    def test_build_missing_private_metadata_feedback_detects_consent_block_when_all_keys_exist(
+        self,
+    ) -> None:
+        feedback = build_missing_private_metadata_feedback(
+            (
+                (
+                    "Required LinkedIn Easy Apply field could not be resolved safely because the "
+                    "profile does not provide the factual data needed: normalized_key=cpf, "
+                    "question_type=free_text_generic, control_kind=text."
+                ),
+            ),
+            raw_text="CPF: 507.329.848-90",
+            consent_to_ai_usage=False,
+        )
+
+        self.assertTrue(feedback["consent_required_for_ai_usage"])
+        self.assertEqual(feedback["missing_unconfigured_field_count"], 0)
+        self.assertEqual(feedback["configured_missing_field_count"], 1)
+        self.assertEqual(feedback["suggested_raw_text_template"], "")
+        next_action = feedback["next_action"]
+        assert isinstance(next_action, str)
+        self.assertIn("consentimento", next_action)
 
 
 if __name__ == "__main__":

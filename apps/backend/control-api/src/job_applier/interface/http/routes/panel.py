@@ -24,6 +24,7 @@ from job_applier.application.panel import (
     ResumeSourceSnapshotUpdateInput,
     ScheduleFormInput,
     build_missing_private_metadata_feedback,
+    build_private_metadata_state_summary,
     calculate_next_execution_at,
     parse_capability_override_json,
     parse_csv_lines,
@@ -76,14 +77,10 @@ def _private_metadata_response(raw_text: str, consent_to_ai_usage: bool) -> dict
 
 
 def _private_metadata_state_summary(raw_text: str, consent_to_ai_usage: bool) -> dict[str, object]:
-    response = _private_metadata_response(raw_text, consent_to_ai_usage)
-    return {
-        "consent_to_ai_usage": response["consent_to_ai_usage"],
-        "has_entries": response["has_entries"],
-        "stored_keys": response["stored_keys"],
-        "ai_usage_warning": response["ai_usage_warning"],
-        "parse_error": response["parse_error"],
-    }
+    return build_private_metadata_state_summary(
+        raw_text=raw_text,
+        consent_to_ai_usage=consent_to_ai_usage,
+    )
 
 
 def _resume_source_snapshot_response(
@@ -274,9 +271,13 @@ async def get_panel_state(
         document.private_metadata.consent_to_ai_usage,
     )
     missing_private_metadata_feedback = build_missing_private_metadata_feedback(
-        submission.notes
-        for submission in submission_repository.list(limit=200)
-        if submission.status.value == "skipped"
+        (
+            submission.notes
+            for submission in submission_repository.list(limit=200)
+            if submission.status.value == "skipped"
+        ),
+        raw_text=document.private_metadata.raw_text,
+        consent_to_ai_usage=document.private_metadata.consent_to_ai_usage,
     )
     capability_profile_payload: dict[str, object] | None = None
     try:

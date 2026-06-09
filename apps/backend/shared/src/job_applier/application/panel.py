@@ -194,8 +194,51 @@ def parse_private_metadata_lines(raw: str) -> dict[str, str]:
     return parsed
 
 
-def build_missing_private_metadata_feedback(notes: Iterable[str | None]) -> dict[str, object]:
+def build_private_metadata_state_summary(
+    *,
+    raw_text: str,
+    consent_to_ai_usage: bool,
+) -> dict[str, object]:
+    """Build a safe summary of the persisted private metadata section."""
+
+    parse_error: str | None = None
+    try:
+        entries = parse_private_metadata_lines(raw_text)
+    except ValueError as exc:
+        entries = {}
+        parse_error = str(exc)
+    stored_keys = sorted(entries)
+    stored_labels = [
+        PRIVATE_METADATA_DISPLAY_LABELS.get(
+            key,
+            key.replace("_", " ").title(),
+        )
+        for key in stored_keys
+    ]
+    return {
+        "consent_to_ai_usage": consent_to_ai_usage,
+        "has_entries": bool(entries),
+        "entry_count": len(entries),
+        "stored_keys": stored_keys,
+        "stored_labels": stored_labels,
+        "ai_usage_warning": PRIVATE_METADATA_AI_USAGE_WARNING,
+        "parse_error": parse_error,
+    }
+
+
+def build_missing_private_metadata_feedback(
+    notes: Iterable[str | None],
+    *,
+    raw_text: str = "",
+    consent_to_ai_usage: bool = False,
+) -> dict[str, object]:
     """Aggregate recent skip notes into a user-facing missing-metadata summary."""
+
+    current_state = build_private_metadata_state_summary(
+        raw_text=raw_text,
+        consent_to_ai_usage=consent_to_ai_usage,
+    )
+    stored_keys = set(cast(list[str], current_state["stored_keys"]))
 
     counts: Counter[str] = Counter()
     total_skipped = 0
@@ -217,6 +260,14 @@ def build_missing_private_metadata_feedback(notes: Iterable[str | None]) -> dict
             "has_missing_fields": False,
             "skipped_submission_count": 0,
             "missing_fields": [],
+            "configured_missing_fields": [],
+            "missing_unconfigured_fields": [],
+            "missing_field_count": 0,
+            "configured_missing_field_count": 0,
+            "missing_unconfigured_field_count": 0,
+            "consent_required_for_ai_usage": False,
+            "suggested_raw_text_template": "",
+            "next_action": None,
             "message": None,
         }
 
@@ -225,21 +276,57 @@ def build_missing_private_metadata_feedback(notes: Iterable[str | None]) -> dict
             "key": key,
             "label": PRIVATE_METADATA_DISPLAY_LABELS.get(key, key.replace("_", " ").title()),
             "occurrences": occurrences,
+            "is_configured": key in stored_keys,
         }
         for key, occurrences in counts.most_common()
     ]
+    configured_missing_fields = [item for item in missing_fields if bool(item["is_configured"])]
+    missing_unconfigured_fields = [
+        item for item in missing_fields if not bool(item["is_configured"])
+    ]
+    suggested_raw_text_template = "\n".join(
+        f"{item['label']}: " for item in missing_unconfigured_fields
+    )
+    consent_required_for_ai_usage = bool(configured_missing_fields) and not consent_to_ai_usage
     example_labels = ", ".join(str(item["label"]) for item in missing_fields[:4])
+    if missing_unconfigured_fields and consent_required_for_ai_usage:
+        next_action = (
+            "Adicione os campos faltantes no private metadata e habilite o consentimento para "
+            "uso com OpenAI se quiser que eu tente essas informacoes em futuras buscas."
+        )
+    elif missing_unconfigured_fields:
+        next_action = (
+            "Adicione os campos faltantes no private metadata se quiser que eu tente essas "
+            "informacoes em futuras buscas."
+        )
+    elif consent_required_for_ai_usage:
+        next_action = (
+            "Os campos faltantes ja parecem cadastrados no private metadata, mas o "
+            "consentimento para uso com OpenAI esta desativado."
+        )
+    else:
+        next_action = (
+            "Os campos faltantes ja estao cadastrados. Se o problema persistir, revise os "
+            "valores salvos no private metadata."
+        )
     message = (
         "Nao consegui aplicar em "
         f"{total_skipped} vaga(s) porque faltaram dados factuais que nao posso inferir com "
-        f"seguranca. Exemplos: {example_labels}. Se quiser que eu tente essas informacoes em "
-        "futuras buscas, preencha o metadata privado com cuidado porque esses dados podem ser "
-        "enviados para a OpenAI quando necessarios para responder formularios."
+        f"seguranca. Exemplos: {example_labels}. {next_action} Cuidado: esses dados podem ser "
+        "enviados para a OpenAI quando forem necessarios para responder formularios."
     )
     return {
         "has_missing_fields": True,
         "skipped_submission_count": total_skipped,
         "missing_fields": missing_fields,
+        "configured_missing_fields": configured_missing_fields,
+        "missing_unconfigured_fields": missing_unconfigured_fields,
+        "missing_field_count": len(missing_fields),
+        "configured_missing_field_count": len(configured_missing_fields),
+        "missing_unconfigured_field_count": len(missing_unconfigured_fields),
+        "consent_required_for_ai_usage": consent_required_for_ai_usage,
+        "suggested_raw_text_template": suggested_raw_text_template,
+        "next_action": next_action,
         "message": message,
     }
 
