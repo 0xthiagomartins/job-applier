@@ -7,6 +7,7 @@ import json
 import re
 import shutil
 import subprocess
+import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -97,6 +98,112 @@ _TECHNICAL_LANGUAGE_ALLOWLIST = frozenset(
         "chatbots",
         "rust",
     }
+)
+_BILINGUAL_ANCHOR_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("python", (r"\bpython\b",)),
+    ("typescript", (r"\btypescript\b",)),
+    ("javascript", (r"\bjavascript\b",)),
+    ("java", (r"\bjava\b",)),
+    ("aws", (r"\baws\b",)),
+    ("gcp", (r"\bgcp\b",)),
+    ("azure", (r"\bazure\b",)),
+    ("rust", (r"\brust\b",)),
+    ("linux", (r"\blinux\b",)),
+    ("sql", (r"\bsql\b",)),
+    ("react", (r"\breact\b",)),
+    ("react_native", (r"\breact native\b",)),
+    ("fastapi", (r"\bfastapi\b",)),
+    ("uipath", (r"\buipath\b",)),
+    ("langchain", (r"\blangchain\b",)),
+    ("devops", (r"\bdevops\b",)),
+    ("rag", (r"\brag\b",)),
+    ("rest_apis", (r"\brest apis\b", r"\bapis rest\b")),
+    ("microservices", (r"\bmicroservices\b", r"\bmicroservicos\b")),
+    (
+        "system_integrations",
+        (r"\bsystem integrations\b", r"\bintegracoes de sistemas\b"),
+    ),
+    (
+        "backend_architecture",
+        (r"\bbackend architecture\b", r"\barquitetura de backend\b"),
+    ),
+    (
+        "database_modeling",
+        (r"\bdatabase modeling\b", r"\bmodelagem de banco de dados\b"),
+    ),
+    ("internal_tools", (r"\binternal tools\b", r"\bferramentas internas\b")),
+    (
+        "machine_learning",
+        (r"\bmachine learning\b", r"\baprendizado de maquina\b"),
+    ),
+    ("cryptography", (r"\bcryptography\b", r"\bcriptografia\b")),
+    ("scalable_systems", (r"\bscalable systems\b", r"\bsistemas escalaveis\b")),
+    (
+        "automated_testing",
+        (r"\bautomated testing\b", r"\btestes automatizados\b"),
+    ),
+    ("observability", (r"\bobservability\b", r"\bobservabilidade\b")),
+    (
+        "production_support",
+        (r"\bproduction support\b", r"\bsuporte a producao\b"),
+    ),
+    (
+        "process_orchestration",
+        (r"\bprocess orchestration\b", r"\borquestracao de processos\b"),
+    ),
+    (
+        "reliability_improvement",
+        (r"\breliability improvement\b", r"\bmelhoria de confiabilidade\b"),
+    ),
+    (
+        "ai_assisted_workflows",
+        (
+            r"\bai assisted workflows\b",
+            r"\bfluxos de trabalho assistidos por ia\b",
+            r"\bfluxos de trabalho auxiliados por ia\b",
+        ),
+    ),
+    ("chatbot_systems", (r"\bchatbot systems\b", r"\bsistemas de chatbot\b")),
+    (
+        "workflow_optimization",
+        (
+            r"\bworkflow optimization\b",
+            r"\botimizacao de fluxos de trabalho\b",
+            r"\botimizacao de fluxo de trabalho\b",
+        ),
+    ),
+    (
+        "web_applications",
+        (r"\bweb applications\b", r"\baplicacoes web\b"),
+    ),
+    (
+        "mobile_development",
+        (r"\bmobile development\b", r"\bdesenvolvimento mobile\b"),
+    ),
+    ("full_stack", (r"\bfull stack\b", r"\bfullstack\b")),
+    ("backend", (r"\bbackend\b",)),
+    ("automation", (r"\bautomation\b", r"\bautomacao\b")),
+    ("applied_ai", (r"\bapplied ai\b", r"\bia aplicada\b")),
+    (
+        "intelligent_automation",
+        (r"\bintelligent automation\b", r"\bautomacao inteligente\b"),
+    ),
+    ("chatbots_with_rag", (r"\brag powered chatbots\b", r"\bchatbots com rag\b")),
+    (
+        "judicial_recovery",
+        (r"\bjudicial recovery\b", r"\brecuperacao judicial\b"),
+    ),
+    ("anti_fraud", (r"\banti fraud\b", r"\bantifraude\b")),
+    (
+        "financial_automation",
+        (r"\bfinancial automation\b", r"\bautomacao financeira\b"),
+    ),
+    (
+        "production_readiness",
+        (r"\bproduction readiness\b", r"\bprontidao para producao\b", r"\bpreparo para producao\b"),
+    ),
+    ("maintainability", (r"\bmaintainability\b", r"\bmanutenibilidade\b")),
+    ("traceability", (r"\btraceability\b", r"\brastreabilidade\b")),
 )
 
 
@@ -253,6 +360,26 @@ def _normalize_tokens(text: str) -> set[str]:
     return tokens
 
 
+def _normalize_anchor_text(text: str) -> str:
+    lowered = text.casefold()
+    folded = "".join(
+        char for char in unicodedata.normalize("NFKD", lowered) if not unicodedata.combining(char)
+    )
+    cleaned = re.sub(r"[^a-z0-9+#/ ]+", " ", folded)
+    return " ".join(cleaned.split())
+
+
+def _extract_anchor_terms(text: str) -> set[str]:
+    normalized = _normalize_anchor_text(text)
+    if not normalized:
+        return set()
+    anchors: set[str] = set()
+    for label, patterns in _BILINGUAL_ANCHOR_PATTERNS:
+        if any(re.search(pattern, normalized) for pattern in patterns):
+            anchors.add(label)
+    return anchors
+
+
 def _strip_technical_allowlist(text: str) -> str:
     lowered = text.lower()
     for token in sorted(_TECHNICAL_LANGUAGE_ALLOWLIST, key=len, reverse=True):
@@ -304,12 +431,21 @@ def _collect_findings(
 
     base_tokens = _normalize_tokens(base_cv_text)
     resume_tokens = _normalize_tokens(combined_resume_text)
-    extra_resume_tokens = {
-        token
-        for token in resume_tokens - base_tokens
-        if token not in _UNANCHORED_ALLOWED_TOKENS and len(token) >= 5
-    }
-    if len(extra_resume_tokens) >= 25:
+    base_language = detect_text_language(base_cv_text).language if base_cv_text else None
+    resume_language = detect_text_language(combined_resume_text).language
+    if base_language and resume_language is not base_language:
+        base_anchor_terms = _extract_anchor_terms(base_cv_text)
+        resume_anchor_terms = _extract_anchor_terms(combined_resume_text)
+        extra_resume_terms = resume_anchor_terms - base_anchor_terms
+        unanchored_count = len(extra_resume_terms)
+    else:
+        extra_resume_terms = {
+            token
+            for token in resume_tokens - base_tokens
+            if token not in _UNANCHORED_ALLOWED_TOKENS and len(token) >= 5
+        }
+        unanchored_count = len(extra_resume_terms)
+    if unanchored_count >= 6:
         findings.append(
             AuditFinding(
                 severity="warning",
@@ -319,15 +455,21 @@ def _collect_findings(
         )
 
     if target_job_title:
-        normalized_job_title_tokens = _normalize_tokens(target_job_title)
-        unsupported_title_tokens = {
-            token
-            for token in normalized_job_title_tokens
-            if token not in base_tokens
-            and token not in _UNANCHORED_ALLOWED_TOKENS
-            and len(token) >= 4
-        }
-        if unsupported_title_tokens and unsupported_title_tokens.issubset(extra_resume_tokens):
+        if base_language and resume_language is not base_language:
+            normalized_job_title_tokens = _extract_anchor_terms(target_job_title)
+            unsupported_title_tokens = normalized_job_title_tokens - _extract_anchor_terms(
+                base_cv_text
+            )
+        else:
+            normalized_job_title_tokens = _normalize_tokens(target_job_title)
+            unsupported_title_tokens = {
+                token
+                for token in normalized_job_title_tokens
+                if token not in base_tokens
+                and token not in _UNANCHORED_ALLOWED_TOKENS
+                and len(token) >= 4
+            }
+        if unsupported_title_tokens and unsupported_title_tokens.issubset(extra_resume_terms):
             findings.append(
                 AuditFinding(
                     severity="warning",
