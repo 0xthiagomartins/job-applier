@@ -8,7 +8,7 @@ import logging
 import random
 import re
 import traceback
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -1377,14 +1377,24 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         if submission_cv_path is not None
                         else settings.profile.cv_filename
                     )
+                    resume_fields = tuple(
+                        field
+                        for field in step.fields
+                        if field.question_type is QuestionType.RESUME_UPLOAD
+                    )
                     resume_verification = _evaluate_resume_verification(
                         step,
                         step_answers,
                         target_cv_name=target_resume_name,
                     )
-                    if any(
-                        field.question_type is QuestionType.RESUME_UPLOAD for field in step.fields
-                    ):
+                    if resume_fields:
+                        resume_verification = await self._reload_resume_verification_state(
+                            page=page,
+                            field=resume_fields[0],
+                            target_cv_name=target_resume_name,
+                            step_index=step.step_index,
+                            total_steps=step.total_steps,
+                        )
                         if resume_verification.verified:
                             resume_review_verified_selection = True
                             resume_verification_required = False
@@ -1404,9 +1414,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                     "reason": resume_verification.reason,
                                 },
                             )
-                    if force_resume_reselection and any(
-                        field.question_type is QuestionType.RESUME_UPLOAD for field in step.fields
-                    ):
+                    if force_resume_reselection and resume_fields:
                         force_resume_reselection = False
                     answers.extend(step_answers)
                     artifacts.extend(step_artifacts)
@@ -2388,6 +2396,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 resolution,
                 settings,
                 submission_cv_path=submission_cv_path,
+                execution_events=execution_events,
+                execution_id=execution_id,
+                submission_id=submission_id,
                 force_resume_reassert=force_resume_refresh,
                 semantic_retry_required=(
                     _field_has_explicit_invalid_feedback(field) or force_semantic_reassert
@@ -2420,6 +2431,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         resolution,
                         settings,
                         submission_cv_path=submission_cv_path,
+                        execution_events=execution_events,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
                         force_resume_reassert=force_resume_refresh,
                         semantic_retry_required=(
                             _field_has_explicit_invalid_feedback(field) or force_semantic_reassert
@@ -2594,6 +2608,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
         settings: UserAgentSettings,
         *,
         submission_cv_path: Path | None,
+        execution_events: list[ExecutionEvent] | None = None,
+        execution_id: UUID | None = None,
+        submission_id: UUID | None = None,
         force_resume_reassert: bool = False,
         semantic_retry_required: bool = False,
         step_index: int | None = None,
@@ -2668,7 +2685,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         field=field,
                         settings=settings,
                         submission_cv_path=submission_cv_path,
+                        execution_events=execution_events,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
                         force_reassert=force_resume_reassert,
+                        step_index=step_index,
+                        total_steps=total_steps,
                     )
                 locator = await self._find_control_locator(root, field)
                 if locator is None:
@@ -2693,7 +2715,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         field=field,
                         settings=settings,
                         submission_cv_path=submission_cv_path,
+                        execution_events=execution_events,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
                         force_reassert=force_resume_reassert,
+                        step_index=step_index,
+                        total_steps=total_steps,
                     )
                 locator = await self._find_control_locator(root, field)
                 if locator is None:
@@ -2734,6 +2761,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         field=field,
                         settings=settings,
                         submission_cv_path=submission_cv_path,
+                        execution_events=execution_events,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
                         force_reassert=force_resume_reassert,
                         step_index=step_index,
                         total_steps=total_steps,
@@ -2790,6 +2820,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
         field: EasyApplyField,
         settings: UserAgentSettings,
         submission_cv_path: Path | None,
+        execution_events: list[ExecutionEvent] | None = None,
+        execution_id: UUID | None = None,
+        submission_id: UUID | None = None,
         force_reassert: bool = False,
         step_index: int | None = None,
         total_steps: int | None = None,
@@ -2802,6 +2835,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     field=field,
                     settings=settings,
                     submission_cv_path=submission_cv_path,
+                    execution_events=execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
                     force_reassert=force_reassert,
                     step_index=step_index,
                     total_steps=total_steps,
@@ -2809,6 +2845,18 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 timeout=self._runtime_settings.linkedin_field_interaction_timeout_seconds,
             )
         except TimeoutError as exc:
+            self._record_resume_chooser_event(
+                execution_events,
+                execution_id=execution_id,
+                submission_id=submission_id,
+                step_index=step_index,
+                stage="easy_apply_resume_reassert_timeout",
+                target_cv_name=(
+                    submission_cv_path.name
+                    if submission_cv_path is not None
+                    else field.current_value
+                ),
+            )
             msg = (
                 "Timed out while the browser agent was trying to finalize the "
                 "LinkedIn Easy Apply resume chooser."
@@ -3497,6 +3545,9 @@ class PlaywrightLinkedInEasyApplyExecutor:
         field: EasyApplyField,
         settings: UserAgentSettings,
         submission_cv_path: Path | None,
+        execution_events: list[ExecutionEvent] | None = None,
+        execution_id: UUID | None = None,
+        submission_id: UUID | None = None,
         force_reassert: bool = False,
         step_index: int | None = None,
         total_steps: int | None = None,
@@ -3516,56 +3567,141 @@ class PlaywrightLinkedInEasyApplyExecutor:
         ):
             return target_cv_name
         if force_reassert and submission_cv_path is not None:
-            if await self._upload_resume_from_choice_step(
+            settle_state = await self._upload_resume_from_choice_step(
                 page=page,
                 root=root,
                 submission_cv_path=submission_cv_path,
                 target_cv_name=target_cv_name,
-            ):
+                execution_events=execution_events,
+                execution_id=execution_id,
+                submission_id=submission_id,
+                step_index=step_index,
+            )
+            if settle_state is not None and settle_state.settled:
                 refreshed_root = await self._easy_apply_root(page)
                 if await self._resume_picker_selection_matches_requested_cv(
                     refreshed_root,
                     target_cv_name=target_cv_name,
                 ):
                     return target_cv_name
-        option_index = _pick_resume_option_index(field.options, target_cv_name)
-        if option_index is None:
-            if (
-                allow_upload
-                and submission_cv_path is not None
-                and await self._upload_resume_from_choice_step(
-                    page=page,
-                    root=root,
-                    submission_cv_path=submission_cv_path,
-                    target_cv_name=target_cv_name,
-                )
-            ):
-                refreshed_root = await self._easy_apply_root(page)
-                if await self._resume_picker_selection_matches_requested_cv(
-                    refreshed_root,
-                    target_cv_name=target_cv_name,
-                ):
-                    return target_cv_name
-                refreshed_field = await self._reload_resume_choice_field(
+                refreshed_field = await self._reload_resume_choice_field_until_target_available(
                     page=page,
                     field=field,
+                    target_cv_name=target_cv_name,
                     step_index=step_index,
                     total_steps=total_steps,
                 )
                 if refreshed_field is not None:
+                    self._record_resume_chooser_event(
+                        execution_events,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
+                        step_index=step_index,
+                        stage="easy_apply_resume_target_materialized",
+                        target_cv_name=target_cv_name,
+                        option_visible=(
+                            _pick_resume_option_index(refreshed_field.options, target_cv_name)
+                            is not None
+                        ),
+                        settle_state=settle_state,
+                    )
                     return await self._apply_resume_choice_field(
                         page=page,
                         root=refreshed_root,
                         field=refreshed_field,
                         settings=settings,
                         submission_cv_path=None,
+                        execution_events=execution_events,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
                         force_reassert=True,
                         step_index=step_index,
                         total_steps=total_steps,
                         target_cv_name_override=target_cv_name,
                         allow_upload=False,
                     )
+                self._record_resume_chooser_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    step_index=step_index,
+                    stage="easy_apply_resume_target_not_materialized",
+                    target_cv_name=target_cv_name,
+                    settle_state=settle_state,
+                )
                 return None
+        option_index = _pick_resume_option_index(field.options, target_cv_name)
+        if option_index is None:
+            if allow_upload and submission_cv_path is not None:
+                settle_state = await self._upload_resume_from_choice_step(
+                    page=page,
+                    root=root,
+                    submission_cv_path=submission_cv_path,
+                    target_cv_name=target_cv_name,
+                    execution_events=execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    step_index=step_index,
+                )
+                if settle_state is not None and settle_state.settled:
+                    refreshed_root = await self._easy_apply_root(page)
+                    if await self._resume_picker_selection_matches_requested_cv(
+                        refreshed_root,
+                        target_cv_name=target_cv_name,
+                    ):
+                        return target_cv_name
+                    refreshed_field = await self._reload_resume_choice_field_until_target_available(
+                        page=page,
+                        field=field,
+                        target_cv_name=target_cv_name,
+                        step_index=step_index,
+                        total_steps=total_steps,
+                    )
+                    if refreshed_field is not None:
+                        self._record_resume_chooser_event(
+                            execution_events,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            step_index=step_index,
+                            stage="easy_apply_resume_target_materialized",
+                            target_cv_name=target_cv_name,
+                            option_visible=(
+                                _pick_resume_option_index(refreshed_field.options, target_cv_name)
+                                is not None
+                            ),
+                            settle_state=settle_state,
+                        )
+                        return await self._apply_resume_choice_field(
+                            page=page,
+                            root=refreshed_root,
+                            field=refreshed_field,
+                            settings=settings,
+                            submission_cv_path=None,
+                            execution_events=execution_events,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            force_reassert=True,
+                            step_index=step_index,
+                            total_steps=total_steps,
+                            target_cv_name_override=target_cv_name,
+                            allow_upload=False,
+                        )
+                    self._record_resume_chooser_event(
+                        execution_events,
+                        execution_id=execution_id,
+                        submission_id=submission_id,
+                        step_index=step_index,
+                        stage="easy_apply_resume_target_not_materialized",
+                        target_cv_name=target_cv_name,
+                        settle_state=settle_state,
+                    )
+                    return None
+                refreshed_field = await self._reload_resume_choice_field(
+                    page=page,
+                    field=field,
+                    step_index=step_index,
+                    total_steps=total_steps,
+                )
             if submission_cv_path is not None:
                 msg = (
                     "LinkedIn Easy Apply did not expose the requested dynamic resume in the "
@@ -3576,6 +3712,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
 
         match field.control_kind:
             case "radio":
+                if await self._select_resume_option_by_target_name(
+                    page=page,
+                    root=root,
+                    field=field,
+                    target_cv_name=target_cv_name,
+                    force_activate=force_reassert,
+                ):
+                    return target_cv_name
                 if force_reassert:
                     alternate_option_index = _pick_alternate_resume_option_index(
                         field.options,
@@ -3603,6 +3747,49 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         target_cv_name=target_cv_name,
                     ):
                         return target_cv_name
+                if force_reassert:
+                    refreshed_field = await self._reload_resume_choice_field_until_target_available(
+                        page=page,
+                        field=field,
+                        target_cv_name=target_cv_name,
+                        step_index=step_index,
+                        total_steps=total_steps,
+                        timeout_ms=1_500,
+                    )
+                    if refreshed_field is None:
+                        self._record_resume_chooser_event(
+                            execution_events,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            step_index=step_index,
+                            stage="easy_apply_resume_target_not_materialized",
+                            target_cv_name=target_cv_name,
+                            option_visible=False,
+                        )
+                        return None
+                    field = refreshed_field
+                    root = await self._easy_apply_root(page)
+                    option_index = _pick_resume_option_index(field.options, target_cv_name)
+                    if option_index is None:
+                        self._record_resume_chooser_event(
+                            execution_events,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            step_index=step_index,
+                            stage="easy_apply_resume_target_not_materialized",
+                            target_cv_name=target_cv_name,
+                            option_visible=False,
+                        )
+                        return None
+                self._record_resume_chooser_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    step_index=step_index,
+                    stage="easy_apply_resume_reassert_agentic_fallback_started",
+                    target_cv_name=target_cv_name,
+                    option_visible=True,
+                )
                 if await self._complete_radio_interaction(
                     page=page,
                     field=field,
@@ -3655,6 +3842,70 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         return target_cv_name
         return None
 
+    async def _reload_resume_choice_field_until_target_available(
+        self,
+        *,
+        page: Page,
+        field: EasyApplyField,
+        target_cv_name: str,
+        step_index: int | None,
+        total_steps: int | None,
+        timeout_ms: int = 3_500,
+        poll_interval_ms: int = 250,
+    ) -> EasyApplyField | None:
+        deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
+        latest_field = await self._reload_resume_choice_field(
+            page=page,
+            field=field,
+            step_index=step_index,
+            total_steps=total_steps,
+        )
+        while True:
+            if latest_field is not None and (
+                _resume_text_matches_requested_cv(latest_field.current_value, target_cv_name)
+                or _pick_resume_option_index(latest_field.options, target_cv_name) is not None
+            ):
+                return latest_field
+            if asyncio.get_running_loop().time() >= deadline:
+                return None
+            await page.wait_for_timeout(poll_interval_ms)
+            latest_field = await self._reload_resume_choice_field(
+                page=page,
+                field=field,
+                step_index=step_index,
+                total_steps=total_steps,
+            )
+
+    async def _select_resume_option_by_target_name(
+        self,
+        *,
+        page: Page,
+        root: Locator,
+        field: EasyApplyField,
+        target_cv_name: str,
+        force_activate: bool = False,
+    ) -> bool:
+        option_locator = await self._resolve_resume_option_locator_by_name(
+            root,
+            field,
+            target_cv_name=target_cv_name,
+        )
+        if option_locator is None:
+            return False
+        if not force_activate and await self._resume_picker_selection_matches_requested_cv(
+            root,
+            target_cv_name=target_cv_name,
+        ):
+            return True
+        if not await self._activate_radio_option(root, option_locator):
+            return False
+        await page.wait_for_timeout(250)
+        refreshed_root = await self._easy_apply_root(page)
+        return await self._resume_picker_selection_matches_requested_cv(
+            refreshed_root,
+            target_cv_name=target_cv_name,
+        )
+
     async def _reload_resume_choice_field(
         self,
         *,
@@ -3700,6 +3951,19 @@ class PlaywrightLinkedInEasyApplyExecutor:
         step_index: int | None,
         total_steps: int | None,
     ) -> ResumeVerificationState:
+        if target_cv_name is not None:
+            live_root = await self._easy_apply_root(page)
+            if await self._resume_picker_selection_matches_requested_cv(
+                live_root,
+                target_cv_name=target_cv_name,
+            ):
+                return ResumeVerificationState(
+                    target_cv_name=target_cv_name,
+                    verified=True,
+                    option_visible=True,
+                    selected_value=normalize_text(target_cv_name),
+                    reason="verified",
+                )
         refreshed_field = await self._reload_resume_choice_field(
             page=page,
             field=field,
@@ -4193,13 +4457,26 @@ class PlaywrightLinkedInEasyApplyExecutor:
         root: Locator,
         submission_cv_path: Path,
         target_cv_name: str,
-    ) -> bool:
+        execution_events: list[ExecutionEvent] | None = None,
+        execution_id: UUID | None = None,
+        submission_id: UUID | None = None,
+        step_index: int | None = None,
+    ) -> ResumeUploadSettleState | None:
         if not submission_cv_path.exists():
-            return False
+            return None
 
         upload_trigger = await self._locate_resume_upload_trigger(root)
         if upload_trigger is not None:
             try:
+                self._record_resume_chooser_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    step_index=step_index,
+                    stage="easy_apply_resume_upload_triggered",
+                    target_cv_name=target_cv_name,
+                    extra_payload={"upload_path": "file_chooser_trigger"},
+                )
                 async with page.expect_file_chooser(timeout=2_500) as chooser_info:
                     await upload_trigger.click()
                 chooser = await chooser_info.value
@@ -4208,7 +4485,17 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     page,
                     target_cv_name=target_cv_name,
                 )
-                return settle_state.settled
+                self._record_resume_chooser_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    step_index=step_index,
+                    stage="easy_apply_resume_upload_settled",
+                    target_cv_name=target_cv_name,
+                    settle_state=settle_state,
+                    extra_payload={"upload_path": "file_chooser_trigger"},
+                )
+                return settle_state
             except PlaywrightTimeoutError:
                 await upload_trigger.click()
                 await page.wait_for_timeout(250)
@@ -4219,12 +4506,31 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 include_page_fallback=True,
             )
             if revealed_file_input is not None:
+                self._record_resume_chooser_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    step_index=step_index,
+                    stage="easy_apply_resume_upload_triggered",
+                    target_cv_name=target_cv_name,
+                    extra_payload={"upload_path": "revealed_file_input"},
+                )
                 await revealed_file_input.set_input_files(submission_cv_path)
                 settle_state = await self._await_resume_upload_settlement(
                     page,
                     target_cv_name=target_cv_name,
                 )
-                return settle_state.settled
+                self._record_resume_chooser_event(
+                    execution_events,
+                    execution_id=execution_id,
+                    submission_id=submission_id,
+                    step_index=step_index,
+                    stage="easy_apply_resume_upload_settled",
+                    target_cv_name=target_cv_name,
+                    settle_state=settle_state,
+                    extra_payload={"upload_path": "revealed_file_input"},
+                )
+                return settle_state
 
         direct_file_input = await self._locate_resume_file_input(
             root,
@@ -4238,13 +4544,32 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 include_page_fallback=True,
             )
         if direct_file_input is None:
-            return False
+            return None
+        self._record_resume_chooser_event(
+            execution_events,
+            execution_id=execution_id,
+            submission_id=submission_id,
+            step_index=step_index,
+            stage="easy_apply_resume_upload_triggered",
+            target_cv_name=target_cv_name,
+            extra_payload={"upload_path": "direct_file_input"},
+        )
         await direct_file_input.set_input_files(submission_cv_path)
         settle_state = await self._await_resume_upload_settlement(
             page,
             target_cv_name=target_cv_name,
         )
-        return settle_state.settled
+        self._record_resume_chooser_event(
+            execution_events,
+            execution_id=execution_id,
+            submission_id=submission_id,
+            step_index=step_index,
+            stage="easy_apply_resume_upload_settled",
+            target_cv_name=target_cv_name,
+            settle_state=settle_state,
+            extra_payload={"upload_path": "direct_file_input"},
+        )
+        return settle_state
 
     async def _locate_resume_upload_trigger(self, root: Locator) -> Locator | None:
         candidates = (
@@ -4259,6 +4584,49 @@ class PlaywrightLinkedInEasyApplyExecutor:
             except Exception:  # noqa: BLE001
                 continue
         return None
+
+    def _record_resume_chooser_event(
+        self,
+        execution_events: list[ExecutionEvent] | None,
+        *,
+        execution_id: UUID | None,
+        submission_id: UUID | None,
+        step_index: int | None,
+        stage: str,
+        target_cv_name: str | None,
+        settle_state: ResumeUploadSettleState | None = None,
+        option_visible: bool | None = None,
+        extra_payload: Mapping[str, object] | None = None,
+    ) -> None:
+        if execution_events is None or execution_id is None:
+            return
+        payload: dict[str, object] = {
+            "stage": stage,
+            "step_index": step_index,
+            "target_cv_name": target_cv_name,
+        }
+        if settle_state is not None:
+            payload.update(
+                {
+                    "selection_matches": settle_state.selection_matches,
+                    "target_visible": settle_state.target_visible,
+                    "success_feedback": settle_state.success_feedback,
+                    "uploading": settle_state.uploading,
+                    "status_text": settle_state.status_text,
+                    "settled": settle_state.settled,
+                }
+            )
+        if option_visible is not None:
+            payload["option_visible"] = option_visible
+        if extra_payload:
+            payload.update(extra_payload)
+        self._record_event(
+            execution_events,
+            execution_id=execution_id,
+            submission_id=submission_id,
+            event_type=ExecutionEventType.STEP_REACHED,
+            payload=payload,
+        )
 
     async def _locate_resume_file_input(
         self,
@@ -4475,6 +4843,42 @@ class PlaywrightLinkedInEasyApplyExecutor:
             return wrapping_label.first
 
         return input_locator
+
+    async def _resolve_resume_option_locator_by_name(
+        self,
+        root: Locator,
+        field: EasyApplyField,
+        *,
+        target_cv_name: str,
+    ) -> Locator | None:
+        group_locator = await self._resolve_radio_group_locator(root, field)
+        search_root = group_locator or root
+        search_terms = [
+            target_cv_name,
+            str(Path(target_cv_name).stem),
+            _resume_target_prefix(target_cv_name),
+        ]
+        for term in search_terms:
+            normalized_term = normalize_text(term)
+            if not normalized_term:
+                continue
+            try:
+                matches = search_root.get_by_text(re.compile(re.escape(term), re.I))
+                match_count = await matches.count()
+            except Exception:  # noqa: BLE001
+                continue
+            for index in range(min(match_count, 8)):
+                candidate = matches.nth(index)
+                role_radio = candidate.locator("xpath=ancestor-or-self::*[@role='radio'][1]")
+                if await role_radio.count():
+                    return role_radio.first
+                explicit_label = candidate.locator("xpath=ancestor-or-self::label[1]")
+                if await explicit_label.count():
+                    return explicit_label.first
+                input_locator = await self._resolve_radio_input_from_locator(candidate)
+                if input_locator is not None:
+                    return input_locator
+        return None
 
     async def _resolve_radio_explicit_label(
         self,
@@ -9562,6 +9966,18 @@ def _resume_option_match_score(option_text: str, filename: str) -> int:
     return score
 
 
+def _resume_target_prefix(target_filename: str) -> str:
+    normalized_stem = normalize_text(Path(target_filename).stem)
+    if not normalized_stem:
+        return ""
+    prefix = re.split(r"[-_.]", normalized_stem, maxsplit=1)[0]
+    if len(prefix) < 6:
+        return ""
+    if not re.fullmatch(r"[a-z0-9]+", prefix):
+        return ""
+    return prefix
+
+
 def _resume_text_matches_requested_cv(text: str, target_filename: str) -> bool:
     normalized_text = normalize_text(text)
     if not normalized_text:
@@ -9569,9 +9985,12 @@ def _resume_text_matches_requested_cv(text: str, target_filename: str) -> bool:
 
     normalized_filename = normalize_text(target_filename)
     normalized_stem = normalize_text(Path(target_filename).stem)
+    prefix = _resume_target_prefix(target_filename)
     if normalized_filename and normalized_filename in normalized_text:
         return True
     if normalized_stem and normalized_stem in normalized_text:
+        return True
+    if prefix and prefix in normalized_text:
         return True
 
     extracted_filenames = re.findall(
@@ -9583,6 +10002,8 @@ def _resume_text_matches_requested_cv(text: str, target_filename: str) -> bool:
         if normalize_text(candidate) == normalized_filename:
             return True
         if normalize_text(Path(candidate).stem) == normalized_stem:
+            return True
+        if prefix and prefix == _resume_target_prefix(candidate):
             return True
     return False
 

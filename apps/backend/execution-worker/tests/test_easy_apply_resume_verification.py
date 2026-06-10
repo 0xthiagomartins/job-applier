@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from pathlib import Path
 from types import TracebackType
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
-from job_applier.domain.entities import ApplicationAnswer
+from job_applier.domain.entities import ApplicationAnswer, ExecutionEvent
 from job_applier.domain.enums import AnswerSource, DebugExecutionStage, FillStrategy, QuestionType
 from job_applier.infrastructure.linkedin.easy_apply import (
     EasyApplyStep,
@@ -91,7 +92,8 @@ class ResumeVerificationTests(unittest.TestCase):
             )
         )
 
-        self.assertTrue(uploaded)
+        assert uploaded is not None
+        self.assertTrue(uploaded.target_visible)
         upload_trigger.click.assert_awaited_once()
         chooser.set_files.assert_awaited_once()
         executor._locate_resume_file_input.assert_not_awaited()
@@ -178,6 +180,28 @@ class ResumeVerificationTests(unittest.TestCase):
             step,
             (),
             target_cv_name="e8ceaf02-principal-back-end-engineer-tailored.pdf",
+        )
+
+        self.assertTrue(verification.verified)
+        self.assertEqual(verification.reason, "verified")
+
+    def test_resume_verification_accepts_truncated_target_with_unique_prefix(self) -> None:
+        step = EasyApplyStep(
+            step_index=1,
+            total_steps=4,
+            fields=(
+                _resume_field(
+                    current_value="PDF fb71e2ab-fullstack-engineer-react-node-tailor… 6/10/2026",
+                    options=("PDF fb71e2ab-fullstack-engineer-react-node-tailor… 6/10/2026",),
+                ),
+            ),
+            surface_text="Resume step",
+        )
+
+        verification = _evaluate_resume_verification(
+            step,
+            (),
+            target_cv_name="fb71e2ab-fullstack-engineer-react-node-tailored.pdf",
         )
 
         self.assertTrue(verification.verified)
@@ -297,6 +321,10 @@ class ResumeVerificationTests(unittest.TestCase):
             current_value="PDF target-resume.pdf 6/9/2026",
             options=("PDF target-resume.pdf 6/9/2026",),
         )
+        executor._easy_apply_root = AsyncMock(return_value=AsyncMock())  # type: ignore[method-assign]
+        executor._resume_picker_selection_matches_requested_cv = AsyncMock(  # type: ignore[method-assign]
+            return_value=False
+        )
         executor._reload_resume_choice_field = AsyncMock(  # type: ignore[method-assign]
             return_value=refreshed_field
         )
@@ -313,6 +341,42 @@ class ResumeVerificationTests(unittest.TestCase):
 
         self.assertTrue(state.verified)
         self.assertEqual(state.reason, "verified")
+
+    def test_reload_resume_verification_state_prefers_live_picker_selection(self) -> None:
+        executor = PlaywrightLinkedInEasyApplyExecutor(
+            RuntimeSettings().model_copy(
+                update={
+                    "resolved_agent_debug_stage": DebugExecutionStage.FULL,
+                    "agent_test_mode": True,
+                }
+            )
+        )
+        stale_field = _resume_field(
+            current_value="PDF stale-resume.pdf 6/8/2026",
+            options=("PDF stale-resume.pdf 6/8/2026",),
+        )
+        executor._easy_apply_root = AsyncMock(return_value=AsyncMock())  # type: ignore[method-assign]
+        executor._resume_picker_selection_matches_requested_cv = AsyncMock(  # type: ignore[method-assign]
+            return_value=True
+        )
+        executor._reload_resume_choice_field = AsyncMock(  # type: ignore[method-assign]
+            return_value=stale_field
+        )
+
+        state = asyncio.run(
+            executor._reload_resume_verification_state(
+                page=AsyncMock(),
+                field=stale_field,
+                target_cv_name="target-resume.pdf",
+                step_index=2,
+                total_steps=5,
+            )
+        )
+
+        self.assertTrue(state.verified)
+        self.assertEqual(state.reason, "verified")
+        self.assertEqual(state.selected_value, "target-resume.pdf")
+        executor._reload_resume_choice_field.assert_not_awaited()
 
     def test_resume_submit_footer_label_only_returns_submit_cta(self) -> None:
         executor = PlaywrightLinkedInEasyApplyExecutor(
@@ -373,7 +437,7 @@ class ResumeVerificationTests(unittest.TestCase):
         first_root = AsyncMock()
         second_root = AsyncMock()
         executor._upload_resume_from_choice_step = AsyncMock(  # type: ignore[method-assign]
-            return_value=True
+            return_value=ResumeUploadSettleState(success_feedback=True)
         )
         executor._easy_apply_root = AsyncMock(  # type: ignore[method-assign]
             side_effect=(first_root, second_root)
@@ -381,8 +445,11 @@ class ResumeVerificationTests(unittest.TestCase):
         executor._resume_picker_selection_matches_requested_cv = AsyncMock(  # type: ignore[method-assign]
             side_effect=(False, True)
         )
-        executor._reload_resume_choice_field = AsyncMock(  # type: ignore[method-assign]
+        executor._reload_resume_choice_field_until_target_available = AsyncMock(  # type: ignore[method-assign]
             return_value=refreshed_field
+        )
+        executor._select_resume_option_by_target_name = AsyncMock(  # type: ignore[method-assign]
+            return_value=False
         )
         executor._check_radio_option_by_index = AsyncMock(  # type: ignore[method-assign]
             return_value=True
@@ -402,8 +469,48 @@ class ResumeVerificationTests(unittest.TestCase):
 
         self.assertEqual(applied, "target-resume.pdf")
         self.assertEqual(executor._resume_picker_selection_matches_requested_cv.await_count, 2)
-        executor._reload_resume_choice_field.assert_awaited_once()
+        executor._reload_resume_choice_field_until_target_available.assert_awaited_once()
         self.assertEqual(executor._check_radio_option_by_index.await_count, 2)
+
+    def test_resume_choice_skips_agentic_fallback_when_target_never_materializes(self) -> None:
+        executor = PlaywrightLinkedInEasyApplyExecutor(
+            RuntimeSettings().model_copy(
+                update={
+                    "resolved_agent_debug_stage": DebugExecutionStage.FULL,
+                    "agent_test_mode": True,
+                }
+            )
+        )
+        stale_field = _resume_field(
+            current_value="PDF stale-resume.pdf 6/8/2026",
+            options=("PDF stale-resume.pdf 6/8/2026",),
+        )
+        executor._upload_resume_from_choice_step = AsyncMock(  # type: ignore[method-assign]
+            return_value=ResumeUploadSettleState(success_feedback=True)
+        )
+        executor._easy_apply_root = AsyncMock(return_value=AsyncMock())  # type: ignore[method-assign]
+        executor._resume_picker_selection_matches_requested_cv = AsyncMock(  # type: ignore[method-assign]
+            return_value=False
+        )
+        executor._reload_resume_choice_field_until_target_available = AsyncMock(  # type: ignore[method-assign]
+            return_value=None
+        )
+        executor._complete_radio_interaction = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        applied = asyncio.run(
+            executor._apply_resume_choice_field(
+                page=AsyncMock(),
+                root=AsyncMock(),
+                field=stale_field,
+                settings=object(),  # type: ignore[arg-type]
+                submission_cv_path=Path("target-resume.pdf"),
+                step_index=1,
+                total_steps=4,
+            )
+        )
+
+        self.assertIsNone(applied)
+        executor._complete_radio_interaction.assert_not_awaited()
 
     def test_resume_choice_timeout_raises_easy_apply_error(self) -> None:
         executor = PlaywrightLinkedInEasyApplyExecutor(
@@ -440,10 +547,56 @@ class ResumeVerificationTests(unittest.TestCase):
                     field=field,
                     settings=object(),  # type: ignore[arg-type]
                     submission_cv_path=Path("target-resume.pdf"),
+                    execution_events=[],
+                    execution_id=uuid4(),
+                    submission_id=uuid4(),
                     step_index=1,
                     total_steps=4,
                 )
             )
+
+    def test_resume_choice_timeout_records_diagnostic_event(self) -> None:
+        executor = PlaywrightLinkedInEasyApplyExecutor(
+            RuntimeSettings().model_copy(
+                update={
+                    "resolved_agent_debug_stage": DebugExecutionStage.FULL,
+                    "agent_test_mode": True,
+                    "linkedin_field_interaction_timeout_seconds": 0.001,
+                }
+            )
+        )
+        field = _resume_field(
+            current_value="PDF stale-resume.pdf 6/8/2026",
+            options=("PDF stale-resume.pdf 6/8/2026",),
+        )
+        execution_events: list[ExecutionEvent] = []
+
+        async def _stall(**_: object) -> str | None:
+            await asyncio.sleep(0.01)
+            return None
+
+        executor._apply_resume_choice_field = _stall  # type: ignore[method-assign]
+
+        with self.assertRaises(LinkedInEasyApplyError):
+            asyncio.run(
+                executor._apply_resume_choice_field_with_timeout(
+                    page=AsyncMock(),
+                    root=AsyncMock(),
+                    field=field,
+                    settings=object(),  # type: ignore[arg-type]
+                    submission_cv_path=Path("target-resume.pdf"),
+                    execution_events=execution_events,
+                    execution_id=uuid4(),
+                    submission_id=uuid4(),
+                    step_index=2,
+                    total_steps=4,
+                )
+            )
+
+        self.assertEqual(
+            json.loads(execution_events[-1].payload_json)["stage"],
+            "easy_apply_resume_reassert_timeout",
+        )
 
     def test_activate_radio_option_uses_js_fallback_before_label_lookup(self) -> None:
         executor = PlaywrightLinkedInEasyApplyExecutor(
