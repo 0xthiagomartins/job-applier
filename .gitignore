@@ -36,6 +36,7 @@ apps/panel/tsconfig.tsbuildinfo
 # Playwright / test outputs
 playwright-report/
 test-results/
+.playwright-mcp/
 
 # Local artifacts
 artifacts/*

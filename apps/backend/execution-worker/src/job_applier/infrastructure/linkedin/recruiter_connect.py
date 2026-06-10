@@ -392,7 +392,7 @@ class PlaywrightRecruiterConnector:
                     screenshot_path=screenshot_path,
                 )
 
-            connect_opened = await self._open_connect_flow(page)
+            connect_opened = await self._open_connect_flow(page, recruiter=recruiter)
             if not connect_opened:
                 await page.screenshot(path=str(screenshot_path), full_page=True)
                 return RecruiterConnectAttempt(
@@ -401,7 +401,7 @@ class PlaywrightRecruiterConnector:
                         recruiter_name=recruiter.name,
                         recruiter_profile_url=recruiter.profile_url,
                         action=RecruiterAction.CONNECT,
-                        status=RecruiterInteractionStatus.FAILED,
+                        status=RecruiterInteractionStatus.SKIPPED,
                         message_sent=message,
                     ),
                     screenshot_path=screenshot_path,
@@ -432,14 +432,21 @@ class PlaywrightRecruiterConnector:
             await page.close()
 
     async def _existing_status(self, page: Page) -> RecruiterInteractionStatus | None:
-        for pattern in (r"pending", r"invitation sent", r"message", r"following"):
+        for pattern in (r"pending", r"invitation sent"):
             locator = page.get_by_role("button", name=re.compile(pattern, re.I))
             if await locator.count():
                 return RecruiterInteractionStatus.SKIPPED
+            text = page.get_by_text(re.compile(pattern, re.I))
+            if await text.count():
+                return RecruiterInteractionStatus.SKIPPED
         return None
 
-    async def _open_connect_flow(self, page: Page) -> bool:
-        direct_connect = page.get_by_role("button", name=re.compile(r"connect", re.I))
+    async def _open_connect_flow(self, page: Page, *, recruiter: RecruiterCandidate) -> bool:
+        recruiter_name = re.escape(recruiter.name.split("•", 1)[0].strip())
+        direct_connect = page.get_by_role(
+            "button",
+            name=re.compile(rf"invite\s+{recruiter_name}\s+to\s+connect", re.I),
+        )
         if await direct_connect.count():
             await direct_connect.first.click()
             return True
@@ -462,33 +469,43 @@ class PlaywrightRecruiterConnector:
         return False
 
     async def _add_note_if_available(self, page: Page, message: str) -> None:
-        add_note = page.get_by_role("button", name=re.compile(r"add a note", re.I))
+        dialog = page.get_by_role("dialog")
+        add_note = dialog.get_by_role("button", name=re.compile(r"add a note", re.I))
         if await add_note.count():
             await add_note.first.click()
             await page.wait_for_timeout(300)
 
-        textarea = page.locator("textarea")
+        textarea = dialog.locator("textarea")
         if await textarea.count():
             await textarea.first.fill(message)
 
     async def _send_connection_request(self, page: Page) -> None:
-        send_button = page.get_by_role("button", name=re.compile(r"send", re.I))
+        dialog = page.get_by_role("dialog")
+        send_without_note = dialog.get_by_role(
+            "button",
+            name=re.compile(r"send without a note", re.I),
+        )
+        if await send_without_note.count():
+            await send_without_note.first.click()
+            return
+
+        send_button = dialog.get_by_role("button", name=re.compile(r"send", re.I))
         if await send_button.count():
             await send_button.first.click()
             return
 
-        modal_connect = page.get_by_role("button", name=re.compile(r"connect", re.I))
+        modal_connect = dialog.get_by_role("button", name=re.compile(r"connect", re.I))
         if await modal_connect.count():
             await modal_connect.first.click()
 
     async def _await_connection_success(self, page: Page) -> bool:
-        for _ in range(12):
+        for _ in range(20):
             if await self._existing_status(page) is RecruiterInteractionStatus.SKIPPED:
                 return True
             success_text = page.get_by_text(re.compile(r"invitation sent|pending", re.I))
             if await success_text.count():
                 return True
-            await page.wait_for_timeout(400)
+            await page.wait_for_timeout(500)
         return False
 
 
