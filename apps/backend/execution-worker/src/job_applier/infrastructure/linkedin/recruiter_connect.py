@@ -20,6 +20,7 @@ from job_applier.cost_observability import record_openai_usage
 from job_applier.domain.entities import JobPosting, RecruiterInteraction, utc_now
 from job_applier.domain.enums import RecruiterAction, RecruiterInteractionStatus
 from job_applier.infrastructure.linkedin.question_resolution import normalize_text
+from job_applier.recruiter_connect_observability import record_recruiter_connect_observation
 from job_applier.settings import RuntimeSettings
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,20 @@ class RecruiterConnectAttempt:
 
     interaction: RecruiterInteraction
     screenshot_path: Path | None = None
+    connect_path: str | None = None
+    send_action: str | None = None
+    success_signal: str | None = None
+    result_reason: str | None = None
+    message_source: str | None = None
+    note_mode: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GeneratedRecruiterMessage:
+    """Prepared recruiter note with provenance metadata."""
+
+    message: str
+    source: str
 
 
 class RecruiterMessageAI(Protocol):
@@ -307,7 +322,7 @@ class RecruiterMessageGenerator:
         recruiter: RecruiterCandidate,
         posting: JobPosting,
         settings: UserAgentSettings,
-    ) -> str:
+    ) -> GeneratedRecruiterMessage:
         """Return a short recruiter note suitable for LinkedIn connect."""
 
         ai_message = await self._generate_ai_message(
@@ -316,12 +331,15 @@ class RecruiterMessageGenerator:
             settings=settings,
         )
         if ai_message:
-            return ai_message
-        return build_recruiter_message_template(
-            recruiter_name=recruiter.name,
-            company_name=posting.company_name,
-            job_title=posting.title,
-            candidate_name=settings.profile.name,
+            return GeneratedRecruiterMessage(message=ai_message, source="ai")
+        return GeneratedRecruiterMessage(
+            message=build_recruiter_message_template(
+                recruiter_name=recruiter.name,
+                company_name=posting.company_name,
+                job_title=posting.title,
+                candidate_name=settings.profile.name,
+            ),
+            source="template",
         )
 
     async def _generate_ai_message(
@@ -366,19 +384,36 @@ class PlaywrightRecruiterConnector:
     ) -> RecruiterConnectAttempt:
         """Try to send a LinkedIn connection request and return the result."""
 
-        message = await self._message_generator.generate(
+        prepared_message = await self._message_generator.generate(
             recruiter=recruiter,
             posting=posting,
             settings=settings,
         )
+        message = prepared_message.message
+        message_source = prepared_message.source
         page = await context.new_page()
         page.set_default_timeout(self._runtime_settings.linkedin_default_timeout_ms)
 
         try:
             await page.goto(recruiter.profile_url, wait_until="domcontentloaded")
+            record_recruiter_connect_observation(
+                counters=("candidate_detected", "attempted", "profile_opened"),
+                recruiter_name=recruiter.name,
+                recruiter_profile_url=recruiter.profile_url,
+                message_source=message_source,
+                timeline_event="recruiter_connect_profile_opened",
+            )
 
-            existing_status = await self._existing_status(page)
+            existing_status, existing_signal = await self._detect_existing_status(page)
             if existing_status is not None:
+                record_recruiter_connect_observation(
+                    status=existing_status.value,
+                    reason="existing_status",
+                    success_signal=existing_signal,
+                    recruiter_name=recruiter.name,
+                    recruiter_profile_url=recruiter.profile_url,
+                    timeline_event="recruiter_connect_existing_status_detected",
+                )
                 await page.screenshot(path=str(screenshot_path), full_page=True)
                 return RecruiterConnectAttempt(
                     interaction=RecruiterInteraction(
@@ -390,10 +425,20 @@ class PlaywrightRecruiterConnector:
                         message_sent=message,
                     ),
                     screenshot_path=screenshot_path,
+                    success_signal=existing_signal,
+                    result_reason="existing_status",
+                    message_source=message_source,
                 )
 
-            connect_opened = await self._open_connect_flow(page, recruiter=recruiter)
-            if not connect_opened:
+            connect_path = await self._open_connect_flow(page, recruiter=recruiter)
+            if connect_path is None:
+                record_recruiter_connect_observation(
+                    status=RecruiterInteractionStatus.SKIPPED.value,
+                    reason="connect_unavailable",
+                    recruiter_name=recruiter.name,
+                    recruiter_profile_url=recruiter.profile_url,
+                    timeline_event="recruiter_connect_unavailable",
+                )
                 await page.screenshot(path=str(screenshot_path), full_page=True)
                 return RecruiterConnectAttempt(
                     interaction=RecruiterInteraction(
@@ -405,12 +450,49 @@ class PlaywrightRecruiterConnector:
                         message_sent=message,
                     ),
                     screenshot_path=screenshot_path,
+                    result_reason="connect_unavailable",
+                    message_source=message_source,
                 )
+            record_recruiter_connect_observation(
+                connect_path=connect_path,
+                recruiter_name=recruiter.name,
+                recruiter_profile_url=recruiter.profile_url,
+                timeline_event="recruiter_connect_action_opened",
+            )
 
-            await self._add_note_if_available(page, message)
-            await self._send_connection_request(page)
-            success = await self._await_connection_success(page)
+            note_mode = await self._add_note_if_available(page, message)
+            if note_mode is not None:
+                record_recruiter_connect_observation(
+                    note_mode=note_mode,
+                    recruiter_name=recruiter.name,
+                    recruiter_profile_url=recruiter.profile_url,
+                    timeline_event="recruiter_connect_note_prepared",
+                )
+            send_action = await self._send_connection_request(page)
+            if send_action is not None:
+                record_recruiter_connect_observation(
+                    send_action=send_action,
+                    recruiter_name=recruiter.name,
+                    recruiter_profile_url=recruiter.profile_url,
+                    timeline_event="recruiter_connect_submit_triggered",
+                )
+            success, success_signal = await self._await_connection_success(page)
             await page.screenshot(path=str(screenshot_path), full_page=True)
+            final_status = (
+                RecruiterInteractionStatus.SENT if success else RecruiterInteractionStatus.FAILED
+            )
+            final_reason = None if success else "success_not_observed"
+            record_recruiter_connect_observation(
+                status=final_status.value,
+                reason=final_reason,
+                connect_path=connect_path,
+                send_action=send_action,
+                success_signal=success_signal,
+                recruiter_name=recruiter.name,
+                recruiter_profile_url=recruiter.profile_url,
+                note_mode=note_mode,
+                timeline_event="recruiter_connect_result",
+            )
 
             return RecruiterConnectAttempt(
                 interaction=RecruiterInteraction(
@@ -418,30 +500,39 @@ class PlaywrightRecruiterConnector:
                     recruiter_name=recruiter.name,
                     recruiter_profile_url=recruiter.profile_url,
                     action=RecruiterAction.CONNECT,
-                    status=(
-                        RecruiterInteractionStatus.SENT
-                        if success
-                        else RecruiterInteractionStatus.FAILED
-                    ),
+                    status=final_status,
                     message_sent=message,
                     sent_at=utc_now() if success else None,
                 ),
                 screenshot_path=screenshot_path,
+                connect_path=connect_path,
+                send_action=send_action,
+                success_signal=success_signal,
+                result_reason=final_reason,
+                message_source=message_source,
+                note_mode=note_mode,
             )
         finally:
             await page.close()
 
     async def _existing_status(self, page: Page) -> RecruiterInteractionStatus | None:
+        status, _signal = await self._detect_existing_status(page)
+        return status
+
+    async def _detect_existing_status(
+        self,
+        page: Page,
+    ) -> tuple[RecruiterInteractionStatus | None, str | None]:
         for pattern in (r"pending", r"invitation sent"):
             locator = page.get_by_role("button", name=re.compile(pattern, re.I))
             if await locator.count():
-                return RecruiterInteractionStatus.SKIPPED
+                return RecruiterInteractionStatus.SKIPPED, f"button:{pattern}"
             text = page.get_by_text(re.compile(pattern, re.I))
             if await text.count():
-                return RecruiterInteractionStatus.SKIPPED
-        return None
+                return RecruiterInteractionStatus.SKIPPED, f"text:{pattern}"
+        return None, None
 
-    async def _open_connect_flow(self, page: Page, *, recruiter: RecruiterCandidate) -> bool:
+    async def _open_connect_flow(self, page: Page, *, recruiter: RecruiterCandidate) -> str | None:
         recruiter_name = re.escape(recruiter.name.split("•", 1)[0].strip())
         direct_connect = page.get_by_role(
             "button",
@@ -449,7 +540,7 @@ class PlaywrightRecruiterConnector:
         )
         if await direct_connect.count():
             await direct_connect.first.click()
-            return True
+            return "direct_button"
 
         more_button = page.get_by_role("button", name=re.compile(r"more", re.I))
         if await more_button.count():
@@ -461,25 +552,30 @@ class PlaywrightRecruiterConnector:
             )
             if await menu_connect.count():
                 await menu_connect.first.click()
-                return True
+                return "more_menuitem"
             alt_connect = page.get_by_role("button", name=re.compile(r"connect", re.I))
             if await alt_connect.count():
                 await alt_connect.first.click()
-                return True
-        return False
+                return "more_button"
+        return None
 
-    async def _add_note_if_available(self, page: Page, message: str) -> None:
+    async def _add_note_if_available(self, page: Page, message: str) -> str | None:
         dialog = page.get_by_role("dialog")
         add_note = dialog.get_by_role("button", name=re.compile(r"add a note", re.I))
         if await add_note.count():
             await add_note.first.click()
             await page.wait_for_timeout(300)
+            note_mode = "add_note_clicked"
+        else:
+            note_mode = "no_add_note_button"
 
         textarea = dialog.locator("textarea")
         if await textarea.count():
             await textarea.first.fill(message)
+            return "note_filled"
+        return note_mode
 
-    async def _send_connection_request(self, page: Page) -> None:
+    async def _send_connection_request(self, page: Page) -> str | None:
         dialog = page.get_by_role("dialog")
         send_without_note = dialog.get_by_role(
             "button",
@@ -487,26 +583,29 @@ class PlaywrightRecruiterConnector:
         )
         if await send_without_note.count():
             await send_without_note.first.click()
-            return
+            return "send_without_note"
 
         send_button = dialog.get_by_role("button", name=re.compile(r"send", re.I))
         if await send_button.count():
             await send_button.first.click()
-            return
+            return "send_button"
 
         modal_connect = dialog.get_by_role("button", name=re.compile(r"connect", re.I))
         if await modal_connect.count():
             await modal_connect.first.click()
+            return "dialog_connect"
+        return None
 
-    async def _await_connection_success(self, page: Page) -> bool:
+    async def _await_connection_success(self, page: Page) -> tuple[bool, str | None]:
         for _ in range(20):
-            if await self._existing_status(page) is RecruiterInteractionStatus.SKIPPED:
-                return True
+            status, signal = await self._detect_existing_status(page)
+            if status is RecruiterInteractionStatus.SKIPPED:
+                return True, signal
             success_text = page.get_by_text(re.compile(r"invitation sent|pending", re.I))
             if await success_text.count():
-                return True
+                return True, "success_text"
             await page.wait_for_timeout(500)
-        return False
+        return False, "timeout"
 
 
 def build_recruiter_message_template(

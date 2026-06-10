@@ -132,6 +132,7 @@ from job_applier.observability import (
     bind_submission_context,
     update_progress_snapshot,
 )
+from job_applier.recruiter_connect_observability import record_recruiter_connect_observation
 from job_applier.settings import RuntimeSettings
 
 logger = logging.getLogger(__name__)
@@ -1823,6 +1824,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                                 recruiter_attempt.interaction.recruiter_name
                                             ),
                                             "status": recruiter_attempt.interaction.status.value,
+                                            "connect_path": recruiter_attempt.connect_path,
+                                            "send_action": recruiter_attempt.send_action,
+                                            "success_signal": recruiter_attempt.success_signal,
+                                            "result_reason": recruiter_attempt.result_reason,
+                                            "message_source": recruiter_attempt.message_source,
+                                            "note_mode": recruiter_attempt.note_mode,
                                         },
                                     )
                                     logger.info(
@@ -1834,6 +1841,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                             "recruiter_name": (
                                                 recruiter_attempt.interaction.recruiter_name
                                             ),
+                                            "connect_path": recruiter_attempt.connect_path,
+                                            "send_action": recruiter_attempt.send_action,
+                                            "success_signal": recruiter_attempt.success_signal,
+                                            "result_reason": recruiter_attempt.result_reason,
+                                            "message_source": recruiter_attempt.message_source,
+                                            "note_mode": recruiter_attempt.note_mode,
                                         },
                                     )
                             elif settings.agent.auto_connect_with_recruiter:
@@ -1851,6 +1864,16 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                         "job_posting_id": str(posting.id),
                                         "status": "skipped",
                                         "reason": reason,
+                                    },
+                                )
+                                record_recruiter_connect_observation(
+                                    counters=("candidate_not_found",),
+                                    status="skipped",
+                                    reason=reason,
+                                    timeline_event="recruiter_connect_skipped",
+                                    extra={
+                                        "job_posting_id": str(posting.id),
+                                        "external_job_id": posting.external_job_id,
                                     },
                                 )
                             self._record_event(

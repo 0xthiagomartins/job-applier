@@ -180,6 +180,21 @@ def reset_run_output(
                     "resume_snapshot": {},
                 },
             },
+            "recruiter_connect": {
+                "counters": {
+                    "candidate_detected": 0,
+                    "candidate_not_found": 0,
+                    "attempted": 0,
+                    "profile_opened": 0,
+                },
+                "status_counts": {},
+                "reason_counts": {},
+                "connect_paths": {},
+                "send_actions": {},
+                "success_signals": {},
+                "message_sources": {},
+                "note_modes": {},
+            },
         },
         output_dir=output_dir,
     )
