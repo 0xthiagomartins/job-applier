@@ -3584,6 +3584,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     target_cv_name=target_cv_name,
                 ):
                     return target_cv_name
+                if await self._resume_picker_target_option_is_selected(
+                    refreshed_root,
+                    field=field,
+                    target_cv_name=target_cv_name,
+                ):
+                    return target_cv_name
                 refreshed_field = await self._reload_resume_choice_field_until_target_available(
                     page=page,
                     field=field,
@@ -3647,6 +3653,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     refreshed_root = await self._easy_apply_root(page)
                     if await self._resume_picker_selection_matches_requested_cv(
                         refreshed_root,
+                        target_cv_name=target_cv_name,
+                    ):
+                        return target_cv_name
+                    if await self._resume_picker_target_option_is_selected(
+                        refreshed_root,
+                        field=field,
                         target_cv_name=target_cv_name,
                     ):
                         return target_cv_name
@@ -3744,6 +3756,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     refreshed_root = await self._easy_apply_root(page)
                     if await self._resume_picker_selection_matches_requested_cv(
                         refreshed_root,
+                        target_cv_name=target_cv_name,
+                    ):
+                        return target_cv_name
+                    if await self._resume_picker_target_option_is_selected(
+                        refreshed_root,
+                        field=field,
                         target_cv_name=target_cv_name,
                     ):
                         return target_cv_name
@@ -3901,8 +3919,14 @@ class PlaywrightLinkedInEasyApplyExecutor:
             return False
         await page.wait_for_timeout(250)
         refreshed_root = await self._easy_apply_root(page)
-        return await self._resume_picker_selection_matches_requested_cv(
+        if await self._resume_picker_selection_matches_requested_cv(
             refreshed_root,
+            target_cv_name=target_cv_name,
+        ):
+            return True
+        return await self._resume_picker_target_option_is_selected(
+            refreshed_root,
+            field=field,
             target_cv_name=target_cv_name,
         )
 
@@ -3964,12 +3988,40 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     selected_value=normalize_text(target_cv_name),
                     reason="verified",
                 )
+            if await self._resume_picker_target_option_is_selected(
+                live_root,
+                field=field,
+                target_cv_name=target_cv_name,
+            ):
+                return ResumeVerificationState(
+                    target_cv_name=target_cv_name,
+                    verified=True,
+                    option_visible=True,
+                    selected_value=normalize_text(target_cv_name),
+                    reason="verified",
+                )
         refreshed_field = await self._reload_resume_choice_field(
             page=page,
             field=field,
             step_index=step_index,
             total_steps=total_steps,
         )
+        if (
+            refreshed_field is not None
+            and target_cv_name is not None
+            and await self._resume_picker_target_option_is_selected(
+                live_root,
+                field=refreshed_field,
+                target_cv_name=target_cv_name,
+            )
+        ):
+            return ResumeVerificationState(
+                target_cv_name=target_cv_name,
+                verified=True,
+                option_visible=True,
+                selected_value=normalize_text(target_cv_name),
+                reason="verified",
+            )
         if refreshed_field is None:
             return _resume_field_verification_state(
                 field,
@@ -4015,6 +4067,22 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     const normalizedText = normalize(text);
                     return Boolean(normalizedText && normalizedText.includes(target));
                   };
+                  const ancestorChainMatchesTarget = (element) => {
+                    if (!(element instanceof Element)) {
+                      return false;
+                    }
+                    let current = element;
+                    let depth = 0;
+                    while (current instanceof Element && current !== node && depth < 8) {
+                      const text = collapse(current.innerText || current.textContent || "");
+                      if (matchesTarget(text)) {
+                        return true;
+                      }
+                      current = current.parentElement;
+                      depth += 1;
+                    }
+                    return false;
+                  };
 
                   const radios = Array.from(node.querySelectorAll('input[type="radio"]'));
                   for (const radio of radios) {
@@ -4023,7 +4091,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     }
                     const card = radio.closest('[role="button"], label, fieldset, div');
                     const cardText = collapse(card?.innerText || card?.textContent || "");
-                    if (matchesTarget(cardText)) {
+                    if (matchesTarget(cardText) || ancestorChainMatchesTarget(radio)) {
                       return true;
                     }
                   }
@@ -4062,6 +4130,30 @@ class PlaywrightLinkedInEasyApplyExecutor:
             return False
         return bool(payload)
 
+    async def _resume_picker_target_option_is_selected(
+        self,
+        root: Locator,
+        *,
+        field: EasyApplyField,
+        target_cv_name: str,
+    ) -> bool:
+        option_index = _pick_resume_option_index(field.options, target_cv_name)
+        if option_index is None:
+            return False
+        option_locator = await self._resolve_radio_option_locator(
+            root,
+            field,
+            option_index=option_index,
+        )
+        if option_locator is None:
+            return False
+        return await self._radio_option_is_selected(
+            root,
+            field,
+            option_index=option_index,
+            option_locator=option_locator,
+        )
+
     async def _inspect_resume_upload_settlement(
         self,
         page: Page,
@@ -4097,6 +4189,22 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     const normalizedText = normalize(text);
                     return Boolean(normalizedText && normalizedText.includes(target));
                   };
+                  const ancestorChainMatchesTarget = (element) => {
+                    if (!(element instanceof Element)) {
+                      return false;
+                    }
+                    let current = element;
+                    let depth = 0;
+                    while (current instanceof Element && current !== node && depth < 8) {
+                      const text = collapse(current.innerText || current.textContent || "");
+                      if (matchesTarget(text)) {
+                        return true;
+                      }
+                      current = current.parentElement;
+                      depth += 1;
+                    }
+                    return false;
+                  };
 
                   let selectionMatches = false;
                   const radios = Array.from(node.querySelectorAll('input[type="radio"]'));
@@ -4106,7 +4214,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                     }
                     const card = radio.closest('[role="button"], label, fieldset, div');
                     const cardText = collapse(card?.innerText || card?.textContent || "");
-                    if (matchesTarget(cardText)) {
+                    if (matchesTarget(cardText) || ancestorChainMatchesTarget(radio)) {
                       selectionMatches = true;
                       break;
                     }
