@@ -384,13 +384,8 @@ class PlaywrightRecruiterConnector:
     ) -> RecruiterConnectAttempt:
         """Try to send a LinkedIn connection request and return the result."""
 
-        prepared_message = await self._message_generator.generate(
-            recruiter=recruiter,
-            posting=posting,
-            settings=settings,
-        )
-        message = prepared_message.message
-        message_source = prepared_message.source
+        message: str | None = None
+        message_source: str | None = None
         page = await context.new_page()
         page.set_default_timeout(self._runtime_settings.linkedin_default_timeout_ms)
 
@@ -400,7 +395,6 @@ class PlaywrightRecruiterConnector:
                 counters=("candidate_detected", "attempted", "profile_opened"),
                 recruiter_name=recruiter.name,
                 recruiter_profile_url=recruiter.profile_url,
-                message_source=message_source,
                 timeline_event="recruiter_connect_profile_opened",
             )
 
@@ -422,12 +416,11 @@ class PlaywrightRecruiterConnector:
                         recruiter_profile_url=recruiter.profile_url,
                         action=RecruiterAction.CONNECT,
                         status=existing_status,
-                        message_sent=message,
+                        message_sent=None,
                     ),
                     screenshot_path=screenshot_path,
                     success_signal=existing_signal,
                     result_reason="existing_status",
-                    message_source=message_source,
                 )
 
             connect_path = await self._open_connect_flow(page, recruiter=recruiter)
@@ -447,17 +440,30 @@ class PlaywrightRecruiterConnector:
                         recruiter_profile_url=recruiter.profile_url,
                         action=RecruiterAction.CONNECT,
                         status=RecruiterInteractionStatus.SKIPPED,
-                        message_sent=message,
+                        message_sent=None,
                     ),
                     screenshot_path=screenshot_path,
                     result_reason="connect_unavailable",
-                    message_source=message_source,
                 )
             record_recruiter_connect_observation(
                 connect_path=connect_path,
                 recruiter_name=recruiter.name,
                 recruiter_profile_url=recruiter.profile_url,
                 timeline_event="recruiter_connect_action_opened",
+            )
+
+            prepared_message = await self._message_generator.generate(
+                recruiter=recruiter,
+                posting=posting,
+                settings=settings,
+            )
+            message = prepared_message.message
+            message_source = prepared_message.source
+            record_recruiter_connect_observation(
+                recruiter_name=recruiter.name,
+                recruiter_profile_url=recruiter.profile_url,
+                message_source=message_source,
+                timeline_event="recruiter_connect_message_prepared",
             )
 
             note_mode = await self._add_note_if_available(page, message)
