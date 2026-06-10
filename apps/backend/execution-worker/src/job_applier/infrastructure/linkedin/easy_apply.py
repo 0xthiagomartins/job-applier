@@ -1546,6 +1546,66 @@ class PlaywrightLinkedInEasyApplyExecutor:
                                 recruiter_interactions=tuple(recruiter_interactions),
                                 cv_version=submission_cv_version,
                             )
+                    if resume_verification_required and not resume_review_verified_selection:
+                        footer_label = await self._resume_submit_footer_label(
+                            page,
+                            step=step,
+                        )
+                        if footer_label is not None:
+                            notes = (
+                                "LinkedIn Easy Apply exposed the final submit action before "
+                                "the requested tailored resume could be verified in the live "
+                                "picker, so the submission was blocked to avoid sending a "
+                                "stale resume."
+                            )
+                            artifacts.extend(
+                                await self._capture_debug_bundle(
+                                    page,
+                                    run_dir=run_dir,
+                                    submission_id=submission_id,
+                                    label="failure_resume_unverified_pre_submit",
+                                ),
+                            )
+                            self._record_event(
+                                execution_events,
+                                execution_id=execution_id,
+                                submission_id=submission_id,
+                                event_type=ExecutionEventType.STEP_REACHED,
+                                payload={
+                                    "stage": "easy_apply_resume_submission_blocked",
+                                    "step_index": step.step_index,
+                                    "target_cv_name": target_resume_name,
+                                    "footer_label": footer_label,
+                                    "reason": "resume_unverified_before_submit",
+                                },
+                            )
+                            self._record_event(
+                                execution_events,
+                                execution_id=execution_id,
+                                submission_id=submission_id,
+                                event_type=ExecutionEventType.JOB_PROCESSED,
+                                payload={
+                                    "job_posting_id": str(posting.id),
+                                    "reason": "resume_unverified_before_submit",
+                                    "status": SubmissionStatus.FAILED.value,
+                                    "notes": notes,
+                                },
+                            )
+                            return EasyApplyExecutionResult(
+                                submission_id=submission_id,
+                                started_at=started_at,
+                                status=SubmissionStatus.FAILED,
+                                resume_mode=resume_mode,
+                                target_language=target_language,
+                                matched_role_target=matched_role_target,
+                                matched_specializations=matched_specializations,
+                                notes=notes,
+                                answers=tuple(answers),
+                                execution_events=tuple(execution_events),
+                                artifacts=tuple(artifacts),
+                                recruiter_interactions=tuple(recruiter_interactions),
+                                cv_version=submission_cv_version,
+                            )
 
                     try:
                         update_progress_snapshot(
@@ -2374,34 +2434,45 @@ class PlaywrightLinkedInEasyApplyExecutor:
                         if submission_cv_path is not None
                         else settings.profile.cv_filename
                     )
-                    resume_state = _resume_field_verification_state(
-                        field,
+                    resume_state = await self._reload_resume_verification_state(
+                        page=page,
+                        field=field,
                         target_cv_name=target_resume_name,
+                        step_index=step.step_index,
+                        total_steps=step.total_steps,
                     )
-                    self._record_event(
-                        execution_events,
-                        execution_id=execution_id,
-                        submission_id=submission_id,
-                        event_type=ExecutionEventType.STEP_REACHED,
-                        payload={
-                            "stage": "easy_apply_resume_selection_unverified",
-                            "step_index": step.step_index,
-                            "normalized_key": field.normalized_key,
-                            "question_type": field.question_type.value,
-                            "control_kind": field.control_kind,
-                            "answer_source": (
-                                resolution.answer_source.value if resolution is not None else None
-                            ),
-                            "fill_strategy": (
-                                resolution.fill_strategy.value if resolution is not None else None
-                            ),
-                            "target_cv_name": target_resume_name,
-                            "selected_value": resume_state.selected_value,
-                            "option_visible": resume_state.option_visible,
-                            "reason": resume_state.reason,
-                        },
-                    )
-                    continue
+                    if resume_state.verified and target_resume_name:
+                        applied_value = target_resume_name
+                    else:
+                        self._record_event(
+                            execution_events,
+                            execution_id=execution_id,
+                            submission_id=submission_id,
+                            event_type=ExecutionEventType.STEP_REACHED,
+                            payload={
+                                "stage": "easy_apply_resume_selection_unverified",
+                                "step_index": step.step_index,
+                                "normalized_key": field.normalized_key,
+                                "question_type": field.question_type.value,
+                                "control_kind": field.control_kind,
+                                "answer_source": (
+                                    resolution.answer_source.value
+                                    if resolution is not None
+                                    else None
+                                ),
+                                "fill_strategy": (
+                                    resolution.fill_strategy.value
+                                    if resolution is not None
+                                    else None
+                                ),
+                                "target_cv_name": target_resume_name,
+                                "selected_value": resume_state.selected_value,
+                                "option_visible": resume_state.option_visible,
+                                "reason": resume_state.reason,
+                            },
+                        )
+                        continue
+            if applied_value is None:
                 self._record_event(
                     execution_events,
                     execution_id=execution_id,
@@ -3587,6 +3658,31 @@ class PlaywrightLinkedInEasyApplyExecutor:
             ),
         )
 
+    async def _reload_resume_verification_state(
+        self,
+        *,
+        page: Page,
+        field: EasyApplyField,
+        target_cv_name: str | None,
+        step_index: int | None,
+        total_steps: int | None,
+    ) -> ResumeVerificationState:
+        refreshed_field = await self._reload_resume_choice_field(
+            page=page,
+            field=field,
+            step_index=step_index,
+            total_steps=total_steps,
+        )
+        if refreshed_field is None:
+            return _resume_field_verification_state(
+                field,
+                target_cv_name=target_cv_name,
+            )
+        return _resume_field_verification_state(
+            refreshed_field,
+            target_cv_name=target_cv_name,
+        )
+
     async def _resume_picker_selection_matches_requested_cv(
         self,
         root: Locator,
@@ -3946,6 +4042,25 @@ class PlaywrightLinkedInEasyApplyExecutor:
         except Exception:  # noqa: BLE001
             return False
         return True
+
+    async def _resume_submit_footer_label(
+        self,
+        page: Page,
+        *,
+        step: EasyApplyStep,
+    ) -> str | None:
+        root = await self._easy_apply_root(page)
+        footer_primary = await self._locate_easy_apply_footer_primary_button(root)
+        if footer_primary is None:
+            return None
+        _, footer_label = footer_primary
+        footer_intent = self._infer_easy_apply_footer_action_intent(
+            footer_label,
+            step=step,
+        )
+        if footer_intent != "submit_application":
+            return None
+        return footer_label
 
     async def _maybe_repair_easy_apply_review(
         self,

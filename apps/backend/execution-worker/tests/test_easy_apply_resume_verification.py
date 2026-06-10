@@ -277,6 +277,76 @@ class ResumeVerificationTests(unittest.TestCase):
         self.assertTrue(settled.uploading)
         self.assertFalse(settled.settled)
 
+    def test_reload_resume_verification_state_uses_live_refreshed_field(self) -> None:
+        executor = PlaywrightLinkedInEasyApplyExecutor(
+            RuntimeSettings().model_copy(
+                update={
+                    "resolved_agent_debug_stage": DebugExecutionStage.FULL,
+                    "agent_test_mode": True,
+                }
+            )
+        )
+        stale_field = _resume_field(
+            current_value="PDF stale-resume.pdf 6/8/2026",
+            options=("PDF stale-resume.pdf 6/8/2026",),
+        )
+        refreshed_field = _resume_field(
+            current_value="PDF target-resume.pdf 6/9/2026",
+            options=("PDF target-resume.pdf 6/9/2026",),
+        )
+        executor._reload_resume_choice_field = AsyncMock(  # type: ignore[method-assign]
+            return_value=refreshed_field
+        )
+
+        state = asyncio.run(
+            executor._reload_resume_verification_state(
+                page=AsyncMock(),
+                field=stale_field,
+                target_cv_name="target-resume.pdf",
+                step_index=2,
+                total_steps=5,
+            )
+        )
+
+        self.assertTrue(state.verified)
+        self.assertEqual(state.reason, "verified")
+
+    def test_resume_submit_footer_label_only_returns_submit_cta(self) -> None:
+        executor = PlaywrightLinkedInEasyApplyExecutor(
+            RuntimeSettings().model_copy(
+                update={
+                    "resolved_agent_debug_stage": DebugExecutionStage.FULL,
+                    "agent_test_mode": True,
+                }
+            )
+        )
+        step = EasyApplyStep(
+            step_index=4,
+            total_steps=5,
+            fields=(),
+            surface_text="Final step",
+        )
+        executor._easy_apply_root = AsyncMock(return_value=AsyncMock())  # type: ignore[method-assign]
+        executor._locate_easy_apply_footer_primary_button = AsyncMock(  # type: ignore[method-assign]
+            side_effect=((AsyncMock(), "Submit application"), (AsyncMock(), "Review"))
+        )
+
+        submit_label = asyncio.run(
+            executor._resume_submit_footer_label(
+                AsyncMock(),
+                step=step,
+            )
+        )
+        review_label = asyncio.run(
+            executor._resume_submit_footer_label(
+                AsyncMock(),
+                step=step,
+            )
+        )
+
+        self.assertEqual(submit_label, "Submit application")
+        self.assertIsNone(review_label)
+
     def test_resume_choice_reloads_picker_after_upload_to_select_new_target(self) -> None:
         executor = PlaywrightLinkedInEasyApplyExecutor(
             RuntimeSettings().model_copy(
