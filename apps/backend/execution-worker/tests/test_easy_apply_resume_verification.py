@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from pathlib import Path
 from types import TracebackType
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 from job_applier.domain.entities import ApplicationAnswer
@@ -15,6 +15,8 @@ from job_applier.infrastructure.linkedin.easy_apply import (
     PlaywrightLinkedInEasyApplyExecutor,
     ResumeUploadSettleState,
     _evaluate_resume_verification,
+    _radio_option_input_id,
+    _radio_option_is_checked,
 )
 from job_applier.infrastructure.linkedin.question_resolution import EasyApplyField
 from job_applier.settings import RuntimeSettings
@@ -442,6 +444,104 @@ class ResumeVerificationTests(unittest.TestCase):
                     total_steps=4,
                 )
             )
+
+    def test_activate_radio_option_uses_js_fallback_before_label_lookup(self) -> None:
+        executor = PlaywrightLinkedInEasyApplyExecutor(
+            RuntimeSettings().model_copy(
+                update={
+                    "resolved_agent_debug_stage": DebugExecutionStage.FULL,
+                    "agent_test_mode": True,
+                }
+            )
+        )
+        executor._resolve_radio_input_from_locator = AsyncMock(  # type: ignore[method-assign]
+            return_value=None
+        )
+        locator = AsyncMock()
+        locator.check.side_effect = Exception("no direct check")
+        locator.click.side_effect = Exception("no direct click")
+        locator.evaluate.return_value = True
+        locator.get_attribute.side_effect = AssertionError("should not read id")
+
+        with patch(
+            "job_applier.infrastructure.linkedin.easy_apply._radio_option_is_checked",
+            new=AsyncMock(return_value=True),
+        ):
+            activated = asyncio.run(
+                executor._activate_radio_option(
+                    AsyncMock(),
+                    locator,
+                )
+            )
+
+        self.assertTrue(activated)
+        locator.get_attribute.assert_not_called()
+
+    def test_radio_option_input_id_returns_none_when_nested_lookup_stalls(self) -> None:
+        locator = AsyncMock()
+        locator.get_attribute.return_value = None
+
+        async def _stall(*_: object, **__: object) -> None:
+            await asyncio.sleep(2)
+            return None
+
+        locator.evaluate.side_effect = _stall
+
+        input_id = asyncio.run(_radio_option_input_id(locator))
+
+        self.assertIsNone(input_id)
+        locator.get_attribute.assert_awaited_once()
+        locator.evaluate.assert_awaited_once()
+
+    def test_radio_option_is_checked_returns_false_when_locator_stalls(self) -> None:
+        locator = AsyncMock()
+
+        async def _stall(*_: object, **__: object) -> None:
+            await asyncio.sleep(2)
+            return None
+
+        locator.is_checked.side_effect = _stall
+        locator.evaluate.side_effect = _stall
+
+        checked = asyncio.run(_radio_option_is_checked(locator))
+
+        self.assertFalse(checked)
+        locator.is_checked.assert_awaited_once()
+        locator.evaluate.assert_awaited_once()
+
+    def test_check_radio_option_revalidates_after_activation(self) -> None:
+        executor = PlaywrightLinkedInEasyApplyExecutor(
+            RuntimeSettings().model_copy(
+                update={
+                    "resolved_agent_debug_stage": DebugExecutionStage.FULL,
+                    "agent_test_mode": True,
+                }
+            )
+        )
+        field = _resume_field(
+            current_value="PDF stale-resume.pdf 6/8/2026",
+            options=("PDF target-resume.pdf 6/9/2026",),
+        )
+        executor._resolve_radio_option_locator = AsyncMock(  # type: ignore[method-assign]
+            return_value=AsyncMock()
+        )
+        executor._activate_radio_option = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        executor._radio_option_is_selected = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        executor._click_radio_text_target = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        executor._force_radio_option_via_dom = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+        checked = asyncio.run(
+            executor._check_radio_option_by_index(
+                AsyncMock(),
+                field,
+                option_index=0,
+                force_activate=True,
+            )
+        )
+
+        self.assertFalse(checked)
+        executor._activate_radio_option.assert_awaited_once()
+        self.assertGreaterEqual(executor._radio_option_is_selected.await_count, 1)
 
 
 if __name__ == "__main__":

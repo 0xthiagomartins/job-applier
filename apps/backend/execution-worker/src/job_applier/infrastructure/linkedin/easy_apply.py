@@ -4316,7 +4316,12 @@ class PlaywrightLinkedInEasyApplyExecutor:
             ):
                 return True
             if await self._activate_radio_option(root, option_locator):
-                return True
+                if await self._radio_option_is_selected(
+                    root,
+                    field,
+                    option_index=option_index,
+                ):
+                    return True
             if option_label and await self._click_radio_text_target(option_locator, option_label):
                 if await self._radio_option_is_selected(root, field, option_index=option_index):
                     return True
@@ -4774,6 +4779,121 @@ class PlaywrightLinkedInEasyApplyExecutor:
             if await _radio_option_is_checked(locator):
                 return True
 
+        try:
+            activated = await asyncio.wait_for(
+                locator.evaluate(
+                    """
+                    (node) => {
+                      if (!(node instanceof Element)) {
+                        return false;
+                      }
+                      const roleRadio = node.matches('[role="radio"]')
+                        ? node
+                        : node.closest('[role="radio"]') || node.querySelector('[role="radio"]');
+                      const input = node instanceof HTMLInputElement
+                        ? node
+                        : node.querySelector('input[type="radio"]')
+                          || roleRadio?.querySelector('input[type="radio"]');
+                      const fieldset = node.closest('fieldset')
+                        || roleRadio?.closest('fieldset')
+                        || input?.closest('fieldset');
+                      const explicitLabel = input instanceof HTMLInputElement && input.id
+                        ? document.querySelector(`label[for="${input.id}"]`)
+                        : null;
+                      const wrappingLabel = node.closest?.('label') || input?.closest?.('label');
+                      const pointerEvent = (type) =>
+                        new MouseEvent(type, {
+                          bubbles: true,
+                          cancelable: true,
+                          composed: true,
+                          view: window,
+                        });
+                      const syncPeerState = () => {
+                        if (!(fieldset instanceof Element)) {
+                          return;
+                        }
+                        const peerRadios = fieldset.querySelectorAll('[role="radio"]');
+                        for (const peer of peerRadios) {
+                          if (peer instanceof Element) {
+                            peer.setAttribute(
+                              'aria-checked',
+                              peer === roleRadio ? 'true' : 'false'
+                            );
+                          }
+                        }
+                        const peerInputs = fieldset.querySelectorAll('input[type="radio"]');
+                        for (const peerInput of peerInputs) {
+                          if (!(peerInput instanceof HTMLInputElement)) {
+                            continue;
+                          }
+                          peerInput.checked = peerInput === input;
+                        }
+                      };
+                      const clickTargets = [
+                        roleRadio,
+                        explicitLabel,
+                        wrappingLabel,
+                        node,
+                        input,
+                      ].filter((candidate) => candidate instanceof HTMLElement);
+                      for (const target of clickTargets) {
+                        target.dispatchEvent(pointerEvent('pointerdown'));
+                        target.dispatchEvent(pointerEvent('mousedown'));
+                        target.click();
+                        target.dispatchEvent(pointerEvent('mouseup'));
+                        target.dispatchEvent(pointerEvent('pointerup'));
+                        target.dispatchEvent(pointerEvent('pointerout'));
+                        if (
+                          (input instanceof HTMLInputElement && input.checked) ||
+                          (
+                            roleRadio instanceof Element &&
+                            roleRadio.getAttribute('aria-checked') === 'true'
+                          )
+                        ) {
+                          if (roleRadio instanceof Element) {
+                            roleRadio.setAttribute('aria-checked', 'true');
+                          }
+                          syncPeerState();
+                          return true;
+                        }
+                      }
+                      if (input instanceof HTMLInputElement) {
+                        const descriptor = Object.getOwnPropertyDescriptor(
+                          HTMLInputElement.prototype,
+                          'checked'
+                        );
+                        descriptor?.set?.call(input, true);
+                        input.checked = true;
+                        input.dispatchEvent(pointerEvent('pointerdown'));
+                        input.dispatchEvent(pointerEvent('mousedown'));
+                        input.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                        input.dispatchEvent(new Event('change', { bubbles: true }));
+                        input.dispatchEvent(pointerEvent('pointerup'));
+                        input.dispatchEvent(pointerEvent('pointerout'));
+                        if (roleRadio instanceof Element) {
+                          roleRadio.setAttribute('aria-checked', 'true');
+                        }
+                        syncPeerState();
+                      }
+                      return (
+                        (input instanceof HTMLInputElement && input.checked) ||
+                        (
+                          roleRadio instanceof Element &&
+                          roleRadio.getAttribute('aria-checked') === 'true'
+                        )
+                      );
+                    }
+                    """
+                ),
+                timeout=1.5,
+            )
+        except Exception:  # noqa: BLE001
+            activated = False
+        if bool(activated):
+            await asyncio.sleep(0.15)
+            return await _radio_option_is_checked(locator)
+
         input_id = await _radio_option_input_id(locator)
         if input_id:
             label = await self._resolve_radio_explicit_label(root, locator)
@@ -4810,114 +4930,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
             if await _radio_option_is_checked(locator):
                 return True
 
-        try:
-            activated = await locator.evaluate(
-                """
-                (node) => {
-                  if (!(node instanceof Element)) {
-                    return false;
-                  }
-                  const roleRadio = node.matches('[role="radio"]')
-                    ? node
-                    : node.closest('[role="radio"]') || node.querySelector('[role="radio"]');
-                  const input = node instanceof HTMLInputElement
-                    ? node
-                    : node.querySelector('input[type="radio"]')
-                      || roleRadio?.querySelector('input[type="radio"]');
-                  const fieldset = node.closest('fieldset')
-                    || roleRadio?.closest('fieldset')
-                    || input?.closest('fieldset');
-                  const explicitLabel = input instanceof HTMLInputElement && input.id
-                    ? document.querySelector(`label[for="${input.id}"]`)
-                    : null;
-                  const wrappingLabel = node.closest?.('label') || input?.closest?.('label');
-                  const pointerEvent = (type) =>
-                    new MouseEvent(type, {
-                      bubbles: true,
-                      cancelable: true,
-                      composed: true,
-                      view: window,
-                    });
-                  const syncPeerState = () => {
-                    if (!(fieldset instanceof Element)) {
-                      return;
-                    }
-                    const peerRadios = fieldset.querySelectorAll('[role="radio"]');
-                    for (const peer of peerRadios) {
-                      if (peer instanceof Element) {
-                        peer.setAttribute('aria-checked', peer === roleRadio ? 'true' : 'false');
-                      }
-                    }
-                    const peerInputs = fieldset.querySelectorAll('input[type="radio"]');
-                    for (const peerInput of peerInputs) {
-                      if (!(peerInput instanceof HTMLInputElement)) {
-                        continue;
-                      }
-                      peerInput.checked = peerInput === input;
-                    }
-                  };
-                  const clickTargets = [
-                    roleRadio,
-                    explicitLabel,
-                    wrappingLabel,
-                    node,
-                    input,
-                  ].filter((candidate) => candidate instanceof HTMLElement);
-                  for (const target of clickTargets) {
-                    target.dispatchEvent(pointerEvent('pointerdown'));
-                    target.dispatchEvent(pointerEvent('mousedown'));
-                    target.click();
-                    target.dispatchEvent(pointerEvent('mouseup'));
-                    target.dispatchEvent(pointerEvent('pointerup'));
-                    target.dispatchEvent(pointerEvent('pointerout'));
-                    if (
-                      (input instanceof HTMLInputElement && input.checked) ||
-                      (
-                        roleRadio instanceof Element &&
-                        roleRadio.getAttribute('aria-checked') === 'true'
-                      )
-                    ) {
-                      if (roleRadio instanceof Element) {
-                        roleRadio.setAttribute('aria-checked', 'true');
-                      }
-                      syncPeerState();
-                      return true;
-                    }
-                  }
-                  if (input instanceof HTMLInputElement) {
-                    const descriptor = Object.getOwnPropertyDescriptor(
-                      HTMLInputElement.prototype,
-                      'checked'
-                    );
-                    descriptor?.set?.call(input, true);
-                    input.checked = true;
-                    input.dispatchEvent(pointerEvent('pointerdown'));
-                    input.dispatchEvent(pointerEvent('mousedown'));
-                    input.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                    input.dispatchEvent(new Event('change', { bubbles: true }));
-                    input.dispatchEvent(pointerEvent('mouseup'));
-                    input.dispatchEvent(pointerEvent('pointerup'));
-                    if (roleRadio instanceof Element) {
-                      roleRadio.setAttribute('aria-checked', 'true');
-                    }
-                    syncPeerState();
-                  }
-                  return (
-                    (input instanceof HTMLInputElement && input.checked) ||
-                    (
-                      roleRadio instanceof Element &&
-                      roleRadio.getAttribute('aria-checked') === 'true'
-                    )
-                  );
-                }
-                """
-            )
-        except Exception:  # noqa: BLE001
-            return False
-        if bool(activated):
-            await asyncio.sleep(0.15)
-        return await _radio_option_is_checked(locator)
+        return False
 
     async def _set_checkbox_state(
         self,
@@ -4967,7 +4980,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
             ):
                 return True
 
-        input_id = await locator.get_attribute("id")
+        input_id = await _safe_locator_get_attribute(locator, "id")
         if input_id:
             label = root.locator(f'label[for="{input_id}"]')
             if await label.count():
@@ -7132,7 +7145,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
             label = ""
         if not label:
             try:
-                label = await locator.get_attribute("aria-label") or ""
+                label = await _safe_locator_get_attribute(locator, "aria-label") or ""
             except Exception:  # noqa: BLE001
                 label = ""
         return normalize_text(label)
@@ -9576,32 +9589,38 @@ def _resume_text_matches_requested_cv(text: str, target_filename: str) -> bool:
 
 async def _radio_option_is_checked(locator: Locator) -> bool:
     try:
-        if await locator.is_checked():
+        if await asyncio.wait_for(
+            locator.is_checked(timeout=750),
+            timeout=0.9,
+        ):
             return True
     except Exception:  # noqa: BLE001
         pass
     try:
-        checked = await locator.evaluate(
-            """
-            (node) => {
-              if (!(node instanceof Element)) {
-                return false;
-              }
-              const input = node instanceof HTMLInputElement
-                ? node
-                : node.querySelector('input[type="radio"]');
-              if (input instanceof HTMLInputElement && input.checked) {
-                return true;
-              }
-              const roleRadio = node.matches('[role="radio"]')
-                ? node
-                : node.closest('[role="radio"]') || node.querySelector('[role="radio"]');
-              return (
-                roleRadio instanceof Element &&
-                roleRadio.getAttribute('aria-checked') === 'true'
-              );
-            }
-            """
+        checked = await asyncio.wait_for(
+            locator.evaluate(
+                """
+                (node) => {
+                  if (!(node instanceof Element)) {
+                    return false;
+                  }
+                  const input = node instanceof HTMLInputElement
+                    ? node
+                    : node.querySelector('input[type="radio"]');
+                  if (input instanceof HTMLInputElement && input.checked) {
+                    return true;
+                  }
+                  const roleRadio = node.matches('[role="radio"]')
+                    ? node
+                    : node.closest('[role="radio"]') || node.querySelector('[role="radio"]');
+                  return (
+                    roleRadio instanceof Element &&
+                    roleRadio.getAttribute('aria-checked') === 'true'
+                  );
+                }
+                """
+            ),
+            timeout=0.9,
         )
     except Exception:  # noqa: BLE001
         return False
@@ -9610,30 +9629,54 @@ async def _radio_option_is_checked(locator: Locator) -> bool:
 
 async def _radio_option_input_id(locator: Locator) -> str | None:
     try:
-        input_id = await locator.get_attribute("id")
+        input_id = await asyncio.wait_for(
+            locator.get_attribute("id", timeout=750),
+            timeout=0.9,
+        )
     except Exception:  # noqa: BLE001
         input_id = None
     if input_id:
         return input_id
     try:
-        nested_input_id = await locator.evaluate(
-            """
-            (node) => {
-              if (!(node instanceof Element)) {
-                return null;
-              }
-              const input = node instanceof HTMLInputElement
-                ? node
-                : node.querySelector('input[type="radio"]');
-              return input instanceof HTMLInputElement && input.id ? input.id : null;
-            }
-            """
+        nested_input_id = await asyncio.wait_for(
+            locator.evaluate(
+                """
+                (node) => {
+                  if (!(node instanceof Element)) {
+                    return null;
+                  }
+                  const input = node instanceof HTMLInputElement
+                    ? node
+                    : node.querySelector('input[type="radio"]');
+                  return input instanceof HTMLInputElement && input.id ? input.id : null;
+                }
+                """
+            ),
+            timeout=0.9,
         )
     except Exception:  # noqa: BLE001
         return None
     if not isinstance(nested_input_id, str) or not nested_input_id:
         return None
     return nested_input_id
+
+
+async def _safe_locator_get_attribute(
+    locator: Locator,
+    name: str,
+    *,
+    timeout_ms: int = 750,
+) -> str | None:
+    try:
+        value = await asyncio.wait_for(
+            locator.get_attribute(name, timeout=timeout_ms),
+            timeout=max(timeout_ms / 1000, 0.1) + 0.15,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(value, str) or not value:
+        return None
+    return value
 
 
 async def _checkbox_option_is_checked(locator: Locator) -> bool:

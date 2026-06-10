@@ -519,9 +519,12 @@ class BrowserDomSnapshotter:
             except Exception:  # noqa: BLE001
                 priority_handle = None
         try:
+            focus_capture_failed = False
             if focus_handle is not None:
-                payload = await focus_handle.evaluate(
-                    """
+                try:
+                    payload = await asyncio.wait_for(
+                        focus_handle.evaluate(
+                            """
                     (focusedNode, { interactiveSelectors, maxElements, priorityNode }) => {
                       const collapse = (value) => (value || "").replace(/\\s+/g, " ").trim();
                       const isVisible = (node) => {
@@ -1063,13 +1066,17 @@ class BrowserDomSnapshotter:
                       };
                     }
                     """,
-                    {
-                        "interactiveSelectors": INTERACTIVE_SELECTORS,
-                        "maxElements": self._max_elements,
-                        "priorityNode": priority_handle,
-                    },
-                )
-            else:
+                            {
+                                "interactiveSelectors": INTERACTIVE_SELECTORS,
+                                "maxElements": self._max_elements,
+                                "priorityNode": priority_handle,
+                            },
+                        ),
+                        timeout=1.5,
+                    )
+                except Exception:  # noqa: BLE001
+                    focus_capture_failed = True
+            if focus_handle is None or focus_capture_failed:
                 payload = await page.evaluate(
                     """
             ({ interactiveSelectors, maxElements, priorityNode }) => {
