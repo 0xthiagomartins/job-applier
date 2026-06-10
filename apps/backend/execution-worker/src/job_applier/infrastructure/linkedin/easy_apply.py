@@ -2662,7 +2662,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 return committed_state.current_value or resolution.value
             case "select":
                 if field.question_type is QuestionType.RESUME_UPLOAD:
-                    return await self._apply_resume_choice_field(
+                    return await self._apply_resume_choice_field_with_timeout(
                         page=page,
                         root=root,
                         field=field,
@@ -2687,7 +2687,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 return option
             case "checkbox":
                 if field.question_type is QuestionType.RESUME_UPLOAD:
-                    return await self._apply_resume_choice_field(
+                    return await self._apply_resume_choice_field_with_timeout(
                         page=page,
                         root=root,
                         field=field,
@@ -2728,7 +2728,7 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 raise LinkedInEasyApplyError(msg)
             case "radio":
                 if field.question_type is QuestionType.RESUME_UPLOAD:
-                    return await self._apply_resume_choice_field(
+                    return await self._apply_resume_choice_field_with_timeout(
                         page=page,
                         root=root,
                         field=field,
@@ -2781,6 +2781,39 @@ class PlaywrightLinkedInEasyApplyExecutor:
                 if settle_state.settled:
                     return settings.profile.cv_filename or resolved_cv_path.name
                 return None
+
+    async def _apply_resume_choice_field_with_timeout(
+        self,
+        *,
+        page: Page,
+        root: Locator,
+        field: EasyApplyField,
+        settings: UserAgentSettings,
+        submission_cv_path: Path | None,
+        force_reassert: bool = False,
+        step_index: int | None = None,
+        total_steps: int | None = None,
+    ) -> str | None:
+        try:
+            return await asyncio.wait_for(
+                self._apply_resume_choice_field(
+                    page=page,
+                    root=root,
+                    field=field,
+                    settings=settings,
+                    submission_cv_path=submission_cv_path,
+                    force_reassert=force_reassert,
+                    step_index=step_index,
+                    total_steps=total_steps,
+                ),
+                timeout=self._runtime_settings.linkedin_field_interaction_timeout_seconds,
+            )
+        except TimeoutError as exc:
+            msg = (
+                "Timed out while the browser agent was trying to finalize the "
+                "LinkedIn Easy Apply resume chooser."
+            )
+            raise LinkedInEasyApplyError(msg) from exc
 
     async def _complete_text_field_interaction(
         self,

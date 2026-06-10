@@ -11,6 +11,7 @@ from job_applier.domain.entities import ApplicationAnswer
 from job_applier.domain.enums import AnswerSource, DebugExecutionStage, FillStrategy, QuestionType
 from job_applier.infrastructure.linkedin.easy_apply import (
     EasyApplyStep,
+    LinkedInEasyApplyError,
     PlaywrightLinkedInEasyApplyExecutor,
     ResumeUploadSettleState,
     _evaluate_resume_verification,
@@ -401,6 +402,46 @@ class ResumeVerificationTests(unittest.TestCase):
         self.assertEqual(executor._resume_picker_selection_matches_requested_cv.await_count, 2)
         executor._reload_resume_choice_field.assert_awaited_once()
         self.assertEqual(executor._check_radio_option_by_index.await_count, 2)
+
+    def test_resume_choice_timeout_raises_easy_apply_error(self) -> None:
+        executor = PlaywrightLinkedInEasyApplyExecutor(
+            RuntimeSettings().model_copy(
+                update={
+                    "resolved_agent_debug_stage": DebugExecutionStage.FULL,
+                    "agent_test_mode": True,
+                    "linkedin_field_interaction_timeout_seconds": 0.001,
+                }
+            )
+        )
+        field = _resume_field(
+            current_value="PDF stale-resume.pdf 6/8/2026",
+            options=("PDF stale-resume.pdf 6/8/2026",),
+        )
+
+        async def _stall(**_: object) -> str | None:
+            await asyncio.sleep(0.01)
+            return None
+
+        executor._apply_resume_choice_field = _stall  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            LinkedInEasyApplyError,
+            (
+                "Timed out while the browser agent was trying to finalize the "
+                "LinkedIn Easy Apply resume chooser."
+            ),
+        ):
+            asyncio.run(
+                executor._apply_resume_choice_field_with_timeout(
+                    page=AsyncMock(),
+                    root=AsyncMock(),
+                    field=field,
+                    settings=object(),  # type: ignore[arg-type]
+                    submission_cv_path=Path("target-resume.pdf"),
+                    step_index=1,
+                    total_steps=4,
+                )
+            )
 
 
 if __name__ == "__main__":
