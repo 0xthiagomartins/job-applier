@@ -46,6 +46,14 @@ class SupportedLanguage(StrEnum):
     PORTUGUESE = "pt"
 
 
+class EmploymentStatus(StrEnum):
+    EMPLOYED = "employed"
+    SELF_EMPLOYED = "self_employed"
+    UNEMPLOYED = "unemployed"
+    AMBIGUOUS = "ambiguous"
+    UNKNOWN = "unknown"
+
+
 class QuestionType(StrEnum):
     FIRST_NAME = "first_name"
     LAST_NAME = "last_name"

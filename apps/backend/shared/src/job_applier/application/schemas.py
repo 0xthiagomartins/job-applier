@@ -13,6 +13,7 @@ from job_applier.domain.enums import (
     AgentExecutionStatus,
     AnswerSource,
     ArtifactType,
+    EmploymentStatus,
     ExecutionEventType,
     ExecutionOrigin,
     FillStrategy,
@@ -338,6 +339,8 @@ class UserProfileConfigSchema(BaseModel):
     needs_sponsorship: bool = False
     salary_expectation: int | None = None
     availability: str
+    employment_status: EmploymentStatus = EmploymentStatus.UNKNOWN
+    current_employer: str | None = None
     default_responses: dict[str, str] = Field(default_factory=dict)
     cv_path: str | None = None
     cv_filename: str | None = None

@@ -18,11 +18,15 @@ from job_applier.application.panel import (
     SUPPORTED_LANGUAGE_OPTIONS,
     TIMEZONE_OPTIONS,
     AIFormInput,
+    EmploymentContextSummary,
     PreferencesFormInput,
     PrivateMetadataFormInput,
     ProfileFormInput,
     ResumeSourceSnapshotUpdateInput,
     ScheduleFormInput,
+    StoredProfileSection,
+    build_current_employer_feedback,
+    build_employment_context_summary,
     build_missing_private_metadata_feedback,
     build_private_metadata_state_summary,
     calculate_next_execution_at,
@@ -34,6 +38,7 @@ from job_applier.application.panel import (
 )
 from job_applier.application.repositories import SubmissionRepository
 from job_applier.domain.enums import (
+    EmploymentStatus,
     ResumeMode,
     ScheduleFrequency,
     SeniorityLevel,
@@ -81,6 +86,14 @@ def _private_metadata_state_summary(raw_text: str, consent_to_ai_usage: bool) ->
         raw_text=raw_text,
         consent_to_ai_usage=consent_to_ai_usage,
     )
+
+
+def _employment_context_summary(profile: StoredProfileSection) -> dict[str, object]:
+    return build_employment_context_summary(
+        current_employer=profile.current_employer,
+        employment_status=profile.employment_status,
+        cv_path=profile.cv_path,
+    ).model_dump(mode="json")
 
 
 def _resume_source_snapshot_response(
@@ -159,6 +172,7 @@ async def get_profile(
     return JSONResponse(
         content={
             "profile": document.profile.model_dump(mode="json"),
+            "employment_context": _employment_context_summary(document.profile),
             "cv_uploaded": bool(document.profile.cv_path),
         },
     )
@@ -266,18 +280,26 @@ async def get_panel_state(
     """Return the safe combined state used by the Next.js panel."""
 
     document = store.load()
+    skipped_notes = [
+        submission.notes
+        for submission in submission_repository.list(limit=200)
+        if submission.status.value == "skipped"
+    ]
     private_metadata_summary = _private_metadata_state_summary(
         document.private_metadata.raw_text,
         document.private_metadata.consent_to_ai_usage,
     )
     missing_private_metadata_feedback = build_missing_private_metadata_feedback(
-        (
-            submission.notes
-            for submission in submission_repository.list(limit=200)
-            if submission.status.value == "skipped"
-        ),
+        skipped_notes,
         raw_text=document.private_metadata.raw_text,
         consent_to_ai_usage=document.private_metadata.consent_to_ai_usage,
+    )
+    current_employment_context = EmploymentContextSummary.model_validate(
+        _employment_context_summary(document.profile)
+    )
+    current_employer_feedback = build_current_employer_feedback(
+        skipped_notes,
+        employment_context=current_employment_context,
     )
     capability_profile_payload: dict[str, object] | None = None
     try:
@@ -296,10 +318,12 @@ async def get_panel_state(
             "computed": {
                 "next_execution_at": calculate_next_execution_at(document.schedule).isoformat(),
                 "capability_profile": capability_profile_payload,
+                "employment_context": current_employment_context.model_dump(mode="json"),
             },
             "private_metadata": private_metadata_summary,
             "feedback": {
                 "missing_private_metadata": missing_private_metadata_feedback,
+                "current_employer": current_employer_feedback,
             },
             "ai": {
                 "model": document.ai.model,
@@ -332,6 +356,8 @@ async def save_profile(
     needs_sponsorship: Annotated[bool, Form()] = False,
     salary_expectation: Annotated[int | None, Form()] = None,
     availability: Annotated[str, Form()] = "",
+    employment_status: Annotated[EmploymentStatus, Form()] = EmploymentStatus.UNKNOWN,
+    current_employer: Annotated[str, Form()] = "",
     default_responses: Annotated[str, Form()] = "",
     capability_overrides: Annotated[str, Form()] = "",
     resume_mode: Annotated[ResumeMode, Form()] = ResumeMode.STATIC,
@@ -355,6 +381,8 @@ async def save_profile(
             needs_sponsorship=needs_sponsorship,
             salary_expectation=salary_expectation,
             availability=availability,
+            employment_status=employment_status,
+            current_employer=current_employer.strip() or None,
             default_responses=parse_text_mapping_lines(default_responses),
             capability_overrides=parse_capability_override_json(capability_overrides),
             resume_mode=resume_mode,
@@ -369,6 +397,7 @@ async def save_profile(
         content={
             "message": "Profile saved successfully.",
             "profile": document.profile.model_dump(mode="json"),
+            "employment_context": _employment_context_summary(document.profile),
             "cv_uploaded": bool(document.profile.cv_path),
         },
     )

@@ -25,7 +25,11 @@ from job_applier.application.config import (
     UserAgentSettings,
     UserProfileConfig,
 )
-from job_applier.application.panel import PanelSettingsDocument, parse_private_metadata_lines
+from job_applier.application.panel import (
+    PanelSettingsDocument,
+    build_employment_context_summary,
+    parse_private_metadata_lines,
+)
 from job_applier.application.repositories import SubmissionRepository
 from job_applier.application.snapshotting import (
     SuccessfulSubmissionRecord,
@@ -338,6 +342,11 @@ def build_user_agent_settings(document: PanelSettingsDocument) -> UserAgentSetti
 
     email = document.profile.email
     assert email is not None
+    employment_context = build_employment_context_summary(
+        current_employer=document.profile.current_employer,
+        employment_status=document.profile.employment_status,
+        cv_path=document.profile.cv_path,
+    )
 
     try:
         return UserAgentSettings(
@@ -359,6 +368,8 @@ def build_user_agent_settings(document: PanelSettingsDocument) -> UserAgentSetti
                 needs_sponsorship=document.profile.needs_sponsorship,
                 salary_expectation=document.profile.salary_expectation,
                 availability=document.profile.availability,
+                employment_status=employment_context.employment_status,
+                current_employer=employment_context.current_employer,
                 default_responses=document.profile.default_responses,
                 cv_path=document.profile.cv_path,
                 cv_filename=document.profile.cv_filename,

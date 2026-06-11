@@ -23,6 +23,7 @@ from pydantic import (
 )
 
 from job_applier.domain.enums import (
+    EmploymentStatus,
     ResumeMode,
     ScheduleFrequency,
     SeniorityLevel,
@@ -99,12 +100,84 @@ _PRIVATE_METADATA_KEY_ALIASES: dict[str, str] = {
 }
 
 _MISSING_PRIVATE_METADATA_NOTE_PATTERN = re.compile(r"normalized_key=([a-z0-9_]+)")
+_CURRENT_EMPLOYER_PRESENT_TOKENS = ("present", "current", "presente", "atual")
+_SELF_EMPLOYED_TOKENS = (
+    "self-employed",
+    "self employed",
+    "freelance",
+    "autonomo",
+    "autônomo",
+    "independent consultant",
+    "independent contractor",
+)
+_PROFILE_FACT_METADATA_KEYS = frozenset({"current_employer"})
 
 
 class PanelModel(BaseModel):
     """Base model used for persisted panel sections."""
 
     model_config = ConfigDict(frozen=True)
+
+
+class EmploymentContextSummary(PanelModel):
+    """Derived employment context used by the profile and apply pipeline."""
+
+    employment_status: EmploymentStatus = EmploymentStatus.UNKNOWN
+    current_employer: str | None = None
+    candidate_employers: tuple[str, ...] = ()
+    source: str = "unknown"
+    is_override: bool = False
+    is_tentative: bool = False
+    can_autofill_current_employer: bool = False
+
+
+def _non_empty_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _looks_like_current_date_range(date_range: str | None) -> bool:
+    normalized = _normalize_employer_token(date_range or "")
+    return any(token in normalized for token in _CURRENT_EMPLOYER_PRESENT_TOKENS)
+
+
+def _looks_like_self_employed_employer(company_name: str) -> bool:
+    normalized = _normalize_employer_token(company_name)
+    return any(token in normalized for token in _SELF_EMPLOYED_TOKENS)
+
+
+def _normalize_employer_token(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", normalized).strip().lower()
+
+
+def _dedupe_preserving_order(values: Iterable[str]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in values:
+        normalized = _normalize_employer_token(item)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(item.strip())
+    return tuple(deduped)
+
+
+def _load_current_employer_candidates(cv_path: str | None) -> tuple[str, ...]:
+    if not cv_path:
+        return ()
+    from job_applier.infrastructure.candidate_capabilities import _load_resume_snapshot
+
+    snapshot = _load_resume_snapshot(cv_path)
+    candidates = [
+        company_name
+        for entry in snapshot.experience_entries
+        for company_name in (_non_empty_text(entry.company_name),)
+        if company_name is not None and _looks_like_current_date_range(entry.date_range)
+    ]
+    return _dedupe_preserving_order(candidates)
 
 
 class CapabilityRangeInput(PanelModel):
@@ -226,6 +299,165 @@ def build_private_metadata_state_summary(
     }
 
 
+def build_employment_context_summary(
+    *,
+    current_employer: str | None,
+    employment_status: EmploymentStatus = EmploymentStatus.UNKNOWN,
+    cv_path: str | None = None,
+) -> EmploymentContextSummary:
+    """Return the trusted current-employer context derived from profile overrides and the CV."""
+
+    explicit_current_employer = _non_empty_text(current_employer)
+    explicit_status = employment_status
+    candidates = _load_current_employer_candidates(cv_path)
+
+    if explicit_status is EmploymentStatus.UNEMPLOYED:
+        return EmploymentContextSummary(
+            employment_status=EmploymentStatus.UNEMPLOYED,
+            current_employer=None,
+            candidate_employers=candidates,
+            source="profile_override",
+            is_override=True,
+            can_autofill_current_employer=True,
+        )
+
+    if explicit_current_employer is not None:
+        resolved_status = explicit_status
+        if resolved_status is EmploymentStatus.UNKNOWN:
+            if ";" in explicit_current_employer:
+                resolved_status = EmploymentStatus.AMBIGUOUS
+            elif _looks_like_self_employed_employer(explicit_current_employer):
+                resolved_status = EmploymentStatus.SELF_EMPLOYED
+            else:
+                resolved_status = EmploymentStatus.EMPLOYED
+        return EmploymentContextSummary(
+            employment_status=resolved_status,
+            current_employer=explicit_current_employer,
+            candidate_employers=candidates,
+            source="profile_override",
+            is_override=True,
+            is_tentative=False,
+            can_autofill_current_employer=True,
+        )
+
+    if len(candidates) == 1:
+        candidate = candidates[0]
+        return EmploymentContextSummary(
+            employment_status=(
+                EmploymentStatus.SELF_EMPLOYED
+                if _looks_like_self_employed_employer(candidate)
+                else EmploymentStatus.EMPLOYED
+            ),
+            current_employer=candidate,
+            candidate_employers=candidates,
+            source="resume_snapshot",
+            can_autofill_current_employer=True,
+        )
+
+    if len(candidates) > 1:
+        return EmploymentContextSummary(
+            employment_status=EmploymentStatus.AMBIGUOUS,
+            current_employer="; ".join(candidates),
+            candidate_employers=candidates,
+            source="resume_snapshot",
+            is_tentative=True,
+            can_autofill_current_employer=True,
+        )
+
+    return EmploymentContextSummary(
+        employment_status=EmploymentStatus.UNKNOWN,
+        current_employer=None,
+        candidate_employers=(),
+        source="unknown",
+        can_autofill_current_employer=False,
+    )
+
+
+def build_current_employer_feedback(
+    notes: Iterable[str | None],
+    *,
+    employment_context: EmploymentContextSummary,
+) -> dict[str, object]:
+    """Summarize historical current-employer blockers against trusted profile context."""
+
+    blocked_count = 0
+    for note in notes:
+        if not note:
+            continue
+        match = _MISSING_PRIVATE_METADATA_NOTE_PATTERN.search(note)
+        if match is None:
+            continue
+        if normalize_private_metadata_key(match.group(1)) == "current_employer":
+            blocked_count += 1
+
+    if blocked_count == 0:
+        return {
+            "has_current_employer_feedback": False,
+            "skipped_submission_count": 0,
+            "resolution_state": None,
+            "next_action": None,
+            "message": None,
+        }
+
+    resolution_state: str
+    next_action: str
+    message: str
+    if employment_context.employment_status is EmploymentStatus.UNKNOWN:
+        resolution_state = "unknown_current_employer"
+        next_action = (
+            "Defina employment_status e, se quiser, current_employer no perfil para eu tentar "
+            "essas vagas novamente sem depender de private metadata."
+        )
+        message = (
+            f"Nao consegui aplicar em {blocked_count} vaga(s) porque nao consegui determinar a "
+            "empresa atual com seguranca a partir do seu contexto atual. "
+            f"{next_action}"
+        )
+    elif employment_context.employment_status is EmploymentStatus.UNEMPLOYED:
+        resolution_state = "unemployed_current_employer"
+        next_action = (
+            "Nenhuma acao obrigatoria. O perfil ja indica que voce esta sem empregador atual. "
+            "Se quiser, revise esse estado no perfil."
+        )
+        message = (
+            f"Historicamente, {blocked_count} vaga(s) pediram empresa atual. Agora o perfil "
+            "indica que voce esta desempregado, entao o agente pode responder isso quando o "
+            f"campo permitir. {next_action}"
+        )
+    elif employment_context.employment_status is EmploymentStatus.AMBIGUOUS:
+        resolution_state = "ambiguous_current_employer"
+        next_action = (
+            "Revise o current_employer no perfil se quiser substituir o valor tentativo "
+            f"'{employment_context.current_employer or ''}'."
+        )
+        message = (
+            f"Historicamente, {blocked_count} vaga(s) pediram empresa atual. Encontrei mais de "
+            "um empregador plausivel no seu contexto, então o agente usará o valor tentativo "
+            f"'{employment_context.current_employer or ''}' quando o campo permitir. {next_action}"
+        )
+    else:
+        resolution_state = "resolved_from_context"
+        next_action = (
+            "Nenhuma acao obrigatoria. O contexto atual ja resolve empresa atual, mas voce pode "
+            "editar esse valor no perfil se quiser."
+        )
+        message = (
+            f"Historicamente, {blocked_count} vaga(s) pediram empresa atual. Agora o agente ja "
+            "consegue resolver isso a partir do contexto atual como "
+            f"'{employment_context.current_employer or ''}'. "
+            f"{next_action}"
+        )
+
+    return {
+        "has_current_employer_feedback": True,
+        "skipped_submission_count": blocked_count,
+        "resolution_state": resolution_state,
+        "employment_context": employment_context.model_dump(mode="json"),
+        "next_action": next_action,
+        "message": message,
+    }
+
+
 def build_missing_private_metadata_feedback(
     notes: Iterable[str | None],
     *,
@@ -252,6 +484,8 @@ def build_missing_private_metadata_feedback(
         if match is None:
             continue
         normalized_key = normalize_private_metadata_key(match.group(1))
+        if normalized_key in _PROFILE_FACT_METADATA_KEYS:
+            continue
         counts[normalized_key] += 1
         total_skipped += 1
 
@@ -385,6 +619,8 @@ class StoredProfileSection(PanelModel):
     needs_sponsorship: bool = False
     salary_expectation: int | None = None
     availability: str = ""
+    employment_status: EmploymentStatus = EmploymentStatus.UNKNOWN
+    current_employer: str | None = None
     default_responses: dict[str, str] = Field(default_factory=dict)
     cv_path: str | None = None
     cv_filename: str | None = None
@@ -409,6 +645,8 @@ class ProfileFormInput(BaseModel):
     needs_sponsorship: bool = False
     salary_expectation: int | None = None
     availability: str = Field(min_length=1)
+    employment_status: EmploymentStatus = EmploymentStatus.UNKNOWN
+    current_employer: str | None = None
     default_responses: dict[str, str] = Field(default_factory=dict)
     resume_mode: ResumeMode = ResumeMode.STATIC
     preferred_language: SupportedLanguage = SupportedLanguage.ENGLISH

@@ -15,6 +15,7 @@ from urllib import error, request
 from job_applier.application.config import UserAgentSettings
 from job_applier.application.panel import (
     PRIVATE_METADATA_DISPLAY_LABELS,
+    build_employment_context_summary,
     normalize_private_metadata_key,
 )
 from job_applier.cost_observability import record_openai_usage
@@ -2131,6 +2132,14 @@ class LinkedInAnswerResolver:
         if _looks_like_sensitive_demographic_gate_question(field):
             return None
 
+        current_employer_value = self._resolve_current_employer_field_value(
+            field,
+            settings,
+            posting=posting,
+        )
+        if current_employer_value is not None:
+            return current_employer_value
+
         semantic_plan_value = self._resolve_semantic_plan_value(
             field,
             settings,
@@ -2437,6 +2446,96 @@ class LinkedInAnswerResolver:
                 return "Yes" if profile.needs_sponsorship else "No"
             case _:
                 return None
+
+    def _resolve_current_employer_field_value(
+        self,
+        field: EasyApplyField,
+        settings: UserAgentSettings,
+        *,
+        posting: JobPosting,
+    ) -> ResolvedFieldValue | None:
+        if not (
+            normalize_key(field.normalized_key) == "current_employer"
+            or _looks_like_current_employer_question(field)
+        ):
+            return None
+
+        employment_context = build_employment_context_summary(
+            current_employer=settings.profile.current_employer,
+            employment_status=settings.profile.employment_status,
+            cv_path=settings.profile.cv_path,
+        )
+        if not employment_context.can_autofill_current_employer:
+            return None
+
+        resolved_value: str | None = None
+        reasoning = "profile_current_employer"
+        normalized_question = normalize_text(
+            " ".join(
+                (
+                    field.question_raw,
+                    field.normalized_key,
+                    field.field_context,
+                    field.helper_text or "",
+                )
+            )
+        )
+
+        if field.options and _field_is_binary_choice(field):
+            target_employer = self._extract_target_employer_from_question(
+                normalized_question,
+                posting=posting,
+            )
+            if target_employer is None:
+                resolved_value = (
+                    "No"
+                    if getattr(employment_context.employment_status, "value", None) == "unemployed"
+                    else "Yes"
+                )
+                reasoning = "profile_current_employer_binary_presence"
+            else:
+                matches_target = _employment_context_matches_company(
+                    employment_context,
+                    target_employer,
+                )
+                resolved_value = "Yes" if matches_target else "No"
+                reasoning = "profile_current_employer_binary_company_match"
+            selected_option = pick_option(field.options, preferred=resolved_value)
+            if selected_option is None:
+                return None
+            resolved_value = selected_option
+        elif field.options:
+            preferred_value = _current_employer_autofill_value(employment_context)
+            if preferred_value is None:
+                return None
+            selected_option = pick_option(field.options, preferred=preferred_value)
+            if selected_option is None:
+                return None
+            resolved_value = selected_option
+            reasoning = "profile_current_employer_option_match"
+        else:
+            resolved_value = _current_employer_autofill_value(employment_context)
+            if resolved_value is None:
+                return None
+
+        return ResolvedFieldValue(
+            value=resolved_value,
+            answer_source=AnswerSource.PROFILE_SNAPSHOT,
+            fill_strategy=FillStrategy.DETERMINISTIC,
+            confidence=0.93,
+            reasoning=reasoning,
+        )
+
+    def _extract_target_employer_from_question(
+        self,
+        normalized_question: str,
+        *,
+        posting: JobPosting,
+    ) -> str | None:
+        posting_company = posting.company_name.strip()
+        if posting_company and normalize_text(posting_company) in normalized_question:
+            return posting_company
+        return None
 
     def _resolve_profile_value(
         self,
@@ -3512,6 +3611,35 @@ def _looks_like_generic_invalid_feedback(validation_message: str) -> bool:
             "entrada invalida",
             "valor invalido",
         )
+    )
+
+
+def _current_employer_autofill_value(employment_context: object) -> str | None:
+    status = getattr(employment_context, "employment_status", None)
+    current_employer = _non_empty_value(getattr(employment_context, "current_employer", None))
+    if getattr(status, "value", None) == "unemployed":
+        return "Unemployed"
+    return current_employer
+
+
+def _employment_context_matches_company(
+    employment_context: object,
+    company_name: str,
+) -> bool:
+    normalized_target = normalize_text(company_name)
+    if not normalized_target:
+        return False
+    candidates = getattr(employment_context, "candidate_employers", ()) or ()
+    if not candidates:
+        current_employer = getattr(employment_context, "current_employer", None)
+        candidates = tuple(
+            item.strip() for item in str(current_employer or "").split(";") if item.strip()
+        )
+    return any(
+        normalized_target == normalize_text(candidate)
+        or normalized_target in normalize_text(candidate)
+        or normalize_text(candidate) in normalized_target
+        for candidate in candidates
     )
 
 

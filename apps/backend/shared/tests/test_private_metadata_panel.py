@@ -6,6 +6,7 @@ from pathlib import Path
 
 from job_applier.application.agent_execution import build_user_agent_settings
 from job_applier.application.panel import (
+    EmploymentContextSummary,
     PanelSettingsDocument,
     PrivateMetadataFormInput,
     StoredAISection,
@@ -13,11 +14,13 @@ from job_applier.application.panel import (
     StoredPrivateMetadataSection,
     StoredProfileSection,
     StoredScheduleSection,
+    build_current_employer_feedback,
+    build_employment_context_summary,
     build_missing_private_metadata_feedback,
     build_private_metadata_state_summary,
     parse_private_metadata_lines,
 )
-from job_applier.domain.enums import ResumeMode, SupportedLanguage
+from job_applier.domain.enums import EmploymentStatus, ResumeMode, SupportedLanguage
 from job_applier.infrastructure.local_panel_store import LocalPanelSettingsStore
 
 
@@ -113,6 +116,49 @@ class PrivateMetadataPanelTests(unittest.TestCase):
         self.assertNotIn("507.329.848-90", str(summary))
         self.assertNotIn("Maria Example", str(summary))
 
+    def test_build_user_agent_settings_derives_current_employer_from_cv_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cv_path = Path(temp_dir) / "resume.txt"
+            cv_path.write_text(
+                "\n".join(
+                    (
+                        "Thiago Martins",
+                        "Full Stack Software Engineer",
+                        "Summary",
+                        "Software engineer focused on backend systems and automation.",
+                        "Experience",
+                        "Automation Developer  SAMSUNG SDS  11/2024 - Present",
+                        "- Built automation systems",
+                        "Skills",
+                        "Backend: Java, Python",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            document = PanelSettingsDocument(
+                profile=StoredProfileSection(
+                    name="Thiago Martins",
+                    email="thiago@example.com",
+                    phone="+5511999999999",
+                    city="Sao Paulo",
+                    work_authorized=True,
+                    availability="Immediate",
+                    cv_path=str(cv_path),
+                    cv_filename=cv_path.name,
+                ),
+                preferences=StoredPreferencesSection(
+                    keywords=("Desenvolvedor Backend",),
+                    location="Remote",
+                ),
+                ai=StoredAISection(model="o3-mini"),
+                schedule=StoredScheduleSection(),
+            )
+
+            settings = build_user_agent_settings(document)
+
+        self.assertEqual(settings.profile.current_employer, "SAMSUNG SDS")
+        self.assertEqual(settings.profile.employment_status, EmploymentStatus.EMPLOYED)
+
     def test_build_missing_private_metadata_feedback_aggregates_without_job_identity(self) -> None:
         feedback = build_missing_private_metadata_feedback(
             (
@@ -183,6 +229,134 @@ class PrivateMetadataPanelTests(unittest.TestCase):
         next_action = feedback["next_action"]
         assert isinstance(next_action, str)
         self.assertIn("consentimento", next_action)
+
+    def test_build_employment_context_summary_derives_single_current_employer_from_cv(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cv_path = Path(temp_dir) / "resume.txt"
+            cv_path.write_text(
+                "\n".join(
+                    (
+                        "Thiago Martins",
+                        "Full Stack Software Engineer",
+                        "Summary",
+                        "Software engineer focused on backend systems and automation.",
+                        "Experience",
+                        "Automation Developer  SAMSUNG SDS  11/2024 - Present",
+                        "- Built automation systems",
+                        "Software Developer  NEOT  01/2021 - 10/2024",
+                        "- Built APIs",
+                        "Skills",
+                        "Backend: Java, Python",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            context = build_employment_context_summary(
+                current_employer=None,
+                employment_status=EmploymentStatus.UNKNOWN,
+                cv_path=str(cv_path),
+            )
+
+        self.assertEqual(context.employment_status, EmploymentStatus.EMPLOYED)
+        self.assertEqual(context.current_employer, "SAMSUNG SDS")
+        self.assertEqual(context.source, "resume_snapshot")
+        self.assertTrue(context.can_autofill_current_employer)
+
+    def test_build_employment_context_summary_marks_ambiguous_current_employers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cv_path = Path(temp_dir) / "resume.txt"
+            cv_path.write_text(
+                "\n".join(
+                    (
+                        "Thiago Martins",
+                        "Full Stack Software Engineer",
+                        "Summary",
+                        "Software engineer focused on backend systems and automation.",
+                        "Experience",
+                        "Automation Developer  SAMSUNG SDS  11/2024 - Present",
+                        "- Built automation systems",
+                        "Freelance Full Stack Developer  Self-Employed  01/2019 - Present",
+                        "- Built APIs",
+                        "Skills",
+                        "Backend: Java, Python",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            context = build_employment_context_summary(
+                current_employer=None,
+                employment_status=EmploymentStatus.UNKNOWN,
+                cv_path=str(cv_path),
+            )
+
+        self.assertEqual(context.employment_status, EmploymentStatus.AMBIGUOUS)
+        self.assertEqual(context.current_employer, "SAMSUNG SDS; Self-Employed")
+        self.assertEqual(context.candidate_employers, ("SAMSUNG SDS", "Self-Employed"))
+        self.assertTrue(context.is_tentative)
+
+    def test_build_employment_context_summary_respects_unemployed_override(self) -> None:
+        context = build_employment_context_summary(
+            current_employer=None,
+            employment_status=EmploymentStatus.UNEMPLOYED,
+            cv_path=None,
+        )
+
+        self.assertEqual(context.employment_status, EmploymentStatus.UNEMPLOYED)
+        self.assertIsNone(context.current_employer)
+        self.assertTrue(context.can_autofill_current_employer)
+        self.assertTrue(context.is_override)
+
+    def test_current_employer_feedback_is_not_treated_as_private_metadata_missing(self) -> None:
+        feedback = build_missing_private_metadata_feedback(
+            (
+                (
+                    "Required LinkedIn Easy Apply field could not be resolved safely because the "
+                    "profile does not provide the factual data needed: "
+                    "normalized_key=current_employer, "
+                    "question_type=free_text_generic, control_kind=text."
+                ),
+                (
+                    "Required LinkedIn Easy Apply field could not be resolved safely because the "
+                    "profile does not provide the factual data needed: normalized_key=cpf, "
+                    "question_type=free_text_generic, control_kind=text."
+                ),
+            ),
+            raw_text="",
+            consent_to_ai_usage=False,
+        )
+
+        self.assertEqual(feedback["skipped_submission_count"], 1)
+        missing_fields = feedback["missing_fields"]
+        assert isinstance(missing_fields, list)
+        self.assertEqual([item["key"] for item in missing_fields], ["cpf"])
+
+    def test_build_current_employer_feedback_reassesses_historical_blockers(self) -> None:
+        context = EmploymentContextSummary(
+            employment_status=EmploymentStatus.AMBIGUOUS,
+            current_employer="SAMSUNG SDS; Self-Employed",
+            candidate_employers=("SAMSUNG SDS", "Self-Employed"),
+            source="resume_snapshot",
+            is_tentative=True,
+            can_autofill_current_employer=True,
+        )
+
+        feedback = build_current_employer_feedback(
+            (
+                (
+                    "Required LinkedIn Easy Apply field could not be resolved safely because the "
+                    "profile does not provide the factual data needed: "
+                    "normalized_key=current_employer, "
+                    "question_type=free_text_generic, control_kind=text."
+                ),
+            ),
+            employment_context=context,
+        )
+
+        self.assertTrue(feedback["has_current_employer_feedback"])
+        self.assertEqual(feedback["resolution_state"], "ambiguous_current_employer")
+        self.assertIn("SAMSUNG SDS; Self-Employed", str(feedback["message"]))
 
 
 if __name__ == "__main__":

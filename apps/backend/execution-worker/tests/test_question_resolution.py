@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
 from unittest.mock import patch
+from uuid import uuid4
 
 from pydantic import SecretStr
 
@@ -411,6 +412,127 @@ class LinkedInAnswerResolverRateLimitTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(resolved)
+        self.assertEqual(self.generator.calls, 0)
+
+    async def test_required_current_employer_uses_single_active_employer_from_cv(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cv_path = Path(temp_dir) / "resume.txt"
+            cv_path.write_text(
+                "\n".join(
+                    (
+                        "Thiago Martins",
+                        "Full Stack Software Engineer",
+                        "Summary",
+                        "Software engineer focused on backend systems and automation.",
+                        "Experience",
+                        "Automation Developer  SAMSUNG SDS  11/2024 - Present",
+                        "- Built automation systems",
+                        "Skills",
+                        "Backend: Java, Python",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            settings = self.settings.model_copy(
+                update={
+                    "profile": self.settings.profile.model_copy(
+                        update={
+                            "cv_path": str(cv_path),
+                            "cv_filename": cv_path.name,
+                        }
+                    )
+                }
+            )
+            field = EasyApplyField(
+                question_raw="Confirm the name of the company where you work",
+                normalized_key="current_employer",
+                question_type=QuestionType.FREE_TEXT_GENERIC,
+                control_kind="text",
+                input_type="text",
+                required=True,
+            )
+
+            resolved = await self.resolver.resolve(
+                field,
+                settings,
+                posting=self.posting,
+            )
+
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved.value, "SAMSUNG SDS")
+        self.assertEqual(resolved.answer_source, AnswerSource.PROFILE_SNAPSHOT)
+        self.assertEqual(self.generator.calls, 0)
+
+    async def test_current_employer_binary_question_uses_posting_company_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cv_path = Path(temp_dir) / "resume.txt"
+            cv_path.write_text(
+                "\n".join(
+                    (
+                        "Thiago Martins",
+                        "Full Stack Software Engineer",
+                        "Summary",
+                        "Software engineer focused on backend systems and automation.",
+                        "Experience",
+                        "Automation Developer  SAMSUNG SDS  11/2024 - Present",
+                        "- Built automation systems",
+                        "Freelance Developer  Self-Employed  01/2019 - Present",
+                        "- Built APIs",
+                        "Skills",
+                        "Backend: Java, Python",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            settings = self.settings.model_copy(
+                update={
+                    "profile": self.settings.profile.model_copy(
+                        update={
+                            "cv_path": str(cv_path),
+                            "cv_filename": cv_path.name,
+                        }
+                    )
+                }
+            )
+            field = EasyApplyField(
+                question_raw="Você trabalha atualmente no Inter?",
+                normalized_key="current_employer",
+                question_type=QuestionType.FREE_TEXT_GENERIC,
+                control_kind="select",
+                input_type="select",
+                options=("Sim", "Não"),
+                required=True,
+            )
+            posting = JobPosting(
+                id=uuid4(),
+                platform=self.posting.platform,
+                url=self.posting.url,
+                title=self.posting.title,
+                company_name="Inter",
+                description_raw=self.posting.description_raw,
+                location=self.posting.location,
+                workplace_type=self.posting.workplace_type,
+                seniority=self.posting.seniority,
+                easy_apply=self.posting.easy_apply,
+                description_hash=self.posting.description_hash,
+                detail_quality_score=self.posting.detail_quality_score,
+                detail_description_score=self.posting.detail_description_score,
+                detail_quality_source=self.posting.detail_quality_source,
+                detail_quality_signals=self.posting.detail_quality_signals,
+                captured_at=self.posting.captured_at,
+            )
+
+            resolved = await self.resolver.resolve(
+                field,
+                settings,
+                posting=posting,
+            )
+
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved.value, "Não")
+        self.assertEqual(resolved.answer_source, AnswerSource.PROFILE_SNAPSHOT)
         self.assertEqual(self.generator.calls, 0)
 
     async def test_semantic_text_feedback_does_not_blindly_reuse_rejected_value(
