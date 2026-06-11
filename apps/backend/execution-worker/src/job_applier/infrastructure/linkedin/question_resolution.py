@@ -704,6 +704,13 @@ class LinkedInQuestionClassifier:
                 confidence=0.88,
                 matched_rule="referral_source",
             )
+        if self._looks_like_company_relationship_disclosure_question(normalized):
+            return QuestionClassification(
+                question_type=QuestionType.YES_NO_GENERIC,
+                normalized_key="company_relationship_disclosure",
+                confidence=0.9,
+                matched_rule="company_relationship_disclosure",
+            )
         if self._looks_like_current_employer_question(normalized):
             return QuestionClassification(
                 question_type=QuestionType.FREE_TEXT_GENERIC,
@@ -935,7 +942,15 @@ class LinkedInQuestionClassifier:
             "onde viu a vaga",
         )
 
+    def _looks_like_company_relationship_disclosure_question(
+        self,
+        normalized_question: str,
+    ) -> bool:
+        return _looks_like_company_relationship_disclosure_question(normalized_question)
+
     def _looks_like_current_employer_question(self, normalized_question: str) -> bool:
+        if self._looks_like_company_relationship_disclosure_question(normalized_question):
+            return False
         return self._contains_any(
             normalized_question,
             "current company",
@@ -2140,6 +2155,12 @@ class LinkedInAnswerResolver:
         if current_employer_value is not None:
             return current_employer_value
 
+        company_relationship_disclosure_value = self._resolve_company_relationship_disclosure_value(
+            field
+        )
+        if company_relationship_disclosure_value is not None:
+            return company_relationship_disclosure_value
+
         semantic_plan_value = self._resolve_semantic_plan_value(
             field,
             settings,
@@ -2524,6 +2545,25 @@ class LinkedInAnswerResolver:
             fill_strategy=FillStrategy.DETERMINISTIC,
             confidence=0.93,
             reasoning=reasoning,
+        )
+
+    def _resolve_company_relationship_disclosure_value(
+        self,
+        field: EasyApplyField,
+    ) -> ResolvedFieldValue | None:
+        normalized_question = normalize_text(f"{field.question_raw} {field.normalized_key}")
+        if not _looks_like_company_relationship_disclosure_question(normalized_question):
+            return None
+
+        option = pick_option(field.options, preferred="No") if field.options else None
+        resolved_value = option or "No"
+        return ResolvedFieldValue(
+            value=resolved_value,
+            answer_source=AnswerSource.BEST_EFFORT_AUTOFILL,
+            fill_strategy=FillStrategy.BEST_EFFORT,
+            ambiguity_flag=True,
+            confidence=0.42,
+            reasoning="company_relationship_disclosure_safe_negative",
         )
 
     def _extract_target_employer_from_question(
@@ -3499,6 +3539,8 @@ def _parse_numeric_option_bounds(option: str) -> tuple[float, float] | None:
 
 
 def _prefers_negative_answer(normalized_question: str) -> bool:
+    if _looks_like_company_relationship_disclosure_question(normalized_question):
+        return True
     return any(
         token in normalized_question
         for token in (
@@ -3510,6 +3552,58 @@ def _prefers_negative_answer(normalized_question: str) -> bool:
             "marketing",
             "future opportunities",
         )
+    )
+
+
+def _looks_like_company_relationship_disclosure_question(normalized_question: str) -> bool:
+    relationship_tokens = (
+        "relative",
+        "relatives",
+        "parent",
+        "parents",
+        "sibling",
+        "siblings",
+        "in law",
+        "spouse",
+        "spouses",
+        "children",
+        "stepchildren",
+        "stepfather",
+        "stepmother",
+        "son in law",
+        "daughter in law",
+        "close friend",
+        "close friends",
+        "friend",
+        "friends",
+        "acquaintance",
+        "acquaintances",
+        "significant and ongoing relationship",
+        "know anyone",
+        "know somebody",
+        "know someone",
+    )
+    employment_tokens = (
+        "currently work at",
+        "work at",
+        "work for",
+        "employee of",
+        "currently employed at",
+        "works at",
+        "works for",
+        "trabalham atualmente",
+        "trabalha atualmente",
+        "trabalham na",
+        "trabalham no",
+        "trabalha na",
+        "trabalha no",
+        "empregado na",
+        "empregado no",
+        "funcionario da",
+        "funcionario do",
+    )
+    return any(token in normalized_question for token in relationship_tokens) and any(
+        token in normalized_question for token in employment_tokens
     )
 
 
@@ -3645,6 +3739,8 @@ def _employment_context_matches_company(
 
 def _looks_like_current_employer_question(field: EasyApplyField) -> bool:
     normalized = normalize_text(f"{field.question_raw} {field.normalized_key}")
+    if _looks_like_company_relationship_disclosure_question(normalized):
+        return False
     return any(
         token in normalized
         for token in (

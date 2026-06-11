@@ -146,6 +146,31 @@ class LinkedInQuestionClassifierTests(unittest.TestCase):
         self.assertEqual(classification.normalized_key, "workplace_availability")
         self.assertEqual(classification.matched_rule, "workplace_availability")
 
+    def test_classifies_company_relationship_disclosure_as_binary_not_current_employer(
+        self,
+    ) -> None:
+        classification = self.classifier.classify(
+            question_raw=(
+                "Do you have any relatives (such as parents, siblings, in-laws, spouses, "
+                "or children, stepchildren, stepfather/stepmother, son-in-law/"
+                "daughter-in-law), close friends, or acquaintances (with whom you have "
+                "a significant and ongoing relationship) who currently work at CI&T?"
+            ),
+            control_kind="select",
+            input_type="select",
+            options=("Select an option", "Yes", "No"),
+        )
+
+        self.assertEqual(classification.question_type, QuestionType.YES_NO_GENERIC)
+        self.assertEqual(
+            classification.normalized_key,
+            "company_relationship_disclosure",
+        )
+        self.assertEqual(
+            classification.matched_rule,
+            "company_relationship_disclosure",
+        )
+
     def test_classifies_proficiency_ladder_questions(self) -> None:
         classification = self.classifier.classify(
             question_raw="Como você avalia seu conhecimento com Java 8+?",
@@ -533,6 +558,50 @@ class LinkedInAnswerResolverRateLimitTests(unittest.IsolatedAsyncioTestCase):
         assert resolved is not None
         self.assertEqual(resolved.value, "Não")
         self.assertEqual(resolved.answer_source, AnswerSource.PROFILE_SNAPSHOT)
+        self.assertEqual(self.generator.calls, 0)
+
+    async def test_company_relationship_disclosure_prefers_negative_answer(self) -> None:
+        field = EasyApplyField(
+            question_raw=(
+                "Do you have any relatives, close friends, or acquaintances who currently "
+                "work at CI&T?"
+            ),
+            normalized_key="company_relationship_disclosure",
+            question_type=QuestionType.YES_NO_GENERIC,
+            control_kind="select",
+            input_type="select",
+            options=("Select an option", "Yes", "No"),
+            required=True,
+        )
+        posting = JobPosting(
+            id=uuid4(),
+            platform=self.posting.platform,
+            url=self.posting.url,
+            title=self.posting.title,
+            company_name="CI&T",
+            description_raw=self.posting.description_raw,
+            location=self.posting.location,
+            workplace_type=self.posting.workplace_type,
+            seniority=self.posting.seniority,
+            easy_apply=self.posting.easy_apply,
+            description_hash=self.posting.description_hash,
+            detail_quality_score=self.posting.detail_quality_score,
+            detail_description_score=self.posting.detail_description_score,
+            detail_quality_source=self.posting.detail_quality_source,
+            detail_quality_signals=self.posting.detail_quality_signals,
+            captured_at=self.posting.captured_at,
+        )
+
+        resolved = await self.resolver.resolve(
+            field,
+            self.settings,
+            posting=posting,
+        )
+
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved.value, "No")
+        self.assertEqual(resolved.fill_strategy, FillStrategy.BEST_EFFORT)
         self.assertEqual(self.generator.calls, 0)
 
     async def test_semantic_text_feedback_does_not_blindly_reuse_rejected_value(
